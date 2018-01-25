@@ -49,6 +49,7 @@ const FR_NAME_NUMBER sql_rcode_table[] = {
 	{ "server error",	RLM_SQL_ERROR		},
 	{ "query invalid",	RLM_SQL_QUERY_INVALID	},
 	{ "no connection",	RLM_SQL_RECONNECT	},
+	{ "no more rows",	RLM_SQL_NO_MORE_ROWS	},
 	{ NULL, 0 }
 };
 
@@ -188,20 +189,20 @@ int sql_fr_pair_list_afrom_str(TALLOC_CTX *ctx, REQUEST *request, VALUE_PAIR **h
 	 */
 	vp = fr_pair_make(ctx, NULL, row[2], NULL, op);
 	if (!vp) {
-		REDEBUG("Failed to create the pair: %s", fr_strerror());
+		RPEDEBUG("Failed to create the pair");
 		return -1;
 	}
 
 	if (do_xlat) {
 		if (fr_pair_mark_xlat(vp, value) < 0) {
-			REDEBUG("Error marking pair for xlat: %s", fr_strerror());
+			RPEDEBUG("Error marking pair for xlat");
 
 			talloc_free(vp);
 			return -1;
 		}
 	} else {
 		if (fr_pair_value_from_str(vp, value, -1) < 0) {
-			REDEBUG("Error parsing value: %s", fr_strerror());
+			RPEDEBUG("Error parsing value");
 
 			talloc_free(vp);
 			return -1;
@@ -240,13 +241,20 @@ sql_rcode_t rlm_sql_fetch_row(rlm_sql_row_t *out, rlm_sql_t const *inst, REQUEST
 	 *	result sets associated with that connection.
 	 */
 	ret = (inst->driver->sql_fetch_row)(out, *handle, inst->config);
-	if (ret < 0) {
+	switch (ret) {
+	case RLM_SQL_OK:
+		rad_assert(*out != NULL);
+		return ret;
+
+	case RLM_SQL_NO_MORE_ROWS:
+		rad_assert(*out == NULL);
+		return ret;
+
+	default:
 		ROPTIONAL(RERROR, ERROR, "Error fetching row");
-
 		rlm_sql_print_error(inst, request, *handle, false);
+		return ret;
 	}
-
-	return ret;
 }
 
 /** Retrieve any errors from the SQL driver
@@ -333,7 +341,7 @@ sql_rcode_t rlm_sql_query(rlm_sql_t const *inst, REQUEST *request, rlm_sql_handl
 	/*
 	 *  inst->pool may be NULL is this function is called by mod_conn_create.
 	 */
-	count = inst->pool ? fr_connection_pool_state(inst->pool)->num : 0;
+	count = inst->pool ? fr_pool_state(inst->pool)->num : 0;
 
 	/*
 	 *  Here we try with each of the existing connections, then try to create
@@ -352,7 +360,7 @@ sql_rcode_t rlm_sql_query(rlm_sql_t const *inst, REQUEST *request, rlm_sql_handl
 		 *	sockets in the pool and fail to establish a *new* connection.
 		 */
 		case RLM_SQL_RECONNECT:
-			*handle = fr_connection_reconnect(inst->pool, request, *handle);
+			*handle = fr_pool_connection_reconnect(inst->pool, request, *handle);
 			/* Reconnection failed */
 			if (!*handle) return RLM_SQL_RECONNECT;
 			/* Reconnection succeeded, try again with the new handle */
@@ -417,7 +425,7 @@ sql_rcode_t rlm_sql_query(rlm_sql_t const *inst, REQUEST *request, rlm_sql_handl
  *	- #RLM_SQL_RECONNECT if a new handle is required (also sets *handle = NULL).
  *	- #RLM_SQL_QUERY_INVALID, #RLM_SQL_ERROR on invalid query or connection error.
  */
-sql_rcode_t rlm_sql_select_query(rlm_sql_t const *inst, REQUEST *request, rlm_sql_handle_t **handle,  char const *query)
+sql_rcode_t rlm_sql_select_query(rlm_sql_t const *inst, REQUEST *request, rlm_sql_handle_t **handle, char const *query)
 {
 	int ret = RLM_SQL_ERROR;
 	int i, count;
@@ -435,7 +443,7 @@ sql_rcode_t rlm_sql_select_query(rlm_sql_t const *inst, REQUEST *request, rlm_sq
 	/*
 	 *  inst->pool may be NULL is this function is called by mod_conn_create.
 	 */
-	count = inst->pool ? fr_connection_pool_state(inst->pool)->num : 0;
+	count = inst->pool ? fr_pool_state(inst->pool)->num : 0;
 
 	/*
 	 *  For sanity, for when no connections are viable, and we can't make a new one
@@ -453,7 +461,7 @@ sql_rcode_t rlm_sql_select_query(rlm_sql_t const *inst, REQUEST *request, rlm_sq
 		 *	sockets in the pool and fail to establish a *new* connection.
 		 */
 		case RLM_SQL_RECONNECT:
-			*handle = fr_connection_reconnect(inst->pool, request, *handle);
+			*handle = fr_pool_connection_reconnect(inst->pool, request, *handle);
 			/* Reconnection failed */
 			if (!*handle) return RLM_SQL_RECONNECT;
 			/* Reconnection succeeded, try again with the new handle */
@@ -495,8 +503,7 @@ int sql_getvpdata(TALLOC_CTX *ctx, rlm_sql_t const *inst, REQUEST *request, rlm_
 	rcode = rlm_sql_select_query(inst, request, handle, query);
 	if (rcode != RLM_SQL_OK) return -1; /* error handled by rlm_sql_select_query */
 
-	while (rlm_sql_fetch_row(&row, inst, request, handle) == 0) {
-		if (!row) break;
+	while (rlm_sql_fetch_row(&row, inst, request, handle) == RLM_SQL_OK) {
 		if (sql_fr_pair_list_afrom_str(ctx, request, pair, row) != 0) {
 			REDEBUG("Error parsing user data from database result");
 
@@ -514,8 +521,7 @@ int sql_getvpdata(TALLOC_CTX *ctx, rlm_sql_t const *inst, REQUEST *request, rlm_
 /*
  *	Log the query to a file.
  */
-void rlm_sql_query_log(rlm_sql_t const *inst, REQUEST *request,
-		       sql_acct_section_t *section, char const *query)
+void rlm_sql_query_log(rlm_sql_t const *inst, REQUEST *request, sql_acct_section_t *section, char const *query)
 {
 	int fd;
 	char const *filename = NULL;
@@ -530,15 +536,16 @@ void rlm_sql_query_log(rlm_sql_t const *inst, REQUEST *request,
 		return;
 	}
 
-	if (radius_axlat(&expanded, request, filename, NULL, NULL) < 0) {
+	if (xlat_aeval(request, &expanded, request, filename, NULL, NULL) < 0) {
 		return;
 	}
 
-	fd = exfile_open(inst->ef, request, filename, 0640, true);
+	fd = exfile_open(inst->ef, request, filename, 0640);
 	if (fd < 0) {
 		ERROR("Couldn't open logfile '%s': %s", expanded, fr_syserror(errno));
 
 		talloc_free(expanded);
+		/* coverity[missing_unlock] */
 		return;
 	}
 

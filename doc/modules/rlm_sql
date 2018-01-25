@@ -142,7 +142,7 @@
 
 	Not allowed as a check item for RADIUS protocol attributes.  It is
 	allowed for server configuration attributes (Auth-Type, etc), and sets
-	the value of on attribute, only if there is no other item of the
+	the value of an attribute, only if there is no other item of the
 	same attribute.
 
 	As a reply item, it means "add the item to the reply list, but
@@ -270,12 +270,12 @@
 
   And then you can use a specific instance in radiusd.conf, like
   so:
-  authorize {
+  recv Access-Request {
     ...
     sql_instance1
     ...
   }
-  accounting {
+  process Accounting-Request {
     ...
     sql_instance1
     sql_instance2

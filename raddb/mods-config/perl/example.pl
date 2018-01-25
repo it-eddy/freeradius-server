@@ -126,7 +126,12 @@ sub authenticate {
 		return RLM_MODULE_REJECT;
 	} else {
 		# Accept user and set some attribute
-		$RAD_REPLY{'h323-credit-amount'} = "100";
+		if (&radiusd::xlat("%{client:group}") eq 'UltraAllInclusive') {
+			# User called from NAS with unlim plan set, set higher limits
+			$RAD_REPLY{'h323-credit-amount'} = "1000000";
+		} else {
+			$RAD_REPLY{'h323-credit-amount'} = "100";
+		}
 		return RLM_MODULE_OK;
 	}
 }
@@ -146,14 +151,6 @@ sub accounting {
 
 	# You can call another subroutine from here
 	test_call();
-
-	return RLM_MODULE_OK;
-}
-
-# Function to handle checksimul
-sub checksimul {
-	# For debugging purposes only
-#	log_request_attributes();
 
 	return RLM_MODULE_OK;
 }

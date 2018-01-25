@@ -20,12 +20,11 @@
  * @brief Function prototypes and datatypes for the REST (HTTP) transport.
  * @file rest.h
  *
- * @copyright 2012-2014  Arran Cudbard-Bell <a.cudbard-bell@freeradius.org>
+ * @copyright 2012-2016 Arran Cudbard-Bell <a.cudbardb@freeradius.org>
  */
-
 RCSIDH(other_h, "$Id$")
 
-#include <freeradius-devel/connection.h>
+#include <freeradius-devel/pool.h>
 #include "config.h"
 
 #define CURL_NO_OLDIES 1
@@ -102,7 +101,7 @@ extern const FR_NAME_NUMBER http_content_type_table[];
 /*
  *	Structure for section configuration
  */
-typedef struct rlm_rest_section_t {
+typedef struct {
 	char const		*name;		//!< Section name.
 	char const		*uri;		//!< URI to send HTTP request to.
 
@@ -143,15 +142,12 @@ typedef struct rlm_rest_section_t {
 /*
  *	Structure for module configuration
  */
-typedef struct rlm_rest_t {
+typedef struct {
 	char const		*xlat_name;	//!< Instance name.
-
-	char const		*connect_uri;	//!< URI we attempt to connect to, to pre-establish
-						//!< TCP connections.
 
 	char const		*connect_proxy;	//!< Send request via this proxy.
 
-	fr_connection_pool_t	*pool;		//!< Pointer to the connection pool.
+	fr_pool_t	*pool;		//!< Pointer to the connection pool.
 
 	rlm_rest_section_t	xlat;		//!< Configuration specific to xlat.
 	rlm_rest_section_t	authorize;	//!< Configuration specific to authorisation.
@@ -162,6 +158,28 @@ typedef struct rlm_rest_t {
 	rlm_rest_section_t	post_auth;	//!< Configuration specific to Post-auth
 } rlm_rest_t;
 
+/** Thread specific rlm_rest instance data
+ *
+ */
+typedef struct {
+	rlm_rest_t const	*inst;		//!< Instance of rlm_rest.
+	fr_pool_t		*pool;		//!< Thread specific connection pool.
+	CURLM			*mandle;	//!< Thread specific multi handle.  Serves as the dispatch
+						//!< and coralling structure for REST requests.
+	fr_event_list_t		*el;		//!< This thread's event list.
+	fr_event_timer_t const	*ev;		//!< Used to manage IO timers for libcurl.
+	unsigned int		transfers;	//!< Keep track of how many outstanding transfers
+						//!< we think there are.
+} rlm_rest_thread_t;
+
+/** Wrapper around the module thread stuct for individual xlats
+ *
+ */
+typedef struct {
+	rlm_rest_t const	*inst;		//!< Instance of rlm_rest.
+	rlm_rest_thread_t	*t;		//!< rlm_rest thread instance.
+} rest_xlat_thread_inst_t;
+
 /*
  *	States for stream based attribute encoders
  */
@@ -169,7 +187,6 @@ typedef enum {
 	READ_STATE_INIT	= 0,
 	READ_STATE_ATTR_BEGIN,
 	READ_STATE_ATTR_CONT,
-	READ_STATE_ATTR_END,
 	READ_STATE_END,
 } read_state_t;
 
@@ -186,8 +203,8 @@ typedef enum {
 /*
  *	Outbound data context (passed to CURLOPT_READFUNCTION as CURLOPT_READDATA)
  */
-typedef struct rlm_rest_request_t {
-	rlm_rest_t		*instance;	//!< This instance of rlm_rest.
+typedef struct {
+	rlm_rest_t const	*instance;	//!< This instance of rlm_rest.
 	REQUEST			*request;	//!< Current request.
 	read_state_t		state;		//!< Encoder state
 
@@ -202,8 +219,8 @@ typedef struct rlm_rest_request_t {
  *	Curl inbound data context (passed to CURLOPT_WRITEFUNCTION and
  *	CURLOPT_HEADERFUNCTION as CURLOPT_WRITEDATA and CURLOPT_HEADERDATA)
  */
-typedef struct rlm_rest_response_t {
-	rlm_rest_t		*instance;	//!< This instance of rlm_rest.
+typedef struct {
+	rlm_rest_t const	*instance;	//!< This instance of rlm_rest.
 	REQUEST			*request;	//!< Current request.
 	write_state_t		state;		//!< Decoder state.
 
@@ -221,7 +238,7 @@ typedef struct rlm_rest_response_t {
 /*
  *	Curl context data
  */
-typedef struct rlm_rest_curl_context_t {
+typedef struct {
 	struct curl_slist	*headers;	//!< Any HTTP headers which will be sent with the
 						//!< request.
 
@@ -235,9 +252,9 @@ typedef struct rlm_rest_curl_context_t {
 /*
  *	Connection API handle
  */
-typedef struct rlm_rest_handle_t {
-	void			*handle;	//!< Real Handle.
-	rlm_rest_curl_context_t	*ctx;		//!< Context.
+typedef struct {
+	CURL			*candle;	//!< Libcurl easy handle
+	rlm_rest_curl_context_t	*ctx;		//!< Context, re-initialised after each request.
 } rlm_rest_handle_t;
 
 /*
@@ -247,34 +264,28 @@ typedef struct rlm_rest_handle_t {
 typedef size_t (*rest_read_t)(void *ptr, size_t size, size_t nmemb,
 			      void *userdata);
 
-void *mod_conn_create(TALLOC_CTX *ctx, void *instance, struct timeval const *timeout);
 
-int mod_conn_alive(void *instance, void *handle);
+void *mod_conn_create(TALLOC_CTX *ctx, void *instance, struct timeval const *timeout);
 
 /*
  *	Request processing API
  */
-int rest_request_config(rlm_rest_t const *instance,
-			rlm_rest_section_t *section, REQUEST *request,
+int rest_request_config(rlm_rest_t const *instance, rlm_rest_thread_t *thread,
+			rlm_rest_section_t const *section, REQUEST *request,
 			void *handle, http_method_t method,
 			http_body_type_t type, char const *uri,
-			char const *username, char const *password) CC_HINT(nonnull (1,2,3,4,7));
+			char const *username, char const *password) CC_HINT(nonnull (1,2,3,4,5,8));
 
-int rest_request_perform(rlm_rest_t const *instance,
-			 rlm_rest_section_t *section, REQUEST *request,
-			 void *handle);
-
-int rest_response_certinfo(UNUSED rlm_rest_t const *instance, rlm_rest_section_t *section,
+int rest_response_certinfo(UNUSED rlm_rest_t const *instance, rlm_rest_section_t const *section,
 			   REQUEST *request, void *handle);
 
 int rest_response_decode(rlm_rest_t const *instance,
-			UNUSED rlm_rest_section_t *section, REQUEST *request,
+			UNUSED rlm_rest_section_t const *section, REQUEST *request,
 			void *handle);
 
 void rest_response_error(REQUEST *request, rlm_rest_handle_t *handle);
 
-void rest_request_cleanup(rlm_rest_t const *instance, rlm_rest_section_t *section,
-			  void *handle);
+void rest_request_cleanup(rlm_rest_t const *instance, void *handle);
 
 #define rest_get_handle_code(_handle)(((rlm_rest_curl_context_t*)((rlm_rest_handle_t*)_handle)->ctx)->response.code)
 
@@ -286,6 +297,14 @@ size_t rest_get_handle_data(char const **out, rlm_rest_handle_t *handle);
  *	Helper functions
  */
 size_t rest_uri_escape(UNUSED REQUEST *request, char *out, size_t outlen, char const *raw, UNUSED void *arg);
-ssize_t rest_uri_build(char **out, rlm_rest_t *instance, REQUEST *request, char const *uri);
+ssize_t rest_uri_build(char **out, rlm_rest_t const *instance, REQUEST *request, char const *uri);
 ssize_t rest_uri_host_unescape(char **out, UNUSED rlm_rest_t const *mod_inst, REQUEST *request,
 			       void *handle, char const *uri);
+
+/*
+ *	Async IO helpers
+ */
+void rest_io_action(REQUEST *request, void *instance, void *thread, void *ctx, fr_state_signal_t action);
+int rest_io_request_enqueue(rlm_rest_thread_t *thread, REQUEST *request, void *handle);
+int rest_io_init(rlm_rest_thread_t *thread);
+

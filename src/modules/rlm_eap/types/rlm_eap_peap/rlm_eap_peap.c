@@ -31,7 +31,7 @@ typedef struct rlm_eap_peap_t {
 	fr_tls_conf_t	*tls_conf;
 
 	char const		*inner_eap_module;	//!< module name for inner EAP
-	int			auth_type_eap;
+	fr_dict_enum_t		*auth_type_eap;
 	bool			use_tunneled_reply;	//!< Use the reply attributes from the tunneled session in
 							//!< the non-tunneled reply to the client.
 
@@ -50,25 +50,25 @@ typedef struct rlm_eap_peap_t {
 
 
 static CONF_PARSER submodule_config[] = {
-	{ FR_CONF_OFFSET("tls", PW_TYPE_STRING, rlm_eap_peap_t, tls_conf_name) },
+	{ FR_CONF_OFFSET("tls", FR_TYPE_STRING, rlm_eap_peap_t, tls_conf_name) },
 
-	{ FR_CONF_OFFSET("inner_eap_module", PW_TYPE_STRING, rlm_eap_peap_t, inner_eap_module), },
+	{ FR_CONF_OFFSET("inner_eap_module", FR_TYPE_STRING, rlm_eap_peap_t, inner_eap_module), },
 
-	{ FR_CONF_DEPRECATED("copy_request_to_tunnel", PW_TYPE_BOOLEAN, rlm_eap_peap_t, NULL), .dflt = "no" },
+	{ FR_CONF_DEPRECATED("copy_request_to_tunnel", FR_TYPE_BOOL, rlm_eap_peap_t, NULL), .dflt = "no" },
 
-	{ FR_CONF_DEPRECATED("use_tunneled_reply", PW_TYPE_BOOLEAN, rlm_eap_peap_t, NULL), .dflt = "no" },
+	{ FR_CONF_DEPRECATED("use_tunneled_reply", FR_TYPE_BOOL, rlm_eap_peap_t, NULL), .dflt = "no" },
 
 #ifdef WITH_PROXY
-	{ FR_CONF_OFFSET("proxy_tunneled_request_as_eap", PW_TYPE_BOOLEAN, rlm_eap_peap_t, proxy_tunneled_request_as_eap), .dflt = "yes" },
+	{ FR_CONF_OFFSET("proxy_tunneled_request_as_eap", FR_TYPE_BOOL, rlm_eap_peap_t, proxy_tunneled_request_as_eap), .dflt = "yes" },
 #endif
 
-	{ FR_CONF_OFFSET("virtual_server", PW_TYPE_STRING | PW_TYPE_REQUIRED | PW_TYPE_NOT_EMPTY, rlm_eap_peap_t, virtual_server) },
+	{ FR_CONF_OFFSET("virtual_server", FR_TYPE_STRING | FR_TYPE_REQUIRED | FR_TYPE_NOT_EMPTY, rlm_eap_peap_t, virtual_server) },
 
-	{ FR_CONF_OFFSET("soh", PW_TYPE_BOOLEAN, rlm_eap_peap_t, soh), .dflt = "no" },
+	{ FR_CONF_OFFSET("soh", FR_TYPE_BOOL, rlm_eap_peap_t, soh), .dflt = "no" },
 
-	{ FR_CONF_OFFSET("require_client_cert", PW_TYPE_BOOLEAN, rlm_eap_peap_t, req_client_cert), .dflt = "no" },
+	{ FR_CONF_OFFSET("require_client_cert", FR_TYPE_BOOL, rlm_eap_peap_t, req_client_cert), .dflt = "no" },
 
-	{ FR_CONF_OFFSET("soh_virtual_server", PW_TYPE_STRING, rlm_eap_peap_t, soh_virtual_server) },
+	{ FR_CONF_OFFSET("soh_virtual_server", FR_TYPE_STRING, rlm_eap_peap_t, soh_virtual_server) },
 	CONF_PARSER_TERMINATOR
 };
 
@@ -231,9 +231,9 @@ static rlm_rcode_t mod_session_init(void *type_arg, eap_session_t *eap_session)
 	 *	EAP-TLS-Require-Client-Cert attribute will override
 	 *	the require_client_cert configuration option.
 	 */
-	vp = fr_pair_find_by_num(eap_session->request->control, 0, PW_EAP_TLS_REQUIRE_CLIENT_CERT, TAG_ANY);
+	vp = fr_pair_find_by_num(eap_session->request->control, 0, FR_EAP_TLS_REQUIRE_CLIENT_CERT, TAG_ANY);
 	if (vp) {
-		client_cert = vp->vp_integer ? true : false;
+		client_cert = vp->vp_uint32 ? true : false;
 	} else {
 		client_cert = inst->req_client_cert;
 	}
@@ -281,18 +281,18 @@ static rlm_rcode_t mod_session_init(void *type_arg, eap_session_t *eap_session)
 /*
  *	Attach the module.
  */
-static int mod_instantiate(UNUSED rlm_eap_config_t const *config, void *instance, CONF_SECTION *cs)
+static int mod_instantiate(void *instance, CONF_SECTION *cs)
 {
 	rlm_eap_peap_t		*inst = talloc_get_type_abort(instance, rlm_eap_peap_t);
 	fr_dict_enum_t		*dv;
 
-	if (!cf_section_sub_find_name2(main_config.config, "server", inst->virtual_server)) {
+	if (!virtual_server_find(inst->virtual_server)) {
 		cf_log_err_by_name(cs, "virtual_server", "Unknown virtual server '%s'", inst->virtual_server);
 		return -1;
 	}
 
 	if (inst->soh_virtual_server) {
-		if (!cf_section_sub_find_name2(main_config.config, "server", inst->soh_virtual_server)) {
+		if (!virtual_server_find(inst->soh_virtual_server)) {
 			cf_log_err_by_name(cs, "soh_virtual_server", "Unknown virtual server '%s'", inst->virtual_server);
 			return -1;
 		}
@@ -313,13 +313,13 @@ static int mod_instantiate(UNUSED rlm_eap_config_t const *config, void *instance
 	 */
 	if (!inst->inner_eap_module) inst->inner_eap_module = "eap";
 
-	dv = fr_dict_enum_by_name(NULL, fr_dict_attr_by_num(NULL, 0, PW_AUTH_TYPE), inst->inner_eap_module);
+	dv = fr_dict_enum_by_alias(NULL, fr_dict_attr_by_num(NULL, 0, FR_AUTH_TYPE), inst->inner_eap_module);
 	if (!dv) {
 		WARN("Failed to find 'Auth-Type %s' section in virtual server %s.  "
 		     "The server cannot proxy inner-tunnel EAP packets",
 		     inst->inner_eap_module, inst->virtual_server);
 	} else {
-		inst->auth_type_eap = dv->value;
+		inst->auth_type_eap = dv;
 	}
 
 	return 0;
@@ -334,6 +334,7 @@ rlm_eap_submodule_t rlm_eap_peap = {
 	.name		= "eap_peap",
 	.magic		= RLM_MODULE_INIT,
 
+	.provides	= { FR_EAP_PEAP },
 	.inst_size	= sizeof(rlm_eap_peap_t),
 	.config		= submodule_config,
 	.instantiate	= mod_instantiate,

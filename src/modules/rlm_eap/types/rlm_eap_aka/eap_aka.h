@@ -33,14 +33,58 @@ RCSIDH(rlm_eap_aka_eap_aka_h, "$Id$")
  * In server_start, we send a EAP-AKA Start message.
  */
 typedef enum {
-	EAP_AKA_SERVER_START		= 0,
-	EAP_AKA_SERVER_CHALLENGE	= 1,
-	EAP_AKA_SERVER_SUCCESS		= 2,
+	EAP_AKA_SERVER_IDENTITY = 0,				//!< Attempting to discover permanent
+								///< identity of the supplicant.
+	EAP_AKA_SERVER_CHALLENGE,				//!< We've challenged the supplicant.
+	EAP_AKA_SERVER_SUCCESS_NOTIFICATION,			//!< Send success notification.
+	EAP_AKA_SERVER_SUCCESS,					//!< Authentication completed successfully.
+	EAP_AKA_SERVER_FAILURE_NOTIFICATION,			//!< Send failure notification.
+	EAP_AKA_SERVER_FAILURE,					//!< Send an EAP-Failure.
 	EAP_AKA_SERVER_MAX_STATES
 } eap_aka_server_state_t;
 
-typedef struct eap_aka_session {
-	eap_aka_server_state_t	state;		//!< Current session state.
-	fr_sim_keys_t		keys;		//!< Various EAP-AKA keys.
-	int  			aka_id;		//!< Packet ID. (replay protection)
+typedef struct {
+	eap_aka_server_state_t		state;			//!< Current session state.
+	bool				allow_encrypted;	//!< Whether we can send encrypted attributes.
+	bool				challenge_success;	//!< Whether we received the correct
+								///< challenge response.
+
+	fr_sim_id_req_type_t		id_req;			//!< The type of identity we're requesting
+								///< or previously requested.
+	fr_sim_keys_t			keys;			//!< Various EAP-AKA keys.
+
+	eap_type_t			type;			//!< Either FR_TYPE_AKA, or FR_TYPE_AKA_PRIME.
+	uint16_t			kdf;			//!< The key derivation function used to derive
+								///< session keys.
+
+	/*
+	 *	Per-session configuration
+	 */
+	bool				request_identity;	//!< Always send an identity request before a
+								///< challenge.
+	bool				send_result_ind;	//!< Say that we would like to use protected result
+								///< indications (AKA-Notification-Success).
+	bool				send_at_bidding;	//!< Indicate that we prefer EAP-AKA' and include
+								///< an AT_BIDDING attribute.
+
+	EVP_MD const			*checkcode_md;		//!< Message digest we use to generate the
+								///< checkcode. EVP_sha1() for EAP-AKA,
+								///< EVP_sha256() for EAP-AKA'.
+	fr_sim_checkcode_t		*checkcode_state;	//!< Digest of all identity packets we've seen.
+	uint8_t				checkcode[32];		//!< Checkcode we calculated.
+	size_t				checkcode_len;		//!< 0, 20 or 32 bytes.
+
+	EVP_MD const			*mac_md;		//!< HMAC-MD we use to generate the MAC.
+								///< EVP_sha1() for EAP-AKA, EVP_sha256()
+								///< for EAP-AKA'.
+
+	int  				aka_id;			//!< Packet ID. (replay protection).
 } eap_aka_session_t;
+
+typedef struct {
+	char const			*network_id;		//!< Network ID as described by RFC 5448.
+	bool				request_identity;	//!< Whether we always request the identity of
+								///< the subscriber.
+	char const			*virtual_server;	//!< Virtual server for HLR integration.
+	bool				protected_success;
+} rlm_eap_aka_t;

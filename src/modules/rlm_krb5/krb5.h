@@ -29,7 +29,7 @@ USES_APPLE_DEPRECATED_API
 #include <krb5.h>
 
 #ifdef KRB5_IS_THREAD_SAFE
-#  include <freeradius-devel/connection.h>
+#  include <freeradius-devel/pool.h>
 #endif
 
 typedef struct rlm_krb5_handle {
@@ -48,7 +48,7 @@ typedef struct rlm_krb5_handle {
  */
 typedef struct rlm_krb5_t {
 #ifdef KRB5_IS_THREAD_SAFE
-	fr_connection_pool_t	*pool;		//!< Connection pool instance.
+	fr_pool_t	*pool;		//!< Connection pool instance.
 #else
 	rlm_krb5_handle_t	*conn;
 #endif
@@ -87,7 +87,7 @@ typedef struct rlm_krb5_t {
 #  endif
 #  define rlm_krb5_error(_x, _y, _z) error_message(_z)
 #else
-char const *rlm_krb5_error(rlm_krb5_t *inst, krb5_context context, krb5_error_code code);
+char const *rlm_krb5_error(rlm_krb5_t const *inst, krb5_context context, krb5_error_code code);
 #endif
 
 void *mod_conn_create(TALLOC_CTX *ctx, void *instance, struct timeval const *timeout);

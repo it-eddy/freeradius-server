@@ -124,7 +124,6 @@ static sql_rcode_t sql_query(rlm_sql_handle_t *handle, UNUSED rlm_sql_config_t *
 		      (long int) conn->sql_code, conn->error, query);
 
 		if (conn->sql_code == DOWN_SQL_CODE) {
-		reconnect:
 			pthread_mutex_unlock(&conn->mut);
 
 			return RLM_SQL_RECONNECT;
@@ -135,20 +134,18 @@ static sql_rcode_t sql_query(rlm_sql_handle_t *handle, UNUSED rlm_sql_config_t *
 			//assume the network is down if rollback had failed
 			ERROR("Fail to rollback transaction after previous error: %s", conn->error);
 
-			goto reconnect;
+			return RLM_SQL_RECONNECT;
 		}
 		//   conn->in_use=0;
-	fail:
-		pthread_mutex_unlock(&conn->mut);
 
 		return RLM_SQL_ERROR;
 	}
 
 	if (conn->statement_type != isc_info_sql_stmt_select) {
-		if (fb_commit(conn)) goto fail;
+		if (fb_commit(conn)) return RLM_SQL_ERROR;	/* fb_commit unlocks the mutex */
+	} else {
+		pthread_mutex_unlock(&conn->mut);
 	}
-
-	pthread_mutex_unlock(&conn->mut);
 
 	return 0;
 }
@@ -211,7 +208,8 @@ static sql_rcode_t sql_fetch_row(rlm_sql_row_t *out, rlm_sql_handle_t *handle, U
 
 	if (conn->statement_type != isc_info_sql_stmt_exec_procedure) {
 		res = fb_fetch(conn);
-		if (res == 100) return RLM_SQL_OK;
+		if (res == 100) return RLM_SQL_NO_MORE_ROWS;
+
 		if (res) {
 			ERROR("Fetch problem: %s", conn->error);
 

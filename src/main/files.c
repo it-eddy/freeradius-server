@@ -74,8 +74,7 @@ void pairlist_free(PAIR_LIST **pl)
 #define FIND_MODE_HAVE_REPLY 2
 
 /*
- *	Read the users, huntgroups or hints file.
- *	Return a PAIR_LIST.
+ *	Read the users file. Return a PAIR_LIST.
  */
 int pairlist_read(TALLOC_CTX *ctx, char const *file, PAIR_LIST **list, int complain)
 {
@@ -97,7 +96,7 @@ int pairlist_read(TALLOC_CTX *ctx, char const *file, PAIR_LIST **list, int compl
 #endif
 	char newfile[8192];
 
-	DEBUG2("      reading file %s", file);
+	DEBUG2("Reading file %s", file);
 
 	/*
 	 *	Open the file.  The error message should be a little
@@ -146,7 +145,7 @@ parse_again:
 
 			/*
 			 *	Get the name.
-			 */		      
+			 */
 			ptr = buffer;
 			getword(&ptr, entry, sizeof(entry), false);
 			entry_lineno = lineno;
@@ -211,8 +210,7 @@ parse_again:
 			parsecode = fr_pair_list_afrom_str(ctx, ptr, &check_tmp);
 			if (parsecode == T_INVALID) {
 				pairlist_free(&pl);
-				ERROR("%s[%d]: Parse error (check) for entry %s: %s",
-					file, lineno, entry, fr_strerror());
+				PERROR("%s[%d]: Parse error (check) for entry %s", file, lineno, entry);
 				fclose(fp);
 				return -1;
 			}
@@ -230,16 +228,16 @@ parse_again:
 			/*
 			 *	Do some more sanity checks.
 			 */
-			for (vp = fr_cursor_init(&cursor, &check_tmp);
+			for (vp = fr_pair_cursor_init(&cursor, &check_tmp);
 			     vp;
-			     vp = fr_cursor_next(&cursor)) {
+			     vp = fr_pair_cursor_next(&cursor)) {
 				if (((vp->op == T_OP_REG_EQ) ||
 				     (vp->op == T_OP_REG_NE)) &&
-				    (vp->da->type != PW_TYPE_STRING)) {
+				    (vp->vp_type != FR_TYPE_STRING)) {
 					pairlist_free(&pl);
 					talloc_free(check_tmp);
-					ERROR("%s[%d]: Cannot use regular expressions for non-string attributes in entry %s",
-					      file, lineno, entry);
+					ERROR("%s[%d]: Cannot use regular expressions for non-string "
+					      "attributes in entry %s", file, lineno, entry);
 					fclose(fp);
 					return -1;
 				}
@@ -297,8 +295,7 @@ parse_again:
 			pairlist_free(&pl);
 			talloc_free(check_tmp);
 			talloc_free(reply_tmp);
-			ERROR("%s[%d]: Parse error (reply) for entry %s: %s",
-			      file, lineno, entry, fr_strerror());
+			PERROR("%s[%d]: Parse error (reply) for entry %s", file, lineno, entry);
 			fclose(fp);
 			return -1;
 		}

@@ -72,7 +72,7 @@ typedef struct rlm_sql_postgres_conn {
 } rlm_sql_postgres_conn_t;
 
 static CONF_PARSER driver_config[] = {
-	{ FR_CONF_OFFSET("send_application_name", PW_TYPE_BOOLEAN, rlm_sql_postgres_t, send_application_name), .dflt = "no" },
+	{ FR_CONF_OFFSET("send_application_name", FR_TYPE_BOOL, rlm_sql_postgres_t, send_application_name), .dflt = "no" },
 	CONF_PARSER_TERMINATOR
 };
 
@@ -315,7 +315,7 @@ static sql_rcode_t sql_fetch_row(rlm_sql_row_t *out, rlm_sql_handle_t *handle, U
 	*out = NULL;
 	handle->row = NULL;
 
-	if (conn->cur_row >= PQntuples(conn->result)) return RLM_SQL_OK;
+	if (conn->cur_row >= PQntuples(conn->result)) return RLM_SQL_NO_MORE_ROWS;
 
 	free_result_row(conn);
 
@@ -331,9 +331,11 @@ static sql_rcode_t sql_fetch_row(rlm_sql_row_t *out, rlm_sql_handle_t *handle, U
 		}
 		conn->cur_row++;
 		*out = handle->row = conn->row;
+
+		return RLM_SQL_OK;
 	}
 
-	return RLM_SQL_OK;
+	return RLM_SQL_NO_MORE_ROWS;
 }
 
 static int sql_num_fields(rlm_sql_handle_t * handle, UNUSED rlm_sql_config_t *config)
@@ -383,7 +385,7 @@ static size_t sql_error(TALLOC_CTX *ctx, sql_log_entry_t out[], size_t outlen,
 	p = PQerrorMessage(conn->db);
 	while ((q = strchr(p, '\n'))) {
 		out[i].type = L_ERR;
-		out[i].msg = talloc_asprintf(ctx, "%.*s", (int) (q - p), p);
+		out[i].msg = talloc_typed_asprintf(ctx, "%.*s", (int) (q - p), p);
 		p = q + 1;
 		if (++i == outlen) return outlen;
 	}
@@ -438,7 +440,7 @@ static int mod_instantiate(rlm_sql_config_t const *config, void *instance, CONF_
 		CONF_SECTION	*cs;
 		char const	*name;
 
-		cs = cf_item_parent(cf_section_to_item(conf));
+		cs = cf_item_to_section(cf_parent(conf));
 
 		name = cf_section_name2(cs);
 		if (!name) name = cf_section_name1(cs);

@@ -36,7 +36,7 @@ RCSID("$Id$")
  *
  *  Expands Class, treating octet at offset 0 (bytes 0-3) as an "integer".
  */
-static ssize_t unpack_xlat(char **out, size_t outlen,
+static ssize_t unpack_xlat(UNUSED TALLOC_CTX *ctx, char **out, size_t outlen,
 			   UNUSED void const *mod_inst, UNUSED void const *xlat_inst,
 			   REQUEST *request, char const *fmt)
 {
@@ -44,7 +44,7 @@ static ssize_t unpack_xlat(char **out, size_t outlen,
 	char *p;
 	size_t len, input_len;
 	int offset;
-	PW_TYPE type;
+	fr_type_t type;
 	fr_dict_attr_t const *da;
 	VALUE_PAIR *vp, *cast;
 	uint8_t const *input;
@@ -92,8 +92,8 @@ static ssize_t unpack_xlat(char **out, size_t outlen,
 	if (*data_name == '&') {
 		if (radius_get_vp(&vp, request, data_name) < 0) goto nothing;
 
-		if ((vp->da->type != PW_TYPE_OCTETS) &&
-		    (vp->da->type != PW_TYPE_STRING)) {
+		if ((vp->vp_type != FR_TYPE_OCTETS) &&
+		    (vp->vp_type != FR_TYPE_STRING)) {
 			REDEBUG("unpack requires the input attribute to be 'string' or 'octets'");
 			goto nothing;
 		}
@@ -118,12 +118,12 @@ static ssize_t unpack_xlat(char **out, size_t outlen,
 
 	offset = (int) strtoul(data_size, &p, 10);
 	if (*p) {
-		REDEBUG("unpack requires a decimal number, not '%s'", data_size);
+		REDEBUG("unpack requires a float64 number, not '%s'", data_size);
 		goto nothing;
 	}
 
-	type = fr_str2int(dict_attr_types, data_type, PW_TYPE_INVALID);
-	if (type == PW_TYPE_INVALID) {
+	type = fr_str2int(dict_attr_types, data_type, FR_TYPE_INVALID);
+	if (type == FR_TYPE_INVALID) {
 		REDEBUG("Invalid data type '%s'", data_type);
 		goto nothing;
 	}
@@ -142,7 +142,7 @@ static ssize_t unpack_xlat(char **out, size_t outlen,
 		goto nothing;
 	}
 
-	da = fr_dict_attr_by_num(NULL, 0, PW_CAST_BASE + type);
+	da = fr_dict_attr_by_num(NULL, 0, FR_CAST_BASE + type);
 	if (!da) {
 		REDEBUG("Cannot decode type '%s'", data_type);
 		goto nothing;
@@ -152,24 +152,23 @@ static ssize_t unpack_xlat(char **out, size_t outlen,
 	if (!cast) goto nothing;
 
 	memcpy(&(cast->data), input + offset, dict_attr_sizes[type][0]);
-	cast->vp_length = dict_attr_sizes[type][0];
 
 	/*
 	 *	Hacks
 	 */
 	switch (type) {
-	case PW_TYPE_SIGNED:
-	case PW_TYPE_INTEGER:
-	case PW_TYPE_DATE:
-		cast->vp_integer = ntohl(cast->vp_integer);
+	case FR_TYPE_INT32:
+	case FR_TYPE_UINT32:
+	case FR_TYPE_DATE:
+		cast->vp_uint32 = ntohl(cast->vp_uint32);
 		break;
 
-	case PW_TYPE_SHORT:
-		cast->vp_short = ((input[offset] << 8) | input[offset + 1]);
+	case FR_TYPE_UINT16:
+		cast->vp_uint16 = ((input[offset] << 8) | input[offset + 1]);
 		break;
 
-	case PW_TYPE_INTEGER64:
-		cast->vp_integer64 = ntohll(cast->vp_integer64);
+	case FR_TYPE_UINT64:
+		cast->vp_uint64 = ntohll(cast->vp_uint64);
 		break;
 
 	default:
@@ -190,11 +189,11 @@ static ssize_t unpack_xlat(char **out, size_t outlen,
 /*
  *	Register the xlats
  */
-static int mod_bootstrap(CONF_SECTION *conf, void *instance)
+static int mod_bootstrap(UNUSED void *instance, CONF_SECTION *conf)
 {
 	if (cf_section_name2(conf)) return 0;
 
-	xlat_register(instance, "unpack", unpack_xlat, NULL, NULL, 0, XLAT_DEFAULT_BUF_LEN);
+	xlat_register(NULL, "unpack", unpack_xlat, NULL, NULL, 0, XLAT_DEFAULT_BUF_LEN, true);
 
 	return 0;
 }

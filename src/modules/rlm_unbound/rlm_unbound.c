@@ -57,8 +57,8 @@ typedef struct rlm_unbound_t {
  *	A mapping of configuration file names to internal variables.
  */
 static const CONF_PARSER module_config[] = {
-	{ FR_CONF_OFFSET("filename", PW_TYPE_FILE_INPUT | PW_TYPE_REQUIRED, rlm_unbound_t, filename), .dflt = "${modconfdir}/unbound/default.conf" },
-	{ FR_CONF_OFFSET("timeout", PW_TYPE_INTEGER, rlm_unbound_t, timeout), .dflt = "3000" },
+	{ FR_CONF_OFFSET("filename", FR_TYPE_FILE_INPUT | FR_TYPE_REQUIRED, rlm_unbound_t, filename), .dflt = "${modconfdir}/unbound/default.conf" },
+	{ FR_CONF_OFFSET("timeout", FR_TYPE_UINT32, rlm_unbound_t, timeout), .dflt = "3000" },
 	CONF_PARSER_TERMINATOR
 };
 
@@ -212,7 +212,7 @@ static int ub_common_fail(REQUEST *request, char const *name, struct ub_result *
 	return 0;
 }
 
-static ssize_t xlat_a(char **out, size_t outlen,
+static ssize_t xlat_a(UNUSED TALLOC_CTX *ctx, char **out, size_t outlen,
 		      void const *mod_inst, UNUSED void const *xlat_inst,
 		      REQUEST *request, char const *fmt)
 {
@@ -259,7 +259,7 @@ static ssize_t xlat_a(char **out, size_t outlen,
 	return -1;
 }
 
-static ssize_t xlat_aaaa(char **out, size_t outlen,
+static ssize_t xlat_aaaa(UNUSED TALLOC_CTX *ctx, char **out, size_t outlen,
 			 void const *mod_inst, UNUSED void const *xlat_inst,
 			 REQUEST *request, char const *fmt)
 {
@@ -304,7 +304,7 @@ error0:
 	return -1;
 }
 
-static ssize_t xlat_ptr(char **out, size_t outlen,
+static ssize_t xlat_ptr(UNUSED TALLOC_CTX *ctx, char **out, size_t outlen,
 			void const *mod_inst, UNUSED void const *xlat_inst,
 			REQUEST *request, char const *fmt)
 {
@@ -357,7 +357,7 @@ error0:
  *	embedded client modes.  This callback function lets an event loop call
  *	ub_process when the instance's file descriptor becomes ready.
  */
-static void ub_fd_handler(UNUSED fr_event_list_t *el, UNUSED int sock, void *ctx)
+static void ub_fd_handler(UNUSED fr_event_list_t *el, UNUSED int sock, UNUSED int flags, void *ctx)
 {
 	rlm_unbound_t *inst = ctx;
 	int err;
@@ -368,7 +368,7 @@ static void ub_fd_handler(UNUSED fr_event_list_t *el, UNUSED int sock, void *ctx
 	}
 }
 
-static int mod_bootstrap(CONF_SECTION *conf, void *instance)
+static int mod_bootstrap(void *instance, CONF_SECTION *conf)
 {
 	rlm_unbound_t *inst = instance;
 
@@ -376,7 +376,7 @@ static int mod_bootstrap(CONF_SECTION *conf, void *instance)
 	if (!inst->name) inst->name = cf_section_name1(conf);
 
 	if (inst->timeout > 10000) {
-		cf_log_err_cs(conf, "timeout must be 0 to 10000");
+		cf_log_err(conf, "timeout must be 0 to 10000");
 		return -1;
 	}
 
@@ -384,29 +384,32 @@ static int mod_bootstrap(CONF_SECTION *conf, void *instance)
 	MEM(inst->xlat_aaaa_name = talloc_typed_asprintf(inst, "%s-aaaa", inst->name));
 	MEM(inst->xlat_ptr_name = talloc_typed_asprintf(inst, "%s-ptr", inst->name));
 
-	if (xlat_register(inst, inst->xlat_a_name, xlat_a, NULL, NULL, 0, XLAT_DEFAULT_BUF_LEN) ||
-	    xlat_register(inst, inst->xlat_aaaa_name, xlat_aaaa, NULL, NULL, 0, XLAT_DEFAULT_BUF_LEN) ||
-	    xlat_register(inst, inst->xlat_ptr_name, xlat_ptr, NULL, NULL, 0, XLAT_DEFAULT_BUF_LEN)) {
-		cf_log_err_cs(conf, "Failed registering xlats");
+	if (xlat_register(inst, inst->xlat_a_name, xlat_a, NULL, NULL, 0, XLAT_DEFAULT_BUF_LEN, false) ||
+	    xlat_register(inst, inst->xlat_aaaa_name, xlat_aaaa, NULL, NULL, 0, XLAT_DEFAULT_BUF_LEN, false) ||
+	    xlat_register(inst, inst->xlat_ptr_name, xlat_ptr, NULL, NULL, 0, XLAT_DEFAULT_BUF_LEN, false)) {
+		cf_log_err(conf, "Failed registering xlats");
 		return -1;
 	}
 
 	return 0;
 }
 
-static int mod_instantiate(CONF_SECTION *conf, void *instance)
+static int mod_instantiate(void *instance, CONF_SECTION *conf)
 {
 	rlm_unbound_t *inst = instance;
 	int res;
 	char *optval;
 
-	log_dst_t log_dst;
+	fr_log_dst_t log_dst;
 	int log_level;
 	int log_fd = -1;
 
 	char k[64]; /* To silence const warns until newer unbound in distros */
 
-	inst->el = radius_event_list_corral(EVENT_CORRAL_AUX);
+	/*
+	 *	@todo - move this to the thread-instantiate function
+	 */
+	inst->el = fr_global_event_list();
 	inst->log_pipe_stream[0] = NULL;
 	inst->log_pipe_stream[1] = NULL;
 	inst->log_fd = -1;
@@ -414,7 +417,7 @@ static int mod_instantiate(CONF_SECTION *conf, void *instance)
 
 	inst->ub = ub_ctx_create();
 	if (!inst->ub) {
-		cf_log_err_cs(conf, "ub_ctx_create failed");
+		cf_log_err(conf, "ub_ctx_create failed");
 		return -1;
 	}
 
@@ -561,6 +564,19 @@ static int mod_instantiate(CONF_SECTION *conf, void *instance)
 		if (optval && strlen(optval)) {
 			log_dst = L_DST_FILES;
 
+			/*
+			 *	We open log_fd early in the process,
+			 *	so that libunbound doesn't close
+			 *	stdout / stderr on us (grrr, stupid
+			 *	software).  But if the config say to
+			 *	use files, we now have to close the
+			 *	dup'd FD.
+			 */
+			if (log_fd >= 0) {
+				close(log_fd);
+				log_fd = -1;
+			}
+
 		} else if (!rad_debug_lvl) {
 			log_dst = L_DST_NULL;
 		}
@@ -575,13 +591,13 @@ static int mod_instantiate(CONF_SECTION *conf, void *instance)
 		 * dup it so libunbound doesn't close it on us.
 		 */
 		if (log_fd == -1) {
-			cf_log_err_cs(conf, "Could not dup fd");
+			cf_log_err(conf, "Could not dup fd");
 			goto error_nores;
 		}
 
 		inst->log_stream = fdopen(log_fd, "w");
 		if (!inst->log_stream) {
-			cf_log_err_cs(conf, "error setting up log stream");
+			cf_log_err(conf, "error setting up log stream");
 			goto error_nores;
 		}
 
@@ -625,8 +641,12 @@ static int mod_instantiate(CONF_SECTION *conf, void *instance)
 
 	inst->log_fd = ub_fd(inst->ub);
 	if (inst->log_fd >= 0) {
-		if (fr_event_fd_insert(inst->el, 0, inst->log_fd, ub_fd_handler, inst) < 0) {
-			cf_log_err_cs(conf, "could not insert async fd");
+		if (fr_event_fd_insert(inst, inst->el, inst->log_fd,
+				       ub_fd_handler,
+				       NULL,
+				       NULL,
+				       inst) < 0) {
+			cf_log_err(conf, "could not insert async fd");
 			inst->log_fd = -1;
 			goto error_nores;
 		}
@@ -636,7 +656,7 @@ static int mod_instantiate(CONF_SECTION *conf, void *instance)
 	return 0;
 
  error:
-	cf_log_err_cs(conf, "%s", ub_strerror(res));
+	cf_log_err(conf, "%s", ub_strerror(res));
 
  error_nores:
 	if (log_fd > -1) close(log_fd);
@@ -649,7 +669,7 @@ static int mod_detach(void *instance)
 	rlm_unbound_t *inst = instance;
 
 	if (inst->log_fd >= 0) {
-		fr_event_fd_delete(inst->el, 0, inst->log_fd);
+		fr_event_fd_delete(inst->el, inst->log_fd, FR_EVENT_FILTER_IO);
 		if (inst->ub) {
 			ub_process(inst->ub);
 			/* This can hang/leave zombies currently
@@ -668,7 +688,7 @@ static int mod_detach(void *instance)
 
 	if (inst->log_pipe_stream[0]) {
 		if (inst->log_pipe_in_use) {
-			fr_event_fd_delete(inst->el, 0, inst->log_pipe[0]);
+			fr_event_fd_delete(inst->el, inst->log_pipe[0], FR_EVENT_FILTER_IO);
 		}
 		fclose(inst->log_pipe_stream[0]);
 	}

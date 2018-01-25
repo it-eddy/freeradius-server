@@ -64,6 +64,7 @@ void request_stats_final(REQUEST *request)
 
 	if (!request->listener) return;
 	if (!request->client) return;
+	if (!request->packet) return;
 
 	if ((request->listener->type != RAD_LISTEN_NONE) &&
 #ifdef WITH_ACCOUNTING
@@ -75,7 +76,7 @@ void request_stats_final(REQUEST *request)
 	    (request->listener->type != RAD_LISTEN_AUTH)) return;
 
 	/* don't count statistic requests */
-	if (request->packet->code == PW_CODE_STATUS_SERVER)
+	if (request->packet->code == FR_CODE_STATUS_SERVER)
 		return;
 
 #undef INC_AUTH
@@ -110,8 +111,8 @@ void request_stats_final(REQUEST *request)
 	 *	deleted, because only the main server thread calls
 	 *	this function, which makes it thread-safe.
 	 */
-	if (request->reply && request->packet && (request->packet->code != PW_CODE_STATUS_SERVER)) switch (request->reply->code) {
-	case PW_CODE_ACCESS_ACCEPT:
+	if (request->reply && (request->packet->code != FR_CODE_STATUS_SERVER)) switch (request->reply->code) {
+	case FR_CODE_ACCESS_ACCEPT:
 		INC_AUTH(total_access_accepts);
 
 		auth_stats:
@@ -131,16 +132,16 @@ void request_stats_final(REQUEST *request)
 			      &request->reply->timestamp);
 		break;
 
-	case PW_CODE_ACCESS_REJECT:
+	case FR_CODE_ACCESS_REJECT:
 		INC_AUTH(total_access_rejects);
 		goto auth_stats;
 
-	case PW_CODE_ACCESS_CHALLENGE:
+	case FR_CODE_ACCESS_CHALLENGE:
 		INC_AUTH(total_access_challenges);
 		goto auth_stats;
 
 #ifdef WITH_ACCOUNTING
-	case PW_CODE_ACCOUNTING_RESPONSE:
+	case FR_CODE_ACCOUNTING_RESPONSE:
 		INC_ACCT(total_responses);
 		fr_stats_bins(&radius_acct_stats,
 			      &request->packet->timestamp,
@@ -152,7 +153,7 @@ void request_stats_final(REQUEST *request)
 #endif
 
 #ifdef WITH_COA
-	case PW_CODE_COA_ACK:
+	case FR_CODE_COA_ACK:
 		INC_COA(total_access_accepts);
 	  coa_stats:
 		INC_COA(total_responses);
@@ -161,11 +162,11 @@ void request_stats_final(REQUEST *request)
 			      &request->reply->timestamp);
 		break;
 
-	case PW_CODE_COA_NAK:
+	case FR_CODE_COA_NAK:
 		INC_COA(total_access_rejects);
 		goto coa_stats;
 
-	case PW_CODE_DISCONNECT_ACK:
+	case FR_CODE_DISCONNECT_ACK:
 		INC_DSC(total_access_accepts);
 	  dsc_stats:
 		INC_DSC(total_responses);
@@ -174,7 +175,7 @@ void request_stats_final(REQUEST *request)
 			      &request->reply->timestamp);
 		break;
 
-	case PW_CODE_DISCONNECT_NAK:
+	case FR_CODE_DISCONNECT_NAK:
 		INC_DSC(total_access_rejects);
 		goto dsc_stats;
 #endif
@@ -184,18 +185,46 @@ void request_stats_final(REQUEST *request)
 		 *	authenticator.
 		 */
 	case 0:
-		if (request->packet->code == PW_CODE_ACCESS_REQUEST) {
-			if (request->reply->offset == -2) {
+		switch (request->packet->code) {
+		case FR_CODE_ACCESS_REQUEST:
+			if (request->reply->id == -1) {
 				INC_AUTH(total_bad_authenticators);
 			} else {
 				INC_AUTH(total_packets_dropped);
 			}
-		} else if (request->packet->code == PW_CODE_ACCOUNTING_REQUEST) {
-			if (request->reply->offset == -2) {
+			break;
+
+
+#ifdef WITH_ACCOUNTING
+		case FR_CODE_ACCOUNTING_REQUEST:
+			if (request->reply->id == -1) {
 				INC_ACCT(total_bad_authenticators);
 			} else {
 				INC_ACCT(total_packets_dropped);
 			}
+			break;
+#endif
+
+#ifdef WITH_COA
+		case FR_CODE_COA_REQUEST:
+			if (request->reply->id == -1) {
+				INC_COA(total_bad_authenticators);
+			} else {
+				INC_COA(total_packets_dropped);
+			}
+			break;
+
+		case FR_CODE_DISCONNECT_REQUEST:
+			if (request->reply->id == -1) {
+				INC_DSC(total_bad_authenticators);
+			} else {
+				INC_DSC(total_packets_dropped);
+			}
+			break;
+#endif
+
+			default:
+				break;
 		}
 		break;
 
@@ -207,25 +236,25 @@ void request_stats_final(REQUEST *request)
 	if (!request->proxy || !request->proxy->home_server) goto done;	/* simplifies formatting */
 
 	switch (request->proxy->packet->code) {
-	case PW_CODE_ACCESS_REQUEST:
+	case FR_CODE_ACCESS_REQUEST:
 		proxy_auth_stats.total_requests += request->proxy->packet->count;
 		request->proxy->home_server->stats.total_requests += request->proxy->packet->count;
 		break;
 
 #ifdef WITH_ACCOUNTING
-	case PW_CODE_ACCOUNTING_REQUEST:
+	case FR_CODE_ACCOUNTING_REQUEST:
 		proxy_acct_stats.total_requests += request->proxy->packet->count;
 		request->proxy->home_server->stats.total_requests += request->proxy->packet->count;
 		break;
 #endif
 
 #ifdef WITH_COA
-	case PW_CODE_COA_REQUEST:
+	case FR_CODE_COA_REQUEST:
 		proxy_coa_stats.total_requests += request->proxy->packet->count;
 		request->proxy->home_server->stats.total_requests += request->proxy->packet->count;
 		break;
 
-	case PW_CODE_DISCONNECT_REQUEST:
+	case FR_CODE_DISCONNECT_REQUEST:
 		proxy_dsc_stats.total_requests += request->proxy->packet->count;
 		request->proxy->home_server->stats.total_requests += request->proxy->packet->count;
 		break;
@@ -241,7 +270,7 @@ void request_stats_final(REQUEST *request)
 #define INC(_x) proxy_auth_stats._x += request->proxy->reply->count; request->proxy->home_server->stats._x += request->proxy->reply->count;
 
 	switch (request->proxy->reply->code) {
-	case PW_CODE_ACCESS_ACCEPT:
+	case FR_CODE_ACCESS_ACCEPT:
 		INC(total_access_accepts);
 	proxy_stats:
 		INC(total_responses);
@@ -253,16 +282,16 @@ void request_stats_final(REQUEST *request)
 			      &request->proxy->reply->timestamp);
 		break;
 
-	case PW_CODE_ACCESS_REJECT:
+	case FR_CODE_ACCESS_REJECT:
 		INC(total_access_rejects);
 		goto proxy_stats;
 
-	case PW_CODE_ACCESS_CHALLENGE:
+	case FR_CODE_ACCESS_CHALLENGE:
 		INC(total_access_challenges);
 		goto proxy_stats;
 
 #ifdef WITH_ACCOUNTING
-	case PW_CODE_ACCOUNTING_RESPONSE:
+	case FR_CODE_ACCOUNTING_RESPONSE:
 		proxy_acct_stats.total_responses++;
 		request->proxy->home_server->stats.total_responses++;
 		fr_stats_bins(&proxy_acct_stats,
@@ -275,8 +304,8 @@ void request_stats_final(REQUEST *request)
 #endif
 
 #ifdef WITH_COA
-	case PW_CODE_COA_ACK:
-	case PW_CODE_COA_NAK:
+	case FR_CODE_COA_ACK:
+	case FR_CODE_COA_NAK:
 		proxy_coa_stats.total_responses++;
 		request->proxy->home_server->stats.total_responses++;
 		fr_stats_bins(&proxy_coa_stats,
@@ -287,8 +316,8 @@ void request_stats_final(REQUEST *request)
 			      &request->proxy->reply->timestamp);
 		break;
 
-	case PW_CODE_DISCONNECT_ACK:
-	case PW_CODE_DISCONNECT_NAK:
+	case FR_CODE_DISCONNECT_ACK:
+	case FR_CODE_DISCONNECT_NAK:
 		proxy_dsc_stats.total_responses++;
 		request->proxy->home_server->stats.total_responses++;
 		fr_stats_bins(&proxy_dsc_stats,
@@ -312,6 +341,7 @@ void request_stats_final(REQUEST *request)
 	request->master_state = REQUEST_COUNTED;
 }
 
+#if 0				/* OLD LISTENERS */
 typedef struct fr_stats2vp {
 	int	attribute;
 	size_t	offset;
@@ -321,16 +351,16 @@ typedef struct fr_stats2vp {
  *	Authentication
  */
 static fr_stats2vp authvp[] = {
-	{ PW_FREERADIUS_TOTAL_ACCESS_REQUESTS, offsetof(fr_stats_t, total_requests) },
-	{ PW_FREERADIUS_TOTAL_ACCESS_ACCEPTS, offsetof(fr_stats_t, total_access_accepts) },
-	{ PW_FREERADIUS_TOTAL_ACCESS_REJECTS, offsetof(fr_stats_t, total_access_rejects) },
-	{ PW_FREERADIUS_TOTAL_ACCESS_CHALLENGES, offsetof(fr_stats_t, total_access_challenges) },
-	{ PW_FREERADIUS_TOTAL_AUTH_RESPONSES, offsetof(fr_stats_t, total_responses) },
-	{ PW_FREERADIUS_TOTAL_AUTH_DUPLICATE_REQUESTS, offsetof(fr_stats_t, total_dup_requests) },
-	{ PW_FREERADIUS_TOTAL_AUTH_MALFORMED_REQUESTS, offsetof(fr_stats_t, total_malformed_requests) },
-	{ PW_FREERADIUS_TOTAL_AUTH_INVALID_REQUESTS, offsetof(fr_stats_t, total_bad_authenticators) },
-	{ PW_FREERADIUS_TOTAL_AUTH_DROPPED_REQUESTS, offsetof(fr_stats_t, total_packets_dropped) },
-	{ PW_FREERADIUS_TOTAL_AUTH_UNKNOWN_TYPES, offsetof(fr_stats_t, total_unknown_types) },
+	{ FR_FREERADIUS_TOTAL_ACCESS_REQUESTS, offsetof(fr_stats_t, total_requests) },
+	{ FR_FREERADIUS_TOTAL_ACCESS_ACCEPTS, offsetof(fr_stats_t, total_access_accepts) },
+	{ FR_FREERADIUS_TOTAL_ACCESS_REJECTS, offsetof(fr_stats_t, total_access_rejects) },
+	{ FR_FREERADIUS_TOTAL_ACCESS_CHALLENGES, offsetof(fr_stats_t, total_access_challenges) },
+	{ FR_FREERADIUS_TOTAL_AUTH_RESPONSES, offsetof(fr_stats_t, total_responses) },
+	{ FR_FREERADIUS_TOTAL_AUTH_DUPLICATE_REQUESTS, offsetof(fr_stats_t, total_dup_requests) },
+	{ FR_FREERADIUS_TOTAL_AUTH_MALFORMED_REQUESTS, offsetof(fr_stats_t, total_malformed_requests) },
+	{ FR_FREERADIUS_TOTAL_AUTH_INVALID_REQUESTS, offsetof(fr_stats_t, total_bad_authenticators) },
+	{ FR_FREERADIUS_TOTAL_AUTH_DROPPED_REQUESTS, offsetof(fr_stats_t, total_packets_dropped) },
+	{ FR_FREERADIUS_TOTAL_AUTH_UNKNOWN_TYPES, offsetof(fr_stats_t, total_unknown_types) },
 	{ 0, 0 }
 };
 
@@ -340,16 +370,16 @@ static fr_stats2vp authvp[] = {
  *	Proxied authentication requests.
  */
 static fr_stats2vp proxy_authvp[] = {
-	{ PW_FREERADIUS_TOTAL_PROXY_ACCESS_REQUESTS, offsetof(fr_stats_t, total_requests) },
-	{ PW_FREERADIUS_TOTAL_PROXY_ACCESS_ACCEPTS, offsetof(fr_stats_t, total_access_accepts) },
-	{ PW_FREERADIUS_TOTAL_PROXY_ACCESS_REJECTS, offsetof(fr_stats_t, total_access_rejects) },
-	{ PW_FREERADIUS_TOTAL_PROXY_ACCESS_CHALLENGES, offsetof(fr_stats_t, total_access_challenges) },
-	{ PW_FREERADIUS_TOTAL_PROXY_AUTH_RESPONSES, offsetof(fr_stats_t, total_responses) },
-	{ PW_FREERADIUS_TOTAL_PROXY_AUTH_DUPLICATE_REQUESTS, offsetof(fr_stats_t, total_dup_requests) },
-	{ PW_FREERADIUS_TOTAL_PROXY_AUTH_MALFORMED_REQUESTS, offsetof(fr_stats_t, total_malformed_requests) },
-	{ PW_FREERADIUS_TOTAL_PROXY_AUTH_INVALID_REQUESTS, offsetof(fr_stats_t, total_bad_authenticators) },
-	{ PW_FREERADIUS_TOTAL_PROXY_AUTH_DROPPED_REQUESTS, offsetof(fr_stats_t, total_packets_dropped) },
-	{ PW_FREERADIUS_TOTAL_PROXY_AUTH_UNKNOWN_TYPES, offsetof(fr_stats_t, total_unknown_types) },
+	{ FR_FREERADIUS_TOTAL_PROXY_ACCESS_REQUESTS, offsetof(fr_stats_t, total_requests) },
+	{ FR_FREERADIUS_TOTAL_PROXY_ACCESS_ACCEPTS, offsetof(fr_stats_t, total_access_accepts) },
+	{ FR_FREERADIUS_TOTAL_PROXY_ACCESS_REJECTS, offsetof(fr_stats_t, total_access_rejects) },
+	{ FR_FREERADIUS_TOTAL_PROXY_ACCESS_CHALLENGES, offsetof(fr_stats_t, total_access_challenges) },
+	{ FR_FREERADIUS_TOTAL_PROXY_AUTH_RESPONSES, offsetof(fr_stats_t, total_responses) },
+	{ FR_FREERADIUS_TOTAL_PROXY_AUTH_DUPLICATE_REQUESTS, offsetof(fr_stats_t, total_dup_requests) },
+	{ FR_FREERADIUS_TOTAL_PROXY_AUTH_MALFORMED_REQUESTS, offsetof(fr_stats_t, total_malformed_requests) },
+	{ FR_FREERADIUS_TOTAL_PROXY_AUTH_INVALID_REQUESTS, offsetof(fr_stats_t, total_bad_authenticators) },
+	{ FR_FREERADIUS_TOTAL_PROXY_AUTH_DROPPED_REQUESTS, offsetof(fr_stats_t, total_packets_dropped) },
+	{ FR_FREERADIUS_TOTAL_PROXY_AUTH_UNKNOWN_TYPES, offsetof(fr_stats_t, total_unknown_types) },
 	{ 0, 0 }
 };
 #endif
@@ -360,53 +390,53 @@ static fr_stats2vp proxy_authvp[] = {
  *	Accounting
  */
 static fr_stats2vp acctvp[] = {
-	{ PW_FREERADIUS_TOTAL_ACCOUNTING_REQUESTS, offsetof(fr_stats_t, total_requests) },
-	{ PW_FREERADIUS_TOTAL_ACCOUNTING_RESPONSES, offsetof(fr_stats_t, total_responses) },
-	{ PW_FREERADIUS_TOTAL_ACCT_DUPLICATE_REQUESTS, offsetof(fr_stats_t, total_dup_requests) },
-	{ PW_FREERADIUS_TOTAL_ACCT_MALFORMED_REQUESTS, offsetof(fr_stats_t, total_malformed_requests) },
-	{ PW_FREERADIUS_TOTAL_ACCT_INVALID_REQUESTS, offsetof(fr_stats_t, total_bad_authenticators) },
-	{ PW_FREERADIUS_TOTAL_ACCT_DROPPED_REQUESTS, offsetof(fr_stats_t, total_packets_dropped) },
-	{ PW_FREERADIUS_TOTAL_ACCT_UNKNOWN_TYPES, offsetof(fr_stats_t, total_unknown_types) },
+	{ FR_FREERADIUS_TOTAL_ACCOUNTING_REQUESTS, offsetof(fr_stats_t, total_requests) },
+	{ FR_FREERADIUS_TOTAL_ACCOUNTING_RESPONSES, offsetof(fr_stats_t, total_responses) },
+	{ FR_FREERADIUS_TOTAL_ACCT_DUPLICATE_REQUESTS, offsetof(fr_stats_t, total_dup_requests) },
+	{ FR_FREERADIUS_TOTAL_ACCT_MALFORMED_REQUESTS, offsetof(fr_stats_t, total_malformed_requests) },
+	{ FR_FREERADIUS_TOTAL_ACCT_INVALID_REQUESTS, offsetof(fr_stats_t, total_bad_authenticators) },
+	{ FR_FREERADIUS_TOTAL_ACCT_DROPPED_REQUESTS, offsetof(fr_stats_t, total_packets_dropped) },
+	{ FR_FREERADIUS_TOTAL_ACCT_UNKNOWN_TYPES, offsetof(fr_stats_t, total_unknown_types) },
 	{ 0, 0 }
 };
 
 #ifdef WITH_PROXY
 static fr_stats2vp proxy_acctvp[] = {
-	{ PW_FREERADIUS_TOTAL_PROXY_ACCOUNTING_REQUESTS, offsetof(fr_stats_t, total_requests) },
-	{ PW_FREERADIUS_TOTAL_PROXY_ACCOUNTING_RESPONSES, offsetof(fr_stats_t, total_responses) },
-	{ PW_FREERADIUS_TOTAL_PROXY_ACCT_DUPLICATE_REQUESTS, offsetof(fr_stats_t, total_dup_requests) },
-	{ PW_FREERADIUS_TOTAL_PROXY_ACCT_MALFORMED_REQUESTS, offsetof(fr_stats_t, total_malformed_requests) },
-	{ PW_FREERADIUS_TOTAL_PROXY_ACCT_INVALID_REQUESTS, offsetof(fr_stats_t, total_bad_authenticators) },
-	{ PW_FREERADIUS_TOTAL_PROXY_ACCT_DROPPED_REQUESTS, offsetof(fr_stats_t, total_packets_dropped) },
-	{ PW_FREERADIUS_TOTAL_PROXY_ACCT_UNKNOWN_TYPES, offsetof(fr_stats_t, total_unknown_types) },
+	{ FR_FREERADIUS_TOTAL_PROXY_ACCOUNTING_REQUESTS, offsetof(fr_stats_t, total_requests) },
+	{ FR_FREERADIUS_TOTAL_PROXY_ACCOUNTING_RESPONSES, offsetof(fr_stats_t, total_responses) },
+	{ FR_FREERADIUS_TOTAL_PROXY_ACCT_DUPLICATE_REQUESTS, offsetof(fr_stats_t, total_dup_requests) },
+	{ FR_FREERADIUS_TOTAL_PROXY_ACCT_MALFORMED_REQUESTS, offsetof(fr_stats_t, total_malformed_requests) },
+	{ FR_FREERADIUS_TOTAL_PROXY_ACCT_INVALID_REQUESTS, offsetof(fr_stats_t, total_bad_authenticators) },
+	{ FR_FREERADIUS_TOTAL_PROXY_ACCT_DROPPED_REQUESTS, offsetof(fr_stats_t, total_packets_dropped) },
+	{ FR_FREERADIUS_TOTAL_PROXY_ACCT_UNKNOWN_TYPES, offsetof(fr_stats_t, total_unknown_types) },
 	{ 0, 0 }
 };
 #endif
 #endif
 
 static fr_stats2vp client_authvp[] = {
-	{ PW_FREERADIUS_TOTAL_ACCESS_REQUESTS, offsetof(fr_stats_t, total_requests) },
-	{ PW_FREERADIUS_TOTAL_ACCESS_ACCEPTS, offsetof(fr_stats_t, total_access_accepts) },
-	{ PW_FREERADIUS_TOTAL_ACCESS_REJECTS, offsetof(fr_stats_t, total_access_rejects) },
-	{ PW_FREERADIUS_TOTAL_ACCESS_CHALLENGES, offsetof(fr_stats_t, total_access_challenges) },
-	{ PW_FREERADIUS_TOTAL_AUTH_RESPONSES, offsetof(fr_stats_t, total_responses) },
-	{ PW_FREERADIUS_TOTAL_AUTH_DUPLICATE_REQUESTS, offsetof(fr_stats_t, total_dup_requests) },
-	{ PW_FREERADIUS_TOTAL_AUTH_MALFORMED_REQUESTS, offsetof(fr_stats_t, total_malformed_requests) },
-	{ PW_FREERADIUS_TOTAL_AUTH_INVALID_REQUESTS, offsetof(fr_stats_t, total_bad_authenticators) },
-	{ PW_FREERADIUS_TOTAL_AUTH_DROPPED_REQUESTS, offsetof(fr_stats_t, total_packets_dropped) },
-	{ PW_FREERADIUS_TOTAL_AUTH_UNKNOWN_TYPES, offsetof(fr_stats_t, total_unknown_types) },
+	{ FR_FREERADIUS_TOTAL_ACCESS_REQUESTS, offsetof(fr_stats_t, total_requests) },
+	{ FR_FREERADIUS_TOTAL_ACCESS_ACCEPTS, offsetof(fr_stats_t, total_access_accepts) },
+	{ FR_FREERADIUS_TOTAL_ACCESS_REJECTS, offsetof(fr_stats_t, total_access_rejects) },
+	{ FR_FREERADIUS_TOTAL_ACCESS_CHALLENGES, offsetof(fr_stats_t, total_access_challenges) },
+	{ FR_FREERADIUS_TOTAL_AUTH_RESPONSES, offsetof(fr_stats_t, total_responses) },
+	{ FR_FREERADIUS_TOTAL_AUTH_DUPLICATE_REQUESTS, offsetof(fr_stats_t, total_dup_requests) },
+	{ FR_FREERADIUS_TOTAL_AUTH_MALFORMED_REQUESTS, offsetof(fr_stats_t, total_malformed_requests) },
+	{ FR_FREERADIUS_TOTAL_AUTH_INVALID_REQUESTS, offsetof(fr_stats_t, total_bad_authenticators) },
+	{ FR_FREERADIUS_TOTAL_AUTH_DROPPED_REQUESTS, offsetof(fr_stats_t, total_packets_dropped) },
+	{ FR_FREERADIUS_TOTAL_AUTH_UNKNOWN_TYPES, offsetof(fr_stats_t, total_unknown_types) },
 	{ 0, 0 }
 };
 
 #ifdef WITH_ACCOUNTING
 static fr_stats2vp client_acctvp[] = {
-	{ PW_FREERADIUS_TOTAL_ACCOUNTING_REQUESTS, offsetof(fr_stats_t, total_requests) },
-	{ PW_FREERADIUS_TOTAL_ACCOUNTING_RESPONSES, offsetof(fr_stats_t, total_responses) },
-	{ PW_FREERADIUS_TOTAL_ACCT_DUPLICATE_REQUESTS, offsetof(fr_stats_t, total_dup_requests) },
-	{ PW_FREERADIUS_TOTAL_ACCT_MALFORMED_REQUESTS, offsetof(fr_stats_t, total_malformed_requests) },
-	{ PW_FREERADIUS_TOTAL_ACCT_INVALID_REQUESTS, offsetof(fr_stats_t, total_bad_authenticators) },
-	{ PW_FREERADIUS_TOTAL_ACCT_DROPPED_REQUESTS, offsetof(fr_stats_t, total_packets_dropped) },
-	{ PW_FREERADIUS_TOTAL_ACCT_UNKNOWN_TYPES, offsetof(fr_stats_t, total_unknown_types) },
+	{ FR_FREERADIUS_TOTAL_ACCOUNTING_REQUESTS, offsetof(fr_stats_t, total_requests) },
+	{ FR_FREERADIUS_TOTAL_ACCOUNTING_RESPONSES, offsetof(fr_stats_t, total_responses) },
+	{ FR_FREERADIUS_TOTAL_ACCT_DUPLICATE_REQUESTS, offsetof(fr_stats_t, total_dup_requests) },
+	{ FR_FREERADIUS_TOTAL_ACCT_MALFORMED_REQUESTS, offsetof(fr_stats_t, total_malformed_requests) },
+	{ FR_FREERADIUS_TOTAL_ACCT_INVALID_REQUESTS, offsetof(fr_stats_t, total_bad_authenticators) },
+	{ FR_FREERADIUS_TOTAL_ACCT_DROPPED_REQUESTS, offsetof(fr_stats_t, total_packets_dropped) },
+	{ FR_FREERADIUS_TOTAL_ACCT_UNKNOWN_TYPES, offsetof(fr_stats_t, total_unknown_types) },
 	{ 0, 0 }
 };
 #endif
@@ -424,10 +454,9 @@ static void request_stats_addvp(REQUEST *request,
 		if (!vp) continue;
 
 		counter = *(fr_uint_t *) (((uint8_t *) stats) + table[i].offset);
-		vp->vp_integer = counter;
+		vp->vp_uint32 = counter;
 	}
 }
-
 
 void request_stats_reply(REQUEST *request)
 {
@@ -436,17 +465,17 @@ void request_stats_reply(REQUEST *request)
 	/*
 	 *	Statistics are available ONLY on a "status" port.
 	 */
-	rad_assert(request->packet->code == PW_CODE_STATUS_SERVER);
+	rad_assert(request->packet->code == FR_CODE_STATUS_SERVER);
 	rad_assert(request->listener->type == RAD_LISTEN_NONE);
 
-	flag = fr_pair_find_by_num(request->packet->vps, VENDORPEC_FREERADIUS, PW_FREERADIUS_STATISTICS_TYPE, TAG_ANY);
-	if (!flag || (flag->vp_integer == 0)) return;
+	flag = fr_pair_find_by_num(request->packet->vps, VENDORPEC_FREERADIUS, FR_FREERADIUS_STATISTICS_TYPE, TAG_ANY);
+	if (!flag || (flag->vp_uint32 == 0)) return;
 
 	/*
 	 *	Authentication.
 	 */
-	if (((flag->vp_integer & 0x01) != 0) &&
-	    ((flag->vp_integer & 0xc0) == 0)) {
+	if (((flag->vp_uint32 & 0x01) != 0) &&
+	    ((flag->vp_uint32 & 0xc0) == 0)) {
 		request_stats_addvp(request, authvp, &radius_auth_stats);
 	}
 
@@ -454,8 +483,8 @@ void request_stats_reply(REQUEST *request)
 	/*
 	 *	Accounting
 	 */
-	if (((flag->vp_integer & 0x02) != 0) &&
-	    ((flag->vp_integer & 0xc0) == 0)) {
+	if (((flag->vp_uint32 & 0x02) != 0) &&
+	    ((flag->vp_uint32 & 0xc0) == 0)) {
 		request_stats_addvp(request, acctvp, &radius_acct_stats);
 	}
 #endif
@@ -464,8 +493,8 @@ void request_stats_reply(REQUEST *request)
 	/*
 	 *	Proxied authentication requests.
 	 */
-	if (((flag->vp_integer & 0x04) != 0) &&
-	    ((flag->vp_integer & 0x20) == 0)) {
+	if (((flag->vp_uint32 & 0x04) != 0) &&
+	    ((flag->vp_uint32 & 0x20) == 0)) {
 		request_stats_addvp(request, proxy_authvp, &proxy_auth_stats);
 	}
 
@@ -473,8 +502,8 @@ void request_stats_reply(REQUEST *request)
 	/*
 	 *	Proxied accounting requests.
 	 */
-	if (((flag->vp_integer & 0x08) != 0) &&
-	    ((flag->vp_integer & 0x20) == 0)) {
+	if (((flag->vp_uint32 & 0x08) != 0) &&
+	    ((flag->vp_uint32 & 0x20) == 0)) {
 		request_stats_addvp(request, proxy_acctvp, &proxy_acct_stats);
 	}
 #endif
@@ -483,19 +512,19 @@ void request_stats_reply(REQUEST *request)
 	/*
 	 *	Internal server statistics
 	 */
-	if ((flag->vp_integer & 0x10) != 0) {
+	if ((flag->vp_uint32 & 0x10) != 0) {
 		vp = radius_pair_create(request->reply, &request->reply->vps,
-				       PW_FREERADIUS_STATS_START_TIME, VENDORPEC_FREERADIUS);
+				       FR_FREERADIUS_STATS_START_TIME, VENDORPEC_FREERADIUS);
 		if (vp) vp->vp_date = start_time.tv_sec;
 		vp = radius_pair_create(request->reply, &request->reply->vps,
-				       PW_FREERADIUS_STATS_HUP_TIME, VENDORPEC_FREERADIUS);
+				       FR_FREERADIUS_STATS_HUP_TIME, VENDORPEC_FREERADIUS);
 		if (vp) vp->vp_date = hup_time.tv_sec;
 	}
 
 	/*
 	 *	For a particular client.
 	 */
-	if ((flag->vp_integer & 0x20) != 0) {
+	if ((flag->vp_uint32 & 0x20) != 0) {
 		fr_ipaddr_t ipaddr;
 		VALUE_PAIR *server_ip, *server_port = NULL;
 		RADCLIENT *client = NULL;
@@ -506,15 +535,15 @@ void request_stats_reply(REQUEST *request)
 		 *	socket.
 		 */
 		server_ip = fr_pair_find_by_num(request->packet->vps, VENDORPEC_FREERADIUS,
-						PW_FREERADIUS_STATS_SERVER_IP_ADDRESS, TAG_ANY);
+						FR_FREERADIUS_STATS_SERVER_IP_ADDRESS, TAG_ANY);
 		if (server_ip) {
 			server_port = fr_pair_find_by_num(request->packet->vps, VENDORPEC_FREERADIUS,
-							  PW_FREERADIUS_STATS_SERVER_PORT, TAG_ANY);
+							  FR_FREERADIUS_STATS_SERVER_PORT, TAG_ANY);
 
 			if (server_port) {
 				ipaddr.af = AF_INET;
-				ipaddr.ipaddr.ip4addr.s_addr = server_ip->vp_ipaddr;
-				cl = listener_find_client_list(&ipaddr, server_port->vp_integer, IPPROTO_UDP);
+				ipaddr.addr.v4.s_addr = server_ip->vp_ipv4addr;
+				cl = listener_find_client_list(&ipaddr, server_port->vp_uint32, IPPROTO_UDP);
 
 				/*
 				 *	Not found: don't do anything
@@ -525,11 +554,11 @@ void request_stats_reply(REQUEST *request)
 
 
 		vp = fr_pair_find_by_num(request->packet->vps, VENDORPEC_FREERADIUS,
-					 PW_FREERADIUS_STATS_CLIENT_IP_ADDRESS, TAG_ANY);
+					 FR_FREERADIUS_STATS_CLIENT_IP_ADDRESS, TAG_ANY);
 		if (vp) {
 			memset(&ipaddr, 0, sizeof(ipaddr));
 			ipaddr.af = AF_INET;
-			ipaddr.ipaddr.ip4addr.s_addr = vp->vp_ipaddr;
+			ipaddr.addr.v4.s_addr = vp->vp_ipv4addr;
 			client = client_find(cl, &ipaddr, IPPROTO_UDP);
 #ifdef WITH_TCP
 			if (!client) {
@@ -541,8 +570,8 @@ void request_stats_reply(REQUEST *request)
 			 *	Else look it up by number.
 			 */
 		} else if ((vp = fr_pair_find_by_num(request->packet->vps, VENDORPEC_FREERADIUS,
-						     PW_FREERADIUS_STATS_CLIENT_NUMBER, TAG_ANY)) != NULL) {
-			client = client_findbynumber(cl, vp->vp_integer);
+						     FR_FREERADIUS_STATS_CLIENT_NUMBER, TAG_ANY)) != NULL) {
+			client = client_findbynumber(cl, vp->vp_uint32);
 		}
 
 		if (client) {
@@ -556,21 +585,21 @@ void request_stats_reply(REQUEST *request)
 			 *	When retrieving client by number, also
 			 *	echo back it's IP address.
 			 */
-			if ((vp->da->type == PW_TYPE_INTEGER) &&
+			if ((vp->vp_type == FR_TYPE_UINT32) &&
 			    (client->ipaddr.af == AF_INET)) {
 				vp = radius_pair_create(request->reply,
 						       &request->reply->vps,
-						       PW_FREERADIUS_STATS_CLIENT_IP_ADDRESS, VENDORPEC_FREERADIUS);
+						       FR_FREERADIUS_STATS_CLIENT_IP_ADDRESS, VENDORPEC_FREERADIUS);
 				if (vp) {
-					vp->vp_ipaddr = client->ipaddr.ipaddr.ip4addr.s_addr;
+					vp->vp_ipv4addr = client->ipaddr.addr.v4.s_addr;
 				}
 
 				if (client->ipaddr.prefix != 32) {
 					vp = radius_pair_create(request->reply,
 							       &request->reply->vps,
-							       PW_FREERADIUS_STATS_CLIENT_NETMASK, VENDORPEC_FREERADIUS);
+							       FR_FREERADIUS_STATS_CLIENT_NETMASK, VENDORPEC_FREERADIUS);
 					if (vp) {
-						vp->vp_integer = client->ipaddr.prefix;
+						vp->vp_uint32 = client->ipaddr.prefix;
 					}
 				}
 			}
@@ -584,12 +613,12 @@ void request_stats_reply(REQUEST *request)
 					fr_pair_copy(request->reply, server_port));
 			}
 
-			if ((flag->vp_integer & 0x01) != 0) {
+			if ((flag->vp_uint32 & 0x01) != 0) {
 				request_stats_addvp(request, client_authvp,
 						    &client->auth);
 			}
 #ifdef WITH_ACCOUNTING
-			if ((flag->vp_integer & 0x02) != 0) {
+			if ((flag->vp_uint32 & 0x02) != 0) {
 				request_stats_addvp(request, client_acctvp,
 						    &client->acct);
 			}
@@ -600,8 +629,8 @@ void request_stats_reply(REQUEST *request)
 	/*
 	 *	For a particular "listen" socket.
 	 */
-	if (((flag->vp_integer & 0x40) != 0) &&
-	    ((flag->vp_integer & 0x03) != 0)) {
+	if (((flag->vp_uint32 & 0x40) != 0) &&
+	    ((flag->vp_uint32 & 0x03) != 0)) {
 		rad_listen_t *this;
 		VALUE_PAIR *server_ip, *server_port;
 		fr_ipaddr_t ipaddr;
@@ -611,17 +640,17 @@ void request_stats_reply(REQUEST *request)
 		 *	socket.
 		 */
 		server_ip = fr_pair_find_by_num(request->packet->vps, VENDORPEC_FREERADIUS,
-						PW_FREERADIUS_STATS_SERVER_IP_ADDRESS, TAG_ANY);
+						FR_FREERADIUS_STATS_SERVER_IP_ADDRESS, TAG_ANY);
 		if (!server_ip) return;
 
 		server_port = fr_pair_find_by_num(request->packet->vps, VENDORPEC_FREERADIUS,
-						  PW_FREERADIUS_STATS_SERVER_PORT, TAG_ANY);
+						  FR_FREERADIUS_STATS_SERVER_PORT, TAG_ANY);
 		if (!server_port) return;
 
 		ipaddr.af = AF_INET;
-		ipaddr.ipaddr.ip4addr.s_addr = server_ip->vp_ipaddr;
+		ipaddr.addr.v4.s_addr = server_ip->vp_ipv4addr;
 		this = listener_find_byipaddr(&ipaddr,
-					      server_port->vp_integer,
+					      server_port->vp_uint32,
 					      IPPROTO_UDP);
 
 		/*
@@ -634,14 +663,14 @@ void request_stats_reply(REQUEST *request)
 		fr_pair_add(&request->reply->vps,
 			fr_pair_copy(request->reply, server_port));
 
-		if (((flag->vp_integer & 0x01) != 0) &&
+		if (((flag->vp_uint32 & 0x01) != 0) &&
 		    ((request->listener->type == RAD_LISTEN_AUTH) ||
 		     (request->listener->type == RAD_LISTEN_NONE))) {
 			request_stats_addvp(request, authvp, &this->stats);
 		}
 
 #ifdef WITH_ACCOUNTING
-		if (((flag->vp_integer & 0x02) != 0) &&
+		if (((flag->vp_uint32 & 0x02) != 0) &&
 		    ((request->listener->type == RAD_LISTEN_ACCT) ||
 		     (request->listener->type == RAD_LISTEN_NONE))) {
 			request_stats_addvp(request, acctvp, &this->stats);
@@ -653,35 +682,27 @@ void request_stats_reply(REQUEST *request)
 	/*
 	 *	Home servers.
 	 */
-	if (((flag->vp_integer & 0x80) != 0) &&
-	    ((flag->vp_integer & 0x03) != 0)) {
+	if (((flag->vp_uint32 & 0x80) != 0) &&
+	    ((flag->vp_uint32 & 0x03) != 0)) {
 		home_server_t *home;
 		VALUE_PAIR *server_ip, *server_port;
-		fr_ipaddr_t ipaddr;
 
 		/*
 		 *	See if we need to look up the server by socket
 		 *	socket.
 		 */
 		server_ip = fr_pair_find_by_num(request->packet->vps, VENDORPEC_FREERADIUS,
-						PW_FREERADIUS_STATS_SERVER_IP_ADDRESS, TAG_ANY);
+						FR_FREERADIUS_STATS_SERVER_IP_ADDRESS, TAG_ANY);
 		if (!server_ip) return;
 
 		server_port = fr_pair_find_by_num(request->packet->vps, VENDORPEC_FREERADIUS,
-						  PW_FREERADIUS_STATS_SERVER_PORT, TAG_ANY);
+						  FR_FREERADIUS_STATS_SERVER_PORT, TAG_ANY);
 		if (!server_port) return;
-
-#ifndef NDEBUG
-		memset(&ipaddr, 0, sizeof(ipaddr));
-#endif
-		ipaddr.af = AF_INET;
-		ipaddr.ipaddr.ip4addr.s_addr = server_ip->vp_ipaddr;
-		home = home_server_find(&ipaddr, server_port->vp_integer,
-					IPPROTO_UDP);
 
 		/*
 		 *	Not found: don't do anything
 		 */
+		home = NULL;
 		if (!home) return;
 
 		fr_pair_add(&request->reply->vps,
@@ -690,17 +711,17 @@ void request_stats_reply(REQUEST *request)
 			fr_pair_copy(request->reply, server_port));
 
 		vp = radius_pair_create(request->reply, &request->reply->vps,
-				       PW_FREERADIUS_STATS_SERVER_OUTSTANDING_REQUESTS, VENDORPEC_FREERADIUS);
-		if (vp) vp->vp_integer = home->currently_outstanding;
+				       FR_FREERADIUS_STATS_SERVER_OUTSTANDING_REQUESTS, VENDORPEC_FREERADIUS);
+		if (vp) vp->vp_uint32 = home->currently_outstanding;
 
 		vp = radius_pair_create(request->reply, &request->reply->vps,
-				       PW_FREERADIUS_STATS_SERVER_STATE, VENDORPEC_FREERADIUS);
-		if (vp) vp->vp_integer = home->state;
+				       FR_FREERADIUS_STATS_SERVER_STATE, VENDORPEC_FREERADIUS);
+		if (vp) vp->vp_uint32 = home->state;
 
 		if ((home->state == HOME_STATE_ALIVE) &&
 		    (home->revive_time.tv_sec != 0)) {
 			vp = radius_pair_create(request->reply, &request->reply->vps,
-					       PW_FREERADIUS_STATS_SERVER_TIME_OF_LIFE, VENDORPEC_FREERADIUS);
+					       FR_FREERADIUS_STATS_SERVER_TIME_OF_LIFE, VENDORPEC_FREERADIUS);
 			if (vp) vp->vp_date = home->revive_time.tv_sec;
 		}
 
@@ -708,22 +729,22 @@ void request_stats_reply(REQUEST *request)
 		    (home->ema.window > 0)) {
 				vp = radius_pair_create(request->reply,
 						       &request->reply->vps,
-						       PW_FREERADIUS_SERVER_EMA_WINDOW, VENDORPEC_FREERADIUS);
-				if (vp) vp->vp_integer = home->ema.window;
+						       FR_FREERADIUS_SERVER_EMA_WINDOW, VENDORPEC_FREERADIUS);
+				if (vp) vp->vp_uint32 = home->ema.window;
 				vp = radius_pair_create(request->reply,
 						       &request->reply->vps,
-						       PW_FREERADIUS_SERVER_EMA_USEC_WINDOW_1, VENDORPEC_FREERADIUS);
-				if (vp) vp->vp_integer = home->ema.ema1 / EMA_SCALE;
+						       FR_FREERADIUS_SERVER_EMA_USEC_WINDOW_1, VENDORPEC_FREERADIUS);
+				if (vp) vp->vp_uint32 = home->ema.ema1 / EMA_SCALE;
 				vp = radius_pair_create(request->reply,
 						       &request->reply->vps,
-						       PW_FREERADIUS_SERVER_EMA_USEC_WINDOW_10, VENDORPEC_FREERADIUS);
-				if (vp) vp->vp_integer = home->ema.ema10 / EMA_SCALE;
+						       FR_FREERADIUS_SERVER_EMA_USEC_WINDOW_10, VENDORPEC_FREERADIUS);
+				if (vp) vp->vp_uint32 = home->ema.ema10 / EMA_SCALE;
 
 		}
 
 		if (home->state == HOME_STATE_IS_DEAD) {
 			vp = radius_pair_create(request->reply, &request->reply->vps,
-					       PW_FREERADIUS_STATS_SERVER_TIME_OF_DEATH, VENDORPEC_FREERADIUS);
+					       FR_FREERADIUS_STATS_SERVER_TIME_OF_DEATH, VENDORPEC_FREERADIUS);
 			if (vp) vp->vp_date = home->zombie_period_start.tv_sec + home->zombie_period;
 		}
 
@@ -733,21 +754,21 @@ void request_stats_reply(REQUEST *request)
 		 *	FIXME: do this for clients, too!
 		 */
 		vp = radius_pair_create(request->reply, &request->reply->vps,
-				       PW_FREERADIUS_STATS_LAST_PACKET_RECV, VENDORPEC_FREERADIUS);
+				       FR_FREERADIUS_STATS_LAST_PACKET_RECV, VENDORPEC_FREERADIUS);
 		if (vp) vp->vp_date = home->last_packet_recv;
 
 		vp = radius_pair_create(request->reply, &request->reply->vps,
-				       PW_FREERADIUS_STATS_LAST_PACKET_SENT, VENDORPEC_FREERADIUS);
+				       FR_FREERADIUS_STATS_LAST_PACKET_SENT, VENDORPEC_FREERADIUS);
 		if (vp) vp->vp_date = home->last_packet_sent;
 
-		if (((flag->vp_integer & 0x01) != 0) &&
+		if (((flag->vp_uint32 & 0x01) != 0) &&
 		    (home->type == HOME_TYPE_AUTH)) {
 			request_stats_addvp(request, proxy_authvp,
 					    &home->stats);
 		}
 
 #ifdef WITH_ACCOUNTING
-		if (((flag->vp_integer & 0x02) != 0) &&
+		if (((flag->vp_uint32 & 0x02) != 0) &&
 		    (home->type == HOME_TYPE_ACCT)) {
 			request_stats_addvp(request, proxy_acctvp,
 					    &home->stats);
@@ -756,6 +777,7 @@ void request_stats_reply(REQUEST *request)
 	}
 #endif	/* WITH_PROXY */
 }
+#endif	/* OLD LISTENERS */
 
 void radius_stats_init(int flag)
 {

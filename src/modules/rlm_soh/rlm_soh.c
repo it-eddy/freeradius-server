@@ -25,7 +25,7 @@ RCSID("$Id$")
 
 #include	<freeradius-devel/radiusd.h>
 #include	<freeradius-devel/modules.h>
-#include	<freeradius-devel/dhcp.h>
+#include	<freeradius-devel/dhcpv4/dhcpv4.h>
 #include	<freeradius-devel/soh.h>
 
 
@@ -38,7 +38,7 @@ typedef struct rlm_soh_t {
 /*
  * Not sure how to make this useful yet...
  */
-static ssize_t soh_xlat(char **out, size_t outlen,
+static ssize_t soh_xlat(UNUSED TALLOC_CTX *ctx, char **out, size_t outlen,
 			UNUSED void const *mod_inst, UNUSED void const *xlat_inst,
 			REQUEST *request, char const *fmt)
 {
@@ -48,25 +48,25 @@ static ssize_t soh_xlat(char **out, size_t outlen,
 	/*
 	 * There will be no point unless SoH-Supported = yes
 	 */
-	vp[0] = fr_pair_find_by_num(request->packet->vps, 0, PW_SOH_SUPPORTED, TAG_ANY);
+	vp[0] = fr_pair_find_by_num(request->packet->vps, 0, FR_SOH_SUPPORTED, TAG_ANY);
 	if (!vp[0])
 		return 0;
 
 
 	if (strncasecmp(fmt, "OS", 2) == 0) {
 		/* OS vendor */
-		vp[0] = fr_pair_find_by_num(request->packet->vps, 0, PW_SOH_MS_MACHINE_OS_VENDOR, TAG_ANY);
-		vp[1] = fr_pair_find_by_num(request->packet->vps, 0, PW_SOH_MS_MACHINE_OS_VERSION, TAG_ANY);
-		vp[2] = fr_pair_find_by_num(request->packet->vps, 0, PW_SOH_MS_MACHINE_OS_RELEASE, TAG_ANY);
-		vp[3] = fr_pair_find_by_num(request->packet->vps, 0, PW_SOH_MS_MACHINE_OS_BUILD, TAG_ANY);
-		vp[4] = fr_pair_find_by_num(request->packet->vps, 0, PW_SOH_MS_MACHINE_SP_VERSION, TAG_ANY);
-		vp[5] = fr_pair_find_by_num(request->packet->vps, 0, PW_SOH_MS_MACHINE_SP_RELEASE, TAG_ANY);
+		vp[0] = fr_pair_find_by_num(request->packet->vps, 0, FR_SOH_MS_MACHINE_OS_VENDOR, TAG_ANY);
+		vp[1] = fr_pair_find_by_num(request->packet->vps, 0, FR_SOH_MS_MACHINE_OS_VERSION, TAG_ANY);
+		vp[2] = fr_pair_find_by_num(request->packet->vps, 0, FR_SOH_MS_MACHINE_OS_RELEASE, TAG_ANY);
+		vp[3] = fr_pair_find_by_num(request->packet->vps, 0, FR_SOH_MS_MACHINE_OS_BUILD, TAG_ANY);
+		vp[4] = fr_pair_find_by_num(request->packet->vps, 0, FR_SOH_MS_MACHINE_SP_VERSION, TAG_ANY);
+		vp[5] = fr_pair_find_by_num(request->packet->vps, 0, FR_SOH_MS_MACHINE_SP_RELEASE, TAG_ANY);
 
-		if (vp[0] && vp[0]->vp_integer == VENDORPEC_MICROSOFT) {
+		if (vp[0] && vp[0]->vp_uint32 == VENDORPEC_MICROSOFT) {
 			if (!vp[1]) {
 				snprintf(*out, outlen, "Windows unknown");
 			} else {
-				switch (vp[1]->vp_integer) {
+				switch (vp[1]->vp_uint32) {
 				case 7:
 					osname = "7";
 					break;
@@ -83,11 +83,11 @@ static ssize_t soh_xlat(char **out, size_t outlen,
 					osname = "Other";
 					break;
 				}
-				snprintf(*out, outlen, "Windows %s %d.%d.%d sp %d.%d", osname, vp[1]->vp_integer,
-					 vp[2] ? vp[2]->vp_integer : 0,
-					 vp[3] ? vp[3]->vp_integer : 0,
-					 vp[4] ? vp[4]->vp_integer : 0,
-					 vp[5] ? vp[5]->vp_integer : 0);
+				snprintf(*out, outlen, "Windows %s %d.%d.%d sp %d.%d", osname, vp[1]->vp_uint32,
+					 vp[2] ? vp[2]->vp_uint32 : 0,
+					 vp[3] ? vp[3]->vp_uint32 : 0,
+					 vp[4] ? vp[4]->vp_uint32 : 0,
+					 vp[5] ? vp[5]->vp_uint32 : 0);
 			}
 			return strlen(*out);
 		}
@@ -101,32 +101,32 @@ static const CONF_PARSER module_config[] = {
 	/*
 	 * Do SoH over DHCP?
 	 */
-	{ FR_CONF_OFFSET("dhcp", PW_TYPE_BOOLEAN, rlm_soh_t, dhcp), .dflt = "no" },
+	{ FR_CONF_OFFSET("dhcp", FR_TYPE_BOOL, rlm_soh_t, dhcp), .dflt = "no" },
 	CONF_PARSER_TERMINATOR
 };
 
 
-static int mod_bootstrap(CONF_SECTION *conf, void *instance)
+static int mod_bootstrap(void *instance, CONF_SECTION *conf)
 {
-	char const *name;
-	rlm_soh_t *inst = instance;
+	char const	*name;
+	rlm_soh_t	*inst = instance;
 
 	name = cf_section_name2(conf);
 	if (!name) name = cf_section_name1(conf);
 	inst->xlat_name = name;
 	if (!inst->xlat_name) return -1;
 
-	xlat_register(inst, inst->xlat_name, soh_xlat, NULL, NULL, 0, XLAT_DEFAULT_BUF_LEN);
+	xlat_register(inst, inst->xlat_name, soh_xlat, NULL, NULL, 0, XLAT_DEFAULT_BUF_LEN, true);
 
 	return 0;
 }
 
-static rlm_rcode_t CC_HINT(nonnull) mod_post_auth(void *instance, REQUEST *request)
+static rlm_rcode_t CC_HINT(nonnull) mod_post_auth(void *instance, UNUSED void *thread, REQUEST *request)
 {
 #ifdef WITH_DHCP
-	int rcode;
-	VALUE_PAIR *vp;
-	rlm_soh_t *inst = instance;
+	int			rcode;
+	VALUE_PAIR		*vp;
+	rlm_soh_t const		*inst = instance;
 
 	if (!inst->dhcp) return RLM_MODULE_NOOP;
 
@@ -186,13 +186,13 @@ static rlm_rcode_t CC_HINT(nonnull) mod_post_auth(void *instance, REQUEST *reque
 	return RLM_MODULE_NOOP;
 }
 
-static rlm_rcode_t CC_HINT(nonnull) mod_authorize(UNUSED void * instance, REQUEST *request)
+static rlm_rcode_t CC_HINT(nonnull) mod_authorize(UNUSED void *instance, UNUSED void *thread, REQUEST *request)
 {
 	VALUE_PAIR *vp;
 	int rv;
 
 	/* try to find the MS-SoH payload */
-	vp = fr_pair_find_by_num(request->packet->vps, VENDORPEC_MICROSOFT, PW_MS_QUARANTINE_SOH, TAG_ANY);
+	vp = fr_pair_find_by_num(request->packet->vps, VENDORPEC_MICROSOFT, FR_MS_QUARANTINE_SOH, TAG_ANY);
 	if (!vp) {
 		RDEBUG("SoH radius VP not found");
 		return RLM_MODULE_NOOP;

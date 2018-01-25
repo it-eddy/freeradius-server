@@ -142,7 +142,7 @@ static int redis_command_read_only(fr_redis_rcode_t *status_out, redisReply **re
 	return 0;
 }
 
-static ssize_t redis_xlat(char **out, size_t outlen,
+static ssize_t redis_xlat(UNUSED TALLOC_CTX *ctx, char **out, size_t outlen,
 			  void const *mod_inst, UNUSED void const *xlat_inst,
 			  REQUEST *request, char const *fmt)
 {
@@ -177,7 +177,7 @@ static ssize_t redis_xlat(char **out, size_t outlen,
 	 */
 	if (p[0] == '@') {
 		fr_socket_addr_t	node_addr;
-		fr_connection_pool_t	*pool;
+		fr_pool_t	*pool;
 
 		RDEBUG3("Overriding node selection");
 
@@ -189,18 +189,18 @@ static ssize_t redis_xlat(char **out, size_t outlen,
 		}
 
 		if (fr_inet_pton_port(&node_addr.ipaddr, &node_addr.port, p, q - p, AF_UNSPEC, true, true) < 0) {
-			REDEBUG("Failed parsing node address: %s", fr_strerror());
+			RPEDEBUG("Failed parsing node address");
 			return -1;
 		}
 
 		p = q + 1;
 
 		if (fr_redis_cluster_pool_by_node_addr(&pool, inst->cluster, &node_addr, true) < 0) {
-			REDEBUG("Failed locating cluster node: %s", fr_strerror());
+			RPEDEBUG("Failed locating cluster node");
 			return -1;
 		}
 
-		conn = fr_connection_get(pool, request);
+		conn = fr_pool_connection_get(pool, request);
 		if (!conn) {
 			REDEBUG("No connections available for cluster node");
 			return -1;
@@ -209,7 +209,7 @@ static ssize_t redis_xlat(char **out, size_t outlen,
 		argc = rad_expand_xlat(request, p, MAX_REDIS_ARGS, argv, false, sizeof(argv_buf), argv_buf);
 		if (argc <= 0) {
 			REDEBUG("Invalid command: %s", p);
-			fr_connection_release(pool, request, conn);
+			fr_pool_connection_release(pool, request, conn);
 			return -1;
 		}
 
@@ -236,13 +236,13 @@ static ssize_t redis_xlat(char **out, size_t outlen,
 
 		case REDIS_RCODE_RECONNECT:
 		close_conn:
-			fr_connection_close(pool, request, conn);
+			fr_pool_connection_close(pool, request, conn);
 			ret = -1;
 			goto finish;
 
 		default:
 		fail:
-			fr_connection_release(pool, request, conn);
+			fr_pool_connection_release(pool, request, conn);
 			ret = -1;
 			goto finish;
 		}
@@ -322,19 +322,19 @@ finish:
 	return ret;
 }
 
-static int mod_bootstrap(CONF_SECTION *conf, void *instance)
+static int mod_bootstrap(void *instance, CONF_SECTION *conf)
 {
 	rlm_redis_t *inst = instance;
 
 	inst->name = cf_section_name2(conf);
 	if (!inst->name) inst->name = cf_section_name1(conf);
 
-	xlat_register(inst, inst->name, redis_xlat, NULL, NULL, 0, XLAT_DEFAULT_BUF_LEN);
+	xlat_register(inst, inst->name, redis_xlat, NULL, NULL, 0, XLAT_DEFAULT_BUF_LEN, false);
 
 	return 0;
 }
 
-static int mod_instantiate(CONF_SECTION *conf, void *instance)
+static int mod_instantiate(void *instance, CONF_SECTION *conf)
 {
 	rlm_redis_t *inst = instance;
 

@@ -52,7 +52,7 @@ typedef struct rlm_json_jpath_to_eval {
 	json_object		*root;
 } rlm_json_jpath_to_eval_t;
 
-static ssize_t jsonquote_xlat(char **out, size_t outlen,
+static ssize_t jsonquote_xlat(UNUSED TALLOC_CTX *ctx, char **out, size_t outlen,
 			      UNUSED void const *mod_inst, UNUSED void const *xlat_inst,
 			      REQUEST *request, char const *fmt)
 {
@@ -60,7 +60,7 @@ static ssize_t jsonquote_xlat(char **out, size_t outlen,
 	char *tmp;
 
 	tmp = fr_json_from_string(request, fmt, false);
-	
+
 	/* Indicate truncation */
 	if (!tmp) return outlen + 1;
 	len = strlen(tmp);
@@ -73,6 +73,7 @@ static ssize_t jsonquote_xlat(char **out, size_t outlen,
 
 /** Determine if a jpath expression is valid
  *
+ * @param ctx to allocate expansion buffer in.
  * @param mod_inst data.
  * @param xlat_inst data.
  * @param out Where to write the output (in the format @verbatim<bytes parsed>[:error]@endverbatim).
@@ -81,7 +82,7 @@ static ssize_t jsonquote_xlat(char **out, size_t outlen,
  * @param fmt jpath expression to parse.
  * @return number of bytes written to out.
  */
-static ssize_t jpath_validate_xlat(char **out, size_t outlen,
+static ssize_t jpath_validate_xlat(UNUSED TALLOC_CTX *ctx, char **out, size_t outlen,
 			    	   UNUSED void const *mod_inst, UNUSED void const *xlat_inst,
 				   REQUEST *request, char const *fmt)
 {
@@ -106,29 +107,36 @@ static ssize_t jpath_validate_xlat(char **out, size_t outlen,
 
 /** Pre-parse and validate literal jpath expressions for maps
  *
- * @param[out] proc_inst the cache structure to fill.
- * @param[in] mod_inst module instance (unused).
- * @param[in] src Where to get the JSON data from (unused).
- * @param[in] maps set of maps to translate to jpaths.
+ * @param[in] cs	#CONF_SECTION that defined the map instance.
+ * @param[in] mod_inst	module instance (unused).
+ * @param[in] proc_inst	the cache structure to fill.
+ * @param[in] src	Where to get the JSON data from.
+ * @param[in] maps	set of maps to translate to jpaths.
  * @return
  *	- 0 on success.
  * 	- -1 on failure.
  */
-static int mod_map_proc_instantiate(void *proc_inst, UNUSED void *mod_inst,
-				    UNUSED vp_tmpl_t const *src, vp_map_t const *maps)
+static int mod_map_proc_instantiate(CONF_SECTION *cs, UNUSED void *mod_inst, void *proc_inst,
+				    vp_tmpl_t const *src, vp_map_t const *maps)
 {
 	rlm_json_jpath_cache_t	*cache_inst = proc_inst;
 	vp_map_t const		*map;
 	ssize_t			slen;
-	rlm_json_jpath_cache_t	 *cache = cache_inst, **tail = &cache->next;
+	rlm_json_jpath_cache_t	*cache = cache_inst, **tail = &cache->next;
+
+	if (!src) {
+		cf_log_err(cs, "Missing JSON source");
+
+		return -1;
+	}
 
 	for (map = maps; map; map = map->next) {
 		CONF_PAIR	*cp = cf_item_to_pair(map->ci);
 		char const	*p;
 
 #ifndef HAVE_JSON_OBJECT_GET_INT64
-		if ((map->lhs->type == TMPL_TYPE_ATTR) && (map->lhs->tmpl_da->type == PW_TYPE_INTEGER64)) {
-			cf_log_err_cp(cp, "64bit integers are not supported by linked json-c.  "
+		if ((map->lhs->type == TMPL_TYPE_ATTR) && (map->lhs->tmpl_da->type == FR_TYPE_UINT64)) {
+			cf_log_err(cp, "64bit integers are not supported by linked json-c.  "
 				      "Upgrade to json-c >= 0.10 to use this feature");
 			return -1;
 		}
@@ -144,9 +152,9 @@ static int mod_map_proc_instantiate(void *proc_inst, UNUSED void *mod_inst,
 			error:
 				fr_canonicalize_error(cache, &spaces, &text, slen, fr_strerror());
 
-				cf_log_err_cp(cp, "Syntax error");
-				cf_log_err_cp(cp, "%s", p);
-				cf_log_err_cp(cp, "%s^ %s", spaces, text);
+				cf_log_err(cp, "Syntax error");
+				cf_log_err(cp, "%s", p);
+				cf_log_err(cp, "%s^ %s", spaces, text);
 
 				talloc_free(spaces);
 				talloc_free(text);
@@ -155,12 +163,12 @@ static int mod_map_proc_instantiate(void *proc_inst, UNUSED void *mod_inst,
 			break;
 
 		case TMPL_TYPE_DATA:
-			if (map->rhs->tmpl_data_type != PW_TYPE_STRING) {
-				cf_log_err_cp(cp, "Right side of map must be a string");
+			if (map->rhs->tmpl_value_type != FR_TYPE_STRING) {
+				cf_log_err(cp, "Right side of map must be a string");
 				return -1;
 			}
-			p = map->rhs->tmpl_data_value.strvalue;
-			slen = fr_jpath_parse(cache, &cache->jpath, p, map->rhs->tmpl_data_length);
+			p = map->rhs->tmpl_value.vb_strvalue;
+			slen = fr_jpath_parse(cache, &cache->jpath, p, map->rhs->tmpl_value_length);
 			if (slen <= 0) goto error;
 			break;
 
@@ -199,7 +207,7 @@ static int _json_map_proc_get_value(TALLOC_CTX *ctx, VALUE_PAIR **out, REQUEST *
 	VALUE_PAIR			*vp;
 	vp_cursor_t			cursor;
 	rlm_json_jpath_to_eval_t	*to_eval = uctx;
-	value_data_t			*head, *value;
+	fr_value_box_t			*head, *value;
 	int				ret;
 
 	*out = NULL;
@@ -207,15 +215,15 @@ static int _json_map_proc_get_value(TALLOC_CTX *ctx, VALUE_PAIR **out, REQUEST *
 	ret = fr_jpath_evaluate_leaf(request, &head, map->lhs->tmpl_da->type, map->lhs->tmpl_da,
 			     	     to_eval->root, to_eval->jpath);
 	if (ret < 0) {
-		REDEBUG("Failed evaluating jpath: %s", fr_strerror());
+		RPEDEBUG("Failed evaluating jpath");
 		return -1;
 	}
 	if (ret == 0) return 0;
 	rad_assert(head);
 
-	for (fr_cursor_init(&cursor, out), value = head;
+	for (fr_pair_cursor_init(&cursor, out), value = head;
 	     value;
-	     fr_cursor_append(&cursor, vp), value = value->next) {
+	     fr_pair_cursor_append(&cursor, vp), value = value->next) {
 		vp = fr_pair_afrom_da(ctx, map->lhs->tmpl_da);
 		if (!vp) {
 		error:
@@ -224,8 +232,8 @@ static int _json_map_proc_get_value(TALLOC_CTX *ctx, VALUE_PAIR **out, REQUEST *
 		}
 		vp->op = map->op;
 
-		if (value_data_steal(vp, &vp->data, vp->da->type, value) < 0) {
-			REDEBUG("Copying data to attribute failed: %s", fr_strerror());
+		if (fr_value_box_steal(vp, &vp->data, value) < 0) {
+			RPEDEBUG("Copying data to attribute failed");
 			talloc_free(vp);
 			goto error;
 		}
@@ -235,19 +243,20 @@ static int _json_map_proc_get_value(TALLOC_CTX *ctx, VALUE_PAIR **out, REQUEST *
 
 /** Parses a JSON string, and executes jpath queries against it to map values to attributes
  *
- * @param mod_inst unused.
- * @param proc_inst cached jpath sequences.
- * @param request The current request.
- * @param src string to parse.
- * @param maps Head of the map list.
+ * @param mod_inst	unused.
+ * @param proc_inst	cached jpath sequences.
+ * @param request	The current request.
+ * @param json		JSON string to parse.
+ * @param maps		Head of the map list.
  * @return
  *	- #RLM_MODULE_NOOP no rows were returned or columns matched.
  *	- #RLM_MODULE_UPDATED if one or more #VALUE_PAIR were added to the #REQUEST.
  *	- #RLM_MODULE_FAIL if a fault occurred.
  */
 static rlm_rcode_t mod_map_proc(UNUSED void *mod_inst, void *proc_inst, REQUEST *request,
-			      	char const *src, vp_map_t const *maps)
+			      	vp_tmpl_t const *json, vp_map_t const *maps)
 {
+	rlm_rcode_t			rcode = RLM_MODULE_UPDATED;
 	struct json_tokener		*tok;
 
 	rlm_json_jpath_cache_t		*cache = proc_inst;
@@ -255,19 +264,22 @@ static rlm_rcode_t mod_map_proc(UNUSED void *mod_inst, void *proc_inst, REQUEST 
 
 	rlm_json_jpath_to_eval_t	to_eval;
 
-	if ((talloc_array_length(src) - 1) == 0) {
+	char				*json_str = NULL;
+
+	if (tmpl_aexpand(request, &json_str, request, json, NULL, NULL) < 0) return RLM_MODULE_FAIL;
+
+	if ((talloc_array_length(json_str) - 1) == 0) {
 		REDEBUG("Zero length string is not valid JSON data");
 		return RLM_MODULE_FAIL;
 	}
 
 	tok = json_tokener_new();
-	to_eval.root = json_tokener_parse_ex(tok, src, (int)(talloc_array_length(src) - 1));
+	to_eval.root = json_tokener_parse_ex(tok, json_str, (int)(talloc_array_length(json_str) - 1));
 	if (!to_eval.root) {
-		REMARKER(src, tok->char_offset, json_tokener_error_desc(json_tokener_get_error(tok)));
-		json_tokener_free(tok);
-		return RLM_MODULE_FAIL;
+		REMARKER(json_str, tok->char_offset, json_tokener_error_desc(json_tokener_get_error(tok)));
+		rcode = RLM_MODULE_FAIL;
+		goto finish;
 	}
-	json_tokener_free(tok);
 
 	for (map = maps; map; map = map->next) {
 		switch (map->rhs->type) {
@@ -279,9 +291,8 @@ static rlm_rcode_t mod_map_proc(UNUSED void *mod_inst, void *proc_inst, REQUEST 
 			to_eval.jpath = cache->jpath;
 
 			if (map_to_request(request, map, _json_map_proc_get_value, &to_eval) < 0) {
-			error:
-				json_object_put(to_eval.root);
-				return RLM_MODULE_FAIL;
+				rcode = RLM_MODULE_FAIL;
+				goto finish;
 			}
 			cache = cache->next;
 			break;
@@ -296,38 +307,46 @@ static rlm_rcode_t mod_map_proc(UNUSED void *mod_inst, void *proc_inst, REQUEST 
 			char		*to_parse;
 
 			if (tmpl_aexpand(request, &to_parse, request, map->rhs, fr_jpath_escape_func, NULL) < 0) {
-				RERROR("Failed getting jpath data: %s", fr_strerror());
-				goto error;
+				RPERROR("Failed getting jpath data");
+				rcode = RLM_MODULE_FAIL;
+				goto finish;
 			}
 			slen = fr_jpath_parse(request, &node, to_parse, talloc_array_length(to_parse) - 1);
 			if (slen <= 0) {
 				REMARKER(to_parse, -(slen), fr_strerror());
 				talloc_free(to_parse);
-				goto error;
+				rcode = RLM_MODULE_FAIL;
+				goto finish;
 			}
 			to_eval.jpath = node;
 
 			if (map_to_request(request, map, _json_map_proc_get_value, &to_eval) < 0) {
 				talloc_free(node);
 				talloc_free(to_parse);
-				goto error;
+				rcode = RLM_MODULE_FAIL;
+				goto finish;
 			}
 			talloc_free(node);
 		}
 			break;
 		}
 	}
-	json_object_put(to_eval.root);
 
-	return RLM_MODULE_UPDATED;
+
+finish:
+	talloc_free(json_str);
+	json_object_put(to_eval.root);
+	json_tokener_free(tok);
+
+	return rcode;
 }
 
-static int mod_bootstrap(UNUSED CONF_SECTION *conf, void *instance)
+static int mod_bootstrap(void *instance, UNUSED CONF_SECTION *conf)
 {
-	xlat_register(instance, "jsonquote", jsonquote_xlat, NULL, NULL, 0, XLAT_DEFAULT_BUF_LEN);
-	xlat_register(instance, "jpathvalidate", jpath_validate_xlat, NULL, NULL, 0, XLAT_DEFAULT_BUF_LEN);
+	xlat_register(instance, "jsonquote", jsonquote_xlat, NULL, NULL, 0, XLAT_DEFAULT_BUF_LEN, true);
+	xlat_register(instance, "jpathvalidate", jpath_validate_xlat, NULL, NULL, 0, XLAT_DEFAULT_BUF_LEN, true);
 
-	if (map_proc_register(instance, "json", mod_map_proc, NULL,
+	if (map_proc_register(instance, "json", mod_map_proc,
 			      mod_map_proc_instantiate, sizeof(rlm_json_jpath_cache_t)) < 0) return -1;
 	return 0;
 }

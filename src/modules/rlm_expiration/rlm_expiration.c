@@ -32,11 +32,11 @@ RCSID("$Id$")
 /*
  *      Check if account has expired, and if user may login now.
  */
-static rlm_rcode_t CC_HINT(nonnull) mod_authorize(UNUSED void *instance, REQUEST *request)
+static rlm_rcode_t CC_HINT(nonnull) mod_authorize(UNUSED void *instance, UNUSED void *thread, REQUEST *request)
 {
 	VALUE_PAIR *vp, *check_item = NULL;
 
-	check_item = fr_pair_find_by_num(request->control, 0, PW_EXPIRATION, TAG_ANY);
+	check_item = fr_pair_find_by_num(request->control, 0, FR_EXPIRATION, TAG_ANY);
 	if (check_item != NULL) {
 		char date[50];
 		/*
@@ -62,9 +62,9 @@ static rlm_rcode_t CC_HINT(nonnull) mod_authorize(UNUSED void *instance, REQUEST
 		 *	Else the account hasn't expired, but it may do so
 		 *	in the future.  Set Session-Timeout.
 		 */
-		vp = fr_pair_find_by_num(request->reply->vps, 0, PW_SESSION_TIMEOUT, TAG_ANY);
+		vp = fr_pair_find_by_num(request->reply->vps, 0, FR_SESSION_TIMEOUT, TAG_ANY);
 		if (!vp) {
-			vp = radius_pair_create(request->reply, &request->reply->vps, PW_SESSION_TIMEOUT, 0);
+			vp = radius_pair_create(request->reply, &request->reply->vps, FR_SESSION_TIMEOUT, 0);
 			vp->vp_date = (uint32_t) (((time_t) check_item->vp_date) - request->packet->timestamp.tv_sec);
 		} else if (vp->vp_date > ((uint32_t) (((time_t) check_item->vp_date) - request->packet->timestamp.tv_sec))) {
 			vp->vp_date = (uint32_t) (((time_t) check_item->vp_date) - request->packet->timestamp.tv_sec);
@@ -102,12 +102,12 @@ static int expirecmp(UNUSED void *instance, REQUEST *req, UNUSED VALUE_PAIR *req
  *	that must be referenced in later calls, store a handle to it
  *	in *instance otherwise put a null pointer there.
  */
-static int mod_instantiate(UNUSED CONF_SECTION *conf, void *instance)
+static int mod_instantiate(void *instance, UNUSED CONF_SECTION *conf)
 {
 	/*
 	 *	Register the expiration comparison operation.
 	 */
-	paircompare_register(fr_dict_attr_by_num(NULL, 0, PW_EXPIRATION), NULL, false, expirecmp, instance);
+	paircompare_register(fr_dict_attr_by_num(NULL, 0, FR_EXPIRATION), NULL, false, expirecmp, instance);
 	return 0;
 }
 

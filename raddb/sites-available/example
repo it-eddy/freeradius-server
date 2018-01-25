@@ -88,7 +88,7 @@ server example {
 		secret		= testing123
 	}
 
-	authorize {
+	recv Access-Request {
 		#
 		#  Some example policies.  See "man unlang" for more.
 		#
@@ -106,16 +106,13 @@ server example {
 		reject
 	}
 
-	authenticate {
+	send Access-Accept {
 
 	}
 
-	post-auth {
-
-		Post-Auth-Type Reject {
-			update reply {
-				&Reply-Message = 'This is only an example.'
-			}
+	send Access-Reject {
+		update reply {
+			&Reply-Message = 'This is only an example.'
 		}
 	}
 

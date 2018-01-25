@@ -60,6 +60,11 @@ typedef struct rlm_python_t {
 	char const	*name;			//!< Name of the module instance
 	PyThreadState	*sub_interpreter;	//!< The main interpreter/thread used for this instance.
 	char const	*python_path;		//!< Path to search for python files in.
+
+#if PY_VERSION_HEX > 0x03050000
+	wchar_t		*wide_name;		//!< Special wide char encoding of radiusd name.
+	wchar_t		*wide_path;		//!< Special wide char encoding of radiusd path.
+#endif
 	PyObject	*module;		//!< Local, interpreter specific module, containing
 						//!< FreeRADIUS functions.
 	bool		cext_compat;		//!< Whether or not to create sub-interpreters per module
@@ -71,7 +76,6 @@ typedef struct rlm_python_t {
 	authenticate,
 	preacct,
 	accounting,
-	checksimul,
 	pre_proxy,
 	post_proxy,
 	post_auth,
@@ -92,7 +96,7 @@ typedef struct rlm_python_t {
  */
 typedef struct python_thread_state {
 	PyThreadState		*state;		//!< Module instance/thread specific state.
-	rlm_python_t		*inst;		//!< Module instance that created this thread state.
+	rlm_python_t const	*inst;		//!< Module instance that created this thread state.
 } python_thread_state_t;
 
 /*
@@ -100,15 +104,14 @@ typedef struct python_thread_state {
  */
 static CONF_PARSER module_config[] = {
 
-#define A(x) { FR_CONF_OFFSET("mod_" #x, PW_TYPE_STRING, rlm_python_t, x.module_name), .dflt = "${.module}" }, \
-	{ FR_CONF_OFFSET("func_" #x, PW_TYPE_STRING, rlm_python_t, x.function_name) },
+#define A(x) { FR_CONF_OFFSET("mod_" #x, FR_TYPE_STRING, rlm_python_t, x.module_name), .dflt = "${.module}" }, \
+	{ FR_CONF_OFFSET("func_" #x, FR_TYPE_STRING, rlm_python_t, x.function_name) },
 
 	A(instantiate)
 	A(authorize)
 	A(authenticate)
 	A(preacct)
 	A(accounting)
-	A(checksimul)
 	A(pre_proxy)
 	A(post_proxy)
 	A(post_auth)
@@ -120,8 +123,8 @@ static CONF_PARSER module_config[] = {
 
 #undef A
 
-	{ FR_CONF_OFFSET("python_path", PW_TYPE_STRING, rlm_python_t, python_path) },
-	{ FR_CONF_OFFSET("cext_compat", PW_TYPE_BOOLEAN, rlm_python_t, cext_compat), .dflt = false },
+	{ FR_CONF_OFFSET("python_path", FR_TYPE_STRING, rlm_python_t, python_path) },
+	{ FR_CONF_OFFSET("cext_compat", FR_TYPE_BOOL, rlm_python_t, cext_compat), .dflt = false },
 
 	CONF_PARSER_TERMINATOR
 };
@@ -170,7 +173,7 @@ fr_thread_local_setup(rbtree_t *, local_thread_state)	/* macro */
  *	radiusd Python functions
  */
 
-/** Allow radlog to be called from python
+/** Allow fr_log to be called from python
  *
  */
 static PyObject *mod_radlog(UNUSED PyObject *module, PyObject *args)
@@ -182,7 +185,7 @@ static PyObject *mod_radlog(UNUSED PyObject *module, PyObject *args)
 		return NULL;
 	}
 
-	radlog(status, "%s", msg);
+	fr_log(&default_log, status, "%s", msg);
 	Py_INCREF(Py_None);
 
 	return Py_None;
@@ -225,13 +228,11 @@ failed:
 static void mod_vptuple(TALLOC_CTX *ctx, REQUEST *request, VALUE_PAIR **vps, PyObject *pValue,
 			char const *funcname, char const *list_name)
 {
-	int	     i;
-	int	     tuplesize;
-	vp_tmpl_t       dst;
+	int	     	i;
+	int	     	tuplesize;
+	vp_tmpl_t       *dst;
 	VALUE_PAIR      *vp;
 	REQUEST         *current = request;
-
-	memset(&dst, 0, sizeof(dst));
 
 	/*
 	 *	If the Python function gave us None for the tuple,
@@ -300,21 +301,25 @@ static void mod_vptuple(TALLOC_CTX *ctx, REQUEST *request, VALUE_PAIR **vps, PyO
 			}
 		}
 
-		if (tmpl_from_attr_str(&dst, s1, REQUEST_CURRENT, PAIR_LIST_REPLY, false, false) <= 0) {
+		if (tmpl_afrom_attr_str(ctx, &dst, s1, REQUEST_CURRENT, PAIR_LIST_REPLY, false, false) <= 0) {
 			ERROR("%s - Failed to find attribute %s:%s", funcname, list_name, s1);
 			continue;
 		}
 
-		if (radius_request(&current, dst.tmpl_request) < 0) {
+		if (radius_request(&current, dst->tmpl_request) < 0) {
 			ERROR("%s - Attribute name %s:%s refers to outer request but not in a tunnel, skipping...",
 			      funcname, list_name, s1);
+			talloc_free(dst);
 			continue;
 		}
 
-		if (!(vp = fr_pair_afrom_da(ctx, dst.tmpl_da))) {
+		vp = fr_pair_afrom_da(ctx, dst->tmpl_da);
+		talloc_free(dst);
+		if (!vp) {
 			ERROR("%s - Failed to create attribute %s:%s", funcname, list_name, s1);
 			continue;
 		}
+
 
 		vp->op = op;
 		if (fr_pair_value_from_str(vp, s2, -1) < 0) {
@@ -354,54 +359,84 @@ static int mod_populate_vptuple(PyObject *pp, VALUE_PAIR *vp)
 
 	PyTuple_SET_ITEM(pp, 0, attribute);
 
-	switch (vp->da->type) {
-	case PW_TYPE_STRING:
+	switch (vp->vp_type) {
+	case FR_TYPE_STRING:
 		value = PyUnicode_FromStringAndSize(vp->vp_strvalue, vp->vp_length);
 		break;
 
-	case PW_TYPE_OCTETS:
+	case FR_TYPE_OCTETS:
 		value = PyString_FromStringAndSize((char const *)vp->vp_octets, vp->vp_length);
 		break;
 
-	case PW_TYPE_INTEGER:
-		value = PyLong_FromUnsignedLong(vp->vp_integer);
-		break;
-
-	case PW_TYPE_BYTE:
-		value = PyLong_FromUnsignedLong(vp->vp_byte);
-		break;
-
-	case PW_TYPE_SHORT:
-		value =  PyLong_FromUnsignedLong(vp->vp_short);
-		break;
-
-	case PW_TYPE_SIGNED:
-		value = PyLong_FromLong(vp->vp_signed);
-		break;
-
-	case PW_TYPE_INTEGER64:
-		value = PyLong_FromUnsignedLongLong(vp->vp_integer64);
-		break;
-
-	case PW_TYPE_DECIMAL:
-		value = PyFloat_FromDouble(vp->vp_decimal);
-		break;
-
-	case PW_TYPE_BOOLEAN:
+	case FR_TYPE_BOOL:
 		value = PyBool_FromLong(vp->vp_bool);
 		break;
 
-	case PW_TYPE_TIMEVAL:
-	case PW_TYPE_IPV4_ADDR:
-	case PW_TYPE_DATE:
-	case PW_TYPE_ABINARY:
-	case PW_TYPE_IFID:
-	case PW_TYPE_IPV6_ADDR:
-	case PW_TYPE_IPV6_PREFIX:
-	case PW_TYPE_ETHERNET:
-	case PW_TYPE_COMBO_IP_ADDR:
-	case PW_TYPE_IPV4_PREFIX:
-	case PW_TYPE_COMBO_IP_PREFIX:
+	case FR_TYPE_UINT8:
+		value = PyLong_FromUnsignedLong(vp->vp_uint8);
+		break;
+
+	case FR_TYPE_UINT16:
+		value = PyLong_FromUnsignedLong(vp->vp_uint16);
+		break;
+
+	case FR_TYPE_UINT32:
+		value = PyLong_FromUnsignedLong(vp->vp_uint32);
+		break;
+
+	case FR_TYPE_UINT64:
+		value = PyLong_FromUnsignedLongLong(vp->vp_uint64);
+		break;
+
+	case FR_TYPE_INT8:
+		value = PyLong_FromLong(vp->vp_int8);
+		break;
+
+	case FR_TYPE_INT16:
+		value = PyLong_FromLong(vp->vp_int16);
+		break;
+
+	case FR_TYPE_INT32:
+		value = PyLong_FromLong(vp->vp_int32);
+		break;
+
+	case FR_TYPE_INT64:
+		value = PyLong_FromLongLong(vp->vp_int64);
+		break;
+
+	case FR_TYPE_FLOAT32:
+		value = PyFloat_FromDouble((double) vp->vp_float32);
+		break;
+
+	case FR_TYPE_FLOAT64:
+		value = PyFloat_FromDouble(vp->vp_float64);
+		break;
+
+	case FR_TYPE_DATE_MILLISECONDS:
+		value = PyLong_FromLongLong(vp->vp_date_milliseconds);
+		break;
+
+	case FR_TYPE_DATE_MICROSECONDS:
+		value = PyLong_FromLongLong(vp->vp_date_microseconds);
+		break;
+
+	case FR_TYPE_DATE_NANOSECONDS:
+		value = PyLong_FromLongLong(vp->vp_date_nanoseconds);
+		break;
+
+	case FR_TYPE_SIZE:
+		value = PyLong_FromUnsignedLongLong((unsigned long long)vp->vp_size);
+		break;
+
+	case FR_TYPE_TIMEVAL:
+	case FR_TYPE_IPV4_ADDR:
+	case FR_TYPE_DATE:
+	case FR_TYPE_ABINARY:
+	case FR_TYPE_IFID:
+	case FR_TYPE_IPV6_ADDR:
+	case FR_TYPE_IPV6_PREFIX:
+	case FR_TYPE_ETHERNET:
+	case FR_TYPE_IPV4_PREFIX:
 	{
 		size_t len;
 		char buffer[256];
@@ -411,8 +446,7 @@ static int mod_populate_vptuple(PyObject *pp, VALUE_PAIR *vp)
 	}
 		break;
 
-	case PW_TYPE_STRUCTURAL:
-	case PW_TYPE_BAD:
+	case FR_TYPE_NON_VALUES:
 		rad_assert(0);
 		return -1;
 	}
@@ -426,7 +460,7 @@ static int mod_populate_vptuple(PyObject *pp, VALUE_PAIR *vp)
 
 static rlm_rcode_t do_python_single(REQUEST *request, PyObject *pFunc, char const *funcname)
 {
-	vp_cursor_t	cursor;
+	fr_cursor_t	cursor;
 	VALUE_PAIR      *vp;
 	PyObject	*pRet = NULL;
 	PyObject	*pArgs = NULL;
@@ -596,7 +630,7 @@ static void _python_thread_tree_free(void *arg)
 	rad_assert(arg == local_thread_state);
 
 	rbtree_t *tree = talloc_get_type_abort(arg, rbtree_t);
-	rbtree_free(tree);	/* Needs to be this not talloc_free to execute delete walker */
+	talloc_free(tree);	/* Needs to be this not talloc_free to execute delete walker */
 
 	local_thread_state = NULL;	/* Prevent double free in unit_test_module env */
 }
@@ -608,16 +642,14 @@ static int _python_inst_cmp(const void *a, const void *b)
 {
 	python_thread_state_t const *a_p = a, *b_p = b;
 
-	if (a_p->inst < b_p->inst) return -1;
-	if (a_p->inst > b_p->inst) return +1;
-	return 0;
+	return (a_p->inst < b_p->inst) - (a_p->inst > b_p->inst);
 }
 
 /** Thread safe call to a python function
  *
  * Will swap in thread state specific to module/thread.
  */
-static rlm_rcode_t do_python(rlm_python_t *inst, REQUEST *request, PyObject *pFunc, char const *funcname)
+static rlm_rcode_t do_python(rlm_python_t const *inst, REQUEST *request, PyObject *pFunc, char const *funcname)
 {
 	int			ret;
 	rbtree_t		*thread_tree;
@@ -633,19 +665,14 @@ static rlm_rcode_t do_python(rlm_python_t *inst, REQUEST *request, PyObject *pFu
 	 *	Check to see if we've got a thread state tree
 	 *	If not, create one.
 	 */
-	thread_tree = fr_thread_local_init(local_thread_state, _python_thread_tree_free);
+	thread_tree = local_thread_state;
 	if (!thread_tree) {
 		thread_tree = rbtree_create(NULL, _python_inst_cmp, _python_thread_entry_free, 0);
 		if (!thread_tree) {
 			RERROR("Failed allocating thread state tree");
 			return RLM_MODULE_FAIL;
 		}
-
-		ret = fr_thread_local_set(local_thread_state, thread_tree);
-		if (ret != 0) {
-			talloc_free(thread_tree);
-			return RLM_MODULE_FAIL;
-		}
+		fr_thread_local_set_destructor(local_thread_state, _python_thread_tree_free, thread_tree);
 	}
 
 	find.inst = inst;
@@ -687,15 +714,14 @@ static rlm_rcode_t do_python(rlm_python_t *inst, REQUEST *request, PyObject *pFu
 }
 
 #define MOD_FUNC(x) \
-static rlm_rcode_t CC_HINT(nonnull) mod_##x(void *instance, REQUEST *request) { \
-	return do_python((rlm_python_t *) instance, request, ((rlm_python_t *)instance)->x.function, #x);\
+static rlm_rcode_t CC_HINT(nonnull) mod_##x(void *instance, UNUSED void *thread, REQUEST *request) { \
+	return do_python((rlm_python_t const *) instance, request, ((rlm_python_t const *)instance)->x.function, #x);\
 }
 
 MOD_FUNC(authenticate)
 MOD_FUNC(authorize)
 MOD_FUNC(preacct)
 MOD_FUNC(accounting)
-MOD_FUNC(checksimul)
 MOD_FUNC(pre_proxy)
 MOD_FUNC(post_proxy)
 MOD_FUNC(post_auth)
@@ -770,7 +796,7 @@ static void python_parse_config(CONF_SECTION *cs, int lvl, PyObject *dict)
 
 	DEBUG("%*s%s {", indent_section, " ", cf_section_name1(cs));
 
-	while ((ci = cf_item_find_next(cs, ci))) {
+	while ((ci = cf_item_next(cs, ci))) {
 		/*
 		 *  This is a section.
 		 *  Create a new dict, store it in current dict,
@@ -847,19 +873,15 @@ static int python_interpreter_init(rlm_python_t *inst, CONF_SECTION *conf)
 
 #if PY_VERSION_HEX > 0x03050000
 		{
-			wchar_t *name;
-
-			wide_name = Py_DecodeLocale(main_config.name, strlen(main_config.name));
-			Py_SetProgramName(name);		/* The value of argv[0] as a wide char string */
-			PyMem_RawFree(name);
+			inst->wide_name = Py_DecodeLocale(main_config.name, strlen(main_config.name));
+			Py_SetProgramName(inst->wide_name);		/* The value of argv[0] as a wide char string */
 		}
 #else
 		{
 			char *name;
 
-			name = talloc_strdup(NULL, main_config.name);
+			memcpy(&name, &main_config.name, sizeof(name));
 			Py_SetProgramName(name);		/* The value of argv[0] as a wide char string */
-			talloc_free(name);
 		}
 #endif
 
@@ -895,23 +917,23 @@ static int python_interpreter_init(rlm_python_t *inst, CONF_SECTION *conf)
 
 		/*
 		 *	Set the python search path
+		 *
+		 *	The path buffer does not appear to be dup'd
+		 *	so its lifetime should really be bound to
+		 *	the lifetime of the module.
 		 */
 		if (inst->python_path) {
 #if PY_VERSION_HEX > 0x03050000
 			{
-				wchar_t *name;
-
-				path = Py_DecodeLocale(inst->python_path, strlen(inst->python_path));
-				PySys_SetPath(path);
-				PyMem_RawFree(path);
+				inst->wide_path = Py_DecodeLocale(inst->python_path, strlen(inst->python_path));
+				PySys_SetPath(inst->wide_path);
 			}
 #else
 			{
 				char *path;
 
-				path = talloc_strdup(NULL, inst->python_path);
+				memcpy(&path, &inst->python_path, sizeof(path));
 				PySys_SetPath(path);
-				talloc_free(path);
 			}
 #endif
 		}
@@ -958,7 +980,7 @@ static int python_interpreter_init(rlm_python_t *inst, CONF_SECTION *conf)
 		 */
 		if (PyModule_AddObject(inst->module, "config", inst->pythonconf_dict) < 0) goto error;
 
-		cs = cf_section_sub_find(conf, "config");
+		cs = cf_section_find(conf, "config", NULL);
 		if (cs) python_parse_config(cs, 0, inst->pythonconf_dict);
 	} else {
 		inst->module = main_module;
@@ -983,7 +1005,7 @@ static int python_interpreter_init(rlm_python_t *inst, CONF_SECTION *conf)
  *	in *instance otherwise put a null pointer there.
  *
  */
-static int mod_instantiate(CONF_SECTION *conf, void *instance)
+static int mod_instantiate(void *instance, CONF_SECTION *conf)
 {
 	rlm_python_t	*inst = instance;
 	int		code = 0;
@@ -1010,7 +1032,6 @@ static int mod_instantiate(CONF_SECTION *conf, void *instance)
 	PYTHON_FUNC_LOAD(authorize);
 	PYTHON_FUNC_LOAD(preacct);
 	PYTHON_FUNC_LOAD(accounting);
-	PYTHON_FUNC_LOAD(checksimul);
 	PYTHON_FUNC_LOAD(pre_proxy);
 	PYTHON_FUNC_LOAD(post_proxy);
 	PYTHON_FUNC_LOAD(post_auth);
@@ -1053,7 +1074,6 @@ static int mod_detach(void *instance)
 	PYTHON_FUNC_DESTROY(authenticate);
 	PYTHON_FUNC_DESTROY(preacct);
 	PYTHON_FUNC_DESTROY(accounting);
-	PYTHON_FUNC_DESTROY(checksimul);
 	PYTHON_FUNC_DESTROY(detach);
 
 	Py_DecRef(inst->pythonconf_dict);
@@ -1067,7 +1087,7 @@ static int mod_detach(void *instance)
 	 *	unit_test_module framework, and probably with the server running
 	 *	in debug mode.
 	 */
-	rbtree_free(local_thread_state);
+	talloc_free(local_thread_state);
 	local_thread_state = NULL;
 
 	/*
@@ -1079,7 +1099,13 @@ static int mod_detach(void *instance)
 		PyThreadState_Swap(main_interpreter); /* Swap to the main thread */
 		Py_Finalize();
 		dlclose(python_dlhandle);
+
+#if PY_VERSION_HEX > 0x03050000
+		if (inst->wide_name) PyMem_RawFree(inst->wide_name);
+		if (inst->wide_path) PyMem_RawFree(inst->wide_path);
+#endif
 	}
+
 
 	return ret;
 }
@@ -1107,7 +1133,6 @@ rad_module_t rlm_python = {
 		[MOD_AUTHORIZE]		= mod_authorize,
 		[MOD_PREACCT]		= mod_preacct,
 		[MOD_ACCOUNTING]	= mod_accounting,
-		[MOD_SESSION]		= mod_checksimul,
 		[MOD_PRE_PROXY]		= mod_pre_proxy,
 		[MOD_POST_PROXY]	= mod_post_proxy,
 		[MOD_POST_AUTH]		= mod_post_auth,

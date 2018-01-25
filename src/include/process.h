@@ -29,51 +29,23 @@ RCSIDH(process_h, "$Id$")
 
 #include <freeradius-devel/clients.h>
 #include <freeradius-devel/listen.h>
+#include <freeradius-devel/signal.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-typedef enum fr_state_action_t {	/* server action */
-	FR_ACTION_INVALID = 0,
-	FR_ACTION_RUN,
-	FR_ACTION_DONE,
-	FR_ACTION_DUP,
-	FR_ACTION_TIMER,
-#ifdef WITH_PROXY
-	FR_ACTION_PROXY_REPLY,
-#endif
-} fr_state_action_t;
-
 /*
  *  Function handler for requests.
  */
-typedef	void (*fr_request_process_t)(REQUEST *, fr_state_action_t);
+typedef	void (*fr_request_process_t)(REQUEST *, fr_state_signal_t);
 
 extern time_t fr_start_time;
-
-#ifdef WITH_PROXY
-int request_proxy_reply(RADIUS_PACKET *packet);
-#endif
-
-#ifdef DEBUG_STATE_MACHINE
-void request_trace_state_machine(REQUEST *request);
-# define TRACE_STATE_MACHINE if (rad_debug_lvl) request_trace_state_machine(request)
-#else
-#  define TRACE_STATE_MACHINE {}
-#endif
 
 /*
  *	More state machine helper functions.
  */
-bool request_max_time(REQUEST *request);
-void request_thread(REQUEST *request, fr_request_process_t process);
-bool request_thread_active(REQUEST *request);
 void request_delete(REQUEST *request);
-void request_free(REQUEST *request);
-void request_thread_done(REQUEST *request);
-bool request_dup_received(rad_listen_t *listener, rbtree_t *dup_tree, RADCLIENT *client, RADIUS_PACKET *packet);
-
 
 #ifdef __cplusplus
 }

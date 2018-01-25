@@ -138,7 +138,7 @@ ldap {
 
 	#  Note: set_auth_type was removed in v3.x.x
 	#  Equivalent functionality can be achieved by adding the following
-	#  stanza to the authorize {} section of your virtual server.
+	#  stanza to the recv Access-Request {} section of your virtual server.
 	#
 	#    ldap
 	#    if ((ok || updated) && User-Password) {
@@ -268,7 +268,9 @@ ldap {
 		#  For group comparisons these attributes will be checked
 		#  instead of querying the LDAP directory directly.
 		#
-		#  This feature is intended to be used with rlm_cache.
+		#  This feature is intended to be used with rlm_cache, but
+		#  may also be useful if all group values need to be processed
+		#  using unlang policies.
 		#
 		#  If you wish to use this feature, you should enable
 		#  the type that matches the format of your check items
@@ -311,63 +313,6 @@ ldap {
 		#  if authorization is successful.
 #		attribute = 'radiusProfileDn'
 	}
-
-	#
-	#  Bulk load clients from the directory
-	#
-	client {
-		#   Where to start searching in the tree for clients
-		base_dn = "${..base_dn}"
-
-		#
-		#  Filter to match client objects
-		#
-		filter = '(objectClass=radiusClient)'
-
-		# Search scope, may be 'base', 'one', 'sub' or 'children'
-#		scope = 'sub'
-
-		#
-		#  Sets default values (not obtained from LDAP) for new client entries
-		#
-		template {
-#			login				= 'test'
-#			password			= 'test'
-#			proto	 			= tcp
-#			require_message_authenticator	= yes
-
-			# Uncomment to add a home_server with the same
-			# attributes as the client.
-#			coa_server {
-#				response_window = 2.0
-#			}
-		}
-
-		#
-		#  Client attribute mappings are in the format:
-		#      <client attribute> = <ldap attribute>
-		#
-		#  The following attributes are required:
-		#    * ipaddr | ipv4addr | ipv6addr - Client IP Address.
-		#    * secret - RADIUS shared secret.
-		#
-		#  All other attributes usually supported in a client
-		#  definition are also supported here.
-		#
-		#  Schemas are available in doc/schemas/ldap for openldap and eDirectory
-		#
-		attribute {
-			ipaddr				= 'radiusClientIdentifier'
-			secret				= 'radiusClientSecret'
-#			shortname			= 'radiusClientShortname'
-#			nas_type			= 'radiusClientType'
-#			virtual_server			= 'radiusClientVirtualServer'
-#			require_message_authenticator	= 'radiusClientRequireMa'
-		}
-	}
-
-	#  Load clients on startup
-#	read_clients = no
 
 	#
 	#  Modify user object on receiving Accounting-Request

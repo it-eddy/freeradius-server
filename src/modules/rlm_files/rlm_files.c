@@ -31,8 +31,6 @@ RCSID("$Id$")
 #include	<fcntl.h>
 
 typedef struct rlm_files_t {
-	char const *compat_mode;
-
 	char const *key;
 
 	char const *filename;
@@ -73,34 +71,32 @@ typedef struct rlm_files_t {
 static int fall_through(VALUE_PAIR *vp)
 {
 	VALUE_PAIR *tmp;
-	tmp = fr_pair_find_by_num(vp, 0, PW_FALL_THROUGH, TAG_ANY);
+	tmp = fr_pair_find_by_num(vp, 0, FR_FALL_THROUGH, TAG_ANY);
 
-	return tmp ? tmp->vp_integer : 0;
+	return tmp ? tmp->vp_uint32 : 0;
 }
 
 static const CONF_PARSER module_config[] = {
-	{ FR_CONF_OFFSET("filename", PW_TYPE_FILE_INPUT, rlm_files_t, filename) },
-	{ FR_CONF_OFFSET("usersfile", PW_TYPE_FILE_INPUT, rlm_files_t, usersfile) },
-	{ FR_CONF_OFFSET("acctusersfile", PW_TYPE_FILE_INPUT, rlm_files_t, acct_usersfile) },
+	{ FR_CONF_OFFSET("filename", FR_TYPE_FILE_INPUT, rlm_files_t, filename) },
+	{ FR_CONF_OFFSET("usersfile", FR_TYPE_FILE_INPUT, rlm_files_t, usersfile) },
+	{ FR_CONF_OFFSET("acctusersfile", FR_TYPE_FILE_INPUT, rlm_files_t, acct_usersfile) },
 #ifdef WITH_PROXY
-	{ FR_CONF_OFFSET("preproxy_usersfile", PW_TYPE_FILE_INPUT, rlm_files_t, preproxy_usersfile) },
-	{ FR_CONF_OFFSET("postproxy_usersfile", PW_TYPE_FILE_INPUT, rlm_files_t, postproxy_usersfile) },
+	{ FR_CONF_OFFSET("preproxy_usersfile", FR_TYPE_FILE_INPUT, rlm_files_t, preproxy_usersfile) },
+	{ FR_CONF_OFFSET("postproxy_usersfile", FR_TYPE_FILE_INPUT, rlm_files_t, postproxy_usersfile) },
 #endif
-	{ FR_CONF_OFFSET("auth_usersfile", PW_TYPE_FILE_INPUT, rlm_files_t, auth_usersfile) },
-	{ FR_CONF_OFFSET("postauth_usersfile", PW_TYPE_FILE_INPUT, rlm_files_t, postauth_usersfile) },
-	{ FR_CONF_OFFSET("compat", PW_TYPE_STRING | PW_TYPE_DEPRECATED, rlm_files_t, compat_mode) },
-	{ FR_CONF_OFFSET("key", PW_TYPE_STRING | PW_TYPE_XLAT, rlm_files_t, key) },
+	{ FR_CONF_OFFSET("auth_usersfile", FR_TYPE_FILE_INPUT, rlm_files_t, auth_usersfile) },
+	{ FR_CONF_OFFSET("postauth_usersfile", FR_TYPE_FILE_INPUT, rlm_files_t, postauth_usersfile) },
+	{ FR_CONF_OFFSET("key", FR_TYPE_STRING | FR_TYPE_XLAT, rlm_files_t, key) },
 	CONF_PARSER_TERMINATOR
 };
 
 
 static int pairlist_cmp(void const *a, void const *b)
 {
-	return strcmp(((PAIR_LIST const *)a)->name,
-		      ((PAIR_LIST const *)b)->name);
+	return strcmp(((PAIR_LIST const *)a)->name, ((PAIR_LIST const *)b)->name);
 }
 
-static int getusersfile(TALLOC_CTX *ctx, char const *filename, rbtree_t **ptree, char const *compat_mode_str)
+static int getusersfile(TALLOC_CTX *ctx, char const *filename, rbtree_t **ptree)
 {
 	int rcode;
 	PAIR_LIST *users = NULL;
@@ -119,26 +115,14 @@ static int getusersfile(TALLOC_CTX *ctx, char const *filename, rbtree_t **ptree,
 	}
 
 	/*
-	 *	Walk through the 'users' file list, if we're debugging,
-	 *	or if we're in compat_mode.
+	 *	Walk through the 'users' file list, if we're debugging.
 	 */
-	if ((rad_debug_lvl) ||
-	    (compat_mode_str && (strcmp(compat_mode_str, "cistron") == 0))) {
+	if (rad_debug_lvl) {
 		VALUE_PAIR *vp;
-		bool compat_mode = false;
-
-		if (compat_mode_str && (strcmp(compat_mode_str, "cistron") == 0)) {
-			compat_mode = true;
-		}
 
 		entry = users;
 		while (entry) {
-			vp_cursor_t cursor;
-			if (compat_mode) {
-				DEBUG("[%s]:%d Cistron compatibility checks for entry %s ...",
-						filename, entry->lineno,
-						entry->name);
-			}
+			fr_cursor_t cursor;
 
 			/*
 			 *	Look for improper use of '=' in the
@@ -147,7 +131,9 @@ static int getusersfile(TALLOC_CTX *ctx, char const *filename, rbtree_t **ptree,
 			 *	and probably ':=' for server
 			 *	configuration items.
 			 */
-			for (vp = fr_cursor_init(&cursor, &entry->check); vp; vp = fr_cursor_next(&cursor)) {
+			for (vp = fr_cursor_init(&cursor, &entry->check);
+			     vp;
+			     vp = fr_cursor_next(&cursor)) {
 				/*
 				 *	Ignore attributes which are set
 				 *	properly.
@@ -162,47 +148,13 @@ static int getusersfile(TALLOC_CTX *ctx, char const *filename, rbtree_t **ptree,
 				 *	ensure it has '=='.
 				 */
 				if ((vp->da->vendor != 0) ||
-						(vp->da->attr < 0x100)) {
-					if (!compat_mode) {
-						WARN("[%s]:%d Changing '%s =' to '%s =='\n\tfor comparing RADIUS attribute in check item list for user %s",
-								filename, entry->lineno,
-								vp->da->name, vp->da->name,
-								entry->name);
-					} else {
-						DEBUG("\tChanging '%s =' to '%s =='",
-								vp->da->name, vp->da->name);
-					}
+				    (vp->da->attr < 0x100)) {
+					WARN("[%s]:%d Changing '%s =' to '%s =='\n\tfor comparing RADIUS attribute in check item list for user %s",
+					     filename, entry->lineno,
+					     vp->da->name, vp->da->name,
+					     entry->name);
 					vp->op = T_OP_CMP_EQ;
 					continue;
-				}
-
-				/*
-				 *	Cistron Compatibility mode.
-				 *
-				 *	Re-write selected attributes
-				 *	to be '+=', instead of '='.
-				 *
-				 *	All others get set to '=='
-				 */
-				if (compat_mode) {
-					/*
-					 *	Non-wire attributes become +=
-					 *
-					 *	On the write attributes
-					 *	become ==
-					 */
-					if ((vp->da->attr >= 0x100) &&
-					    (vp->da->attr <= 0xffff) &&
-					    (vp->da->attr != PW_HINT) &&
-					    (vp->da->attr != PW_HUNTGROUP_NAME)) {
-						DEBUG("\tChanging '%s =' to '%s +='", vp->da->name, vp->da->name);
-
-						vp->op = T_OP_ADD;
-					} else {
-						DEBUG("\tChanging '%s =' to '%s =='", vp->da->name, vp->da->name);
-
-						vp->op = T_OP_CMP_EQ;
-					}
 				}
 			} /* end of loop over check items */
 
@@ -213,7 +165,9 @@ static int getusersfile(TALLOC_CTX *ctx, char const *filename, rbtree_t **ptree,
 			 *	It's a common enough mistake, that it's
 			 *	worth doing.
 			 */
-			for (vp = fr_cursor_init(&cursor, &entry->reply); vp; vp = fr_cursor_next(&cursor)) {
+			for (vp = fr_cursor_init(&cursor, &entry->reply);
+			     vp;
+			     vp = fr_cursor_next(&cursor)) {
 				/*
 				 *	If it's NOT a vendor attribute,
 				 *	and it's NOT a wire protocol
@@ -271,7 +225,7 @@ static int getusersfile(TALLOC_CTX *ctx, char const *filename, rbtree_t **ptree,
 				error:
 					pairlist_free(&entry);
 					pairlist_free(&next);
-					rbtree_free(tree);
+					talloc_free(tree);
 					return -1;
 				}
 
@@ -317,12 +271,12 @@ static int getusersfile(TALLOC_CTX *ctx, char const *filename, rbtree_t **ptree,
 /*
  *	(Re-)read the "users" file into memory.
  */
-static int mod_instantiate(UNUSED CONF_SECTION *conf, void *instance)
+static int mod_instantiate(void *instance, UNUSED CONF_SECTION *conf)
 {
 	rlm_files_t *inst = instance;
 
 #undef READFILE
-#define READFILE(_x, _y) do { if (getusersfile(inst, inst->_x, &inst->_y, inst->compat_mode) != 0) { ERROR("Failed reading %s", inst->_x); return -1;} } while (0)
+#define READFILE(_x, _y) do { if (getusersfile(inst, inst->_x, &inst->_y) != 0) { ERROR("Failed reading %s", inst->_x); return -1;} } while (0)
 
 	READFILE(filename, common);
 	READFILE(usersfile, users);
@@ -342,7 +296,7 @@ static int mod_instantiate(UNUSED CONF_SECTION *conf, void *instance)
 /*
  *	Common code called by everything below.
  */
-static rlm_rcode_t file_common(rlm_files_t *inst, REQUEST *request, char const *filename, rbtree_t *tree,
+static rlm_rcode_t file_common(rlm_files_t const *inst, REQUEST *request, char const *filename, rbtree_t *tree,
 			       RADIUS_PACKET *request_packet, RADIUS_PACKET *reply_packet)
 {
 	char const	*name, *match;
@@ -361,7 +315,7 @@ static rlm_rcode_t file_common(rlm_files_t *inst, REQUEST *request, char const *
 	} else {
 		int len;
 
-		len = radius_xlat(buffer, sizeof(buffer), request, inst->key, NULL, NULL);
+		len = xlat_eval(buffer, sizeof(buffer), request, inst->key, NULL, NULL);
 		if (len < 0) {
 			return RLM_MODULE_FAIL;
 		}
@@ -380,7 +334,7 @@ static rlm_rcode_t file_common(rlm_files_t *inst, REQUEST *request, char const *
 	 *	Find the entry for the user.
 	 */
 	while (user_pl || default_pl) {
-		vp_cursor_t cursor;
+		fr_cursor_t cursor;
 		VALUE_PAIR *vp;
 		PAIR_LIST const *pl;
 
@@ -413,7 +367,7 @@ static rlm_rcode_t file_common(rlm_files_t *inst, REQUEST *request, char const *
 		for (vp = fr_cursor_init(&cursor, &check_tmp);
 		     vp;
 		     vp = fr_cursor_next(&cursor)) {
-			if (radius_xlat_do(request, vp) < 0) {
+			if (xlat_eval_do(request, vp) < 0) {
 				RWARN("Failed parsing expanded value for check item, skipping entry: %s", fr_strerror());
 				fr_pair_list_free(&check_tmp);
 				continue;
@@ -433,15 +387,14 @@ static rlm_rcode_t file_common(rlm_files_t *inst, REQUEST *request, char const *
 			/*
 			 *	Fallthrough?
 			 */
-			if (!fall_through(pl->reply))
-				break;
+			if (!fall_through(pl->reply)) break;
 		}
 	}
 
 	/*
 	 *	Remove server internal parameters.
 	 */
-	fr_pair_delete_by_num(&reply_packet->vps, 0, PW_FALL_THROUGH, TAG_ANY);
+	fr_pair_delete_by_num(&reply_packet->vps, 0, FR_FALL_THROUGH, TAG_ANY);
 
 	/*
 	 *	See if we succeeded.
@@ -460,9 +413,9 @@ static rlm_rcode_t file_common(rlm_files_t *inst, REQUEST *request, char const *
  *	for this user from the database. The main code only
  *	needs to check the password, the rest is done here.
  */
-static rlm_rcode_t CC_HINT(nonnull) mod_authorize(void *instance, REQUEST *request)
+static rlm_rcode_t CC_HINT(nonnull) mod_authorize(void *instance, UNUSED void *thread, REQUEST *request)
 {
-	rlm_files_t *inst = instance;
+	rlm_files_t const *inst = instance;
 
 	return file_common(inst, request, inst->filename,
 			   inst->users ? inst->users : inst->common,
@@ -475,9 +428,9 @@ static rlm_rcode_t CC_HINT(nonnull) mod_authorize(void *instance, REQUEST *reque
  *	config. Reply items are Not Recommended(TM) in acct_users,
  *	except for Fallthrough, which should work
  */
-static rlm_rcode_t CC_HINT(nonnull) mod_preacct(void *instance, REQUEST *request)
+static rlm_rcode_t CC_HINT(nonnull) mod_preacct(void *instance, UNUSED void *thread, REQUEST *request)
 {
-	rlm_files_t *inst = instance;
+	rlm_files_t const *inst = instance;
 
 	return file_common(inst, request, inst->acct_usersfile,
 			   inst->acct_users ? inst->acct_users : inst->common,
@@ -485,18 +438,18 @@ static rlm_rcode_t CC_HINT(nonnull) mod_preacct(void *instance, REQUEST *request
 }
 
 #ifdef WITH_PROXY
-static rlm_rcode_t CC_HINT(nonnull) mod_pre_proxy(void *instance, REQUEST *request)
+static rlm_rcode_t CC_HINT(nonnull) mod_pre_proxy(void *instance, UNUSED void *thread, REQUEST *request)
 {
-	rlm_files_t *inst = instance;
+	rlm_files_t const *inst = instance;
 
 	return file_common(inst, request, inst->preproxy_usersfile,
 			   inst->preproxy_users ? inst->preproxy_users : inst->common,
 			   request->packet, request->proxy->packet);
 }
 
-static rlm_rcode_t CC_HINT(nonnull) mod_post_proxy(void *instance, REQUEST *request)
+static rlm_rcode_t CC_HINT(nonnull) mod_post_proxy(void *instance, UNUSED void *thread, REQUEST *request)
 {
-	rlm_files_t *inst = instance;
+	rlm_files_t const *inst = instance;
 
 	return file_common(inst, request, inst->postproxy_usersfile,
 			   inst->postproxy_users ? inst->postproxy_users : inst->common,
@@ -504,18 +457,18 @@ static rlm_rcode_t CC_HINT(nonnull) mod_post_proxy(void *instance, REQUEST *requ
 }
 #endif
 
-static rlm_rcode_t CC_HINT(nonnull) mod_authenticate(void *instance, REQUEST *request)
+static rlm_rcode_t CC_HINT(nonnull) mod_authenticate(void *instance, UNUSED void *thread, REQUEST *request)
 {
-	rlm_files_t *inst = instance;
+	rlm_files_t const *inst = instance;
 
 	return file_common(inst, request, inst->auth_usersfile,
 			   inst->auth_users ? inst->auth_users : inst->common,
 			   request->packet, request->reply);
 }
 
-static rlm_rcode_t CC_HINT(nonnull) mod_post_auth(void *instance, REQUEST *request)
+static rlm_rcode_t CC_HINT(nonnull) mod_post_auth(void *instance, UNUSED void *thread, REQUEST *request)
 {
-	rlm_files_t *inst = instance;
+	rlm_files_t const *inst = instance;
 
 	return file_common(inst, request, inst->postauth_usersfile,
 			   inst->postauth_users ? inst->postauth_users : inst->common,
@@ -528,7 +481,6 @@ extern rad_module_t rlm_files;
 rad_module_t rlm_files = {
 	.magic		= RLM_MODULE_INIT,
 	.name		= "files",
-	.type		= RLM_TYPE_HUP_SAFE,
 	.inst_size	= sizeof(rlm_files_t),
 	.config		= module_config,
 	.instantiate	= mod_instantiate,

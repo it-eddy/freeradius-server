@@ -405,15 +405,6 @@ ssize_t rad_filename_unescape(char *out, size_t outlen, char const *in, size_t i
 	return outlen - freespace;	/* how many bytes were written */
 }
 
-void talloc_const_free(void const *ptr)
-{
-	void *tmp;
-	if (!ptr) return;
-
-	memcpy(&tmp, &ptr, sizeof(tmp));
-	talloc_free(tmp);
-}
-
 /** talloc a buffer to hold the concatenated value of all elements of argv
  *
  * @param ctx to allocate buffer in.
@@ -456,25 +447,6 @@ char *rad_ajoin(TALLOC_CTX *ctx, char const **argv, int argc, char c)
 
 	return buff;
 }
-
-/*
- *	Logs an error message and aborts the program
- *
- */
-#ifndef NDEBUG
-bool rad_assert_fail(char const *file, unsigned int line, char const *expr)
-{
-	ERROR("ASSERT FAILED %s[%u]: %s", file, line, expr);
-	fr_fault(SIGABRT);
-	fr_exit_now(1);
-}
-#else
-bool rad_assert_fail(char const *file, unsigned int line, char const *expr)
-{
-	ERROR("ASSERT WOULD FAIL %s[%u]: %s", file, line, expr);
-	return false;
-}
-#endif
 
 /*
  *	Copy a quoted string.
@@ -672,7 +644,7 @@ int rad_expand_xlat(REQUEST *request, char const *cmd,
 	strlcpy(argv_buf, cmd, argv_buflen);
 
 	/*
-	 *	Split the string into argv's BEFORE doing radius_xlat...
+	 *	Split the string into argv's BEFORE doing xlat_eval...
 	 */
 	from = cmd;
 	to = argv_buf;
@@ -764,7 +736,7 @@ int rad_expand_xlat(REQUEST *request, char const *cmd,
 
 		if (!request) continue;
 
-		sublen = radius_xlat(to, left - 1, request, argv[i], NULL, NULL);
+		sublen = xlat_eval(to, left - 1, request, argv[i], NULL, NULL);
 		if (sublen <= 0) {
 			if (can_fail) {
 				/*
@@ -860,7 +832,7 @@ char const *rad_radacct_dir(void)
 /*
  *	Verify a packet.
  */
-static void verify_packet(char const *file, int line, REQUEST *request, RADIUS_PACKET *packet, char const *type)
+static void packet_verify(char const *file, int line, REQUEST const *request, RADIUS_PACKET const *packet, char const *type)
 {
 	TALLOC_CTX *parent;
 
@@ -881,7 +853,7 @@ static void verify_packet(char const *file, int line, REQUEST *request, RADIUS_P
 		rad_assert(0);
 	}
 
-	VERIFY_PACKET(packet);
+	PACKET_VERIFY(packet);
 
 	if (!packet->vps) return;
 
@@ -892,42 +864,52 @@ static void verify_packet(char const *file, int line, REQUEST *request, RADIUS_P
 /*
  *	Catch horrible talloc errors.
  */
-void verify_request(char const *file, int line, REQUEST *request)
+void request_verify(char const *file, int line, REQUEST const *request)
 {
 	if (!request) {
 		fprintf(stderr, "CONSISTENCY CHECK FAILED %s[%i]: REQUEST pointer was NULL", file, line);
 		if (!fr_cond_assert(0)) fr_exit_now(1);
 	}
 
-	(void) talloc_get_type_abort(request, REQUEST);
+	(void) talloc_get_type_abort_const(request, REQUEST);
+
+	rad_assert(request->magic == REQUEST_MAGIC);
+
+	if (talloc_get_size(request) != sizeof(REQUEST)) {
+		fprintf(stderr, "CONSISTENCY CHECK FAILED %s[%i]: expected REQUEST size of %zu bytes, got %zu bytes",
+			file, line, sizeof(REQUEST), talloc_get_size(request));
+		if (!fr_cond_assert(0)) fr_exit_now(1);
+	}
 
 #ifdef WITH_VERIFY_PTR
 	fr_pair_list_verify(file, line, request, request->control);
 	fr_pair_list_verify(file, line, request->state_ctx, request->state);
+
+	if (request->username) VP_VERIFY(request->username);
+	if (request->password) VP_VERIFY(request->password);
 #endif
 
-	if (request->packet) verify_packet(file, line, request, request->packet, "request");
-	if (request->reply) verify_packet(file, line, request, request->reply, "reply");
+	rad_assert(request->server_cs != NULL);
+
+	if (request->packet) {
+		packet_verify(file, line, request, request->packet, "request");
+		if ((request->packet->code == FR_CODE_ACCESS_REQUEST) &&
+		    (request->reply && !request->reply->code)) {
+			rad_assert(request->state_ctx != NULL);
+		}
+	}
+	if (request->reply) packet_verify(file, line, request, request->reply, "reply");
 #ifdef WITH_PROXY
 	if (request->proxy) {
 		(void) talloc_get_type_abort(request->proxy, REQUEST);
 
 		rad_assert(request == talloc_parent(request->proxy));
 
-		if (request->proxy->packet) verify_packet(file, line, request->proxy, request->proxy->packet, "proxy-request");
-		if (request->proxy->reply) verify_packet(file, line, request->proxy, request->proxy->reply, "proxy-reply");
+		if (request->proxy->packet) packet_verify(file, line, request->proxy, request->proxy->packet, "proxy-request");
+		if (request->proxy->reply) packet_verify(file, line, request->proxy, request->proxy->reply, "proxy-reply");
 	}
 #endif
 
-#ifdef WITH_COA
-	if (request->coa) {
-		(void) talloc_get_type_abort(request->coa, REQUEST);
-
-		rad_assert(request == talloc_parent(request->coa));
-
-		verify_request(file, line, request->coa);
-	}
-#endif
 }
 #endif
 
@@ -940,15 +922,15 @@ void verify_request(char const *file, int line, REQUEST *request)
  */
 void rad_mode_to_str(char out[10], mode_t mode)
 {
-    static char const *rwx[] = {"---", "--x", "-w-", "-wx", "r--", "r-x", "rw-", "rwx"};
+	static char const *rwx[] = {"---", "--x", "-w-", "-wx", "r--", "r-x", "rw-", "rwx"};
 
-    strcpy(&out[0], rwx[(mode >> 6) & 0x07]);
-    strcpy(&out[3], rwx[(mode >> 3) & 0x07]);
-    strcpy(&out[6], rwx[(mode & 7)]);
-    if (mode & S_ISUID) out[2] = (mode & 0100) ? 's' : 'S';
-    if (mode & S_ISGID) out[5] = (mode & 0010) ? 's' : 'l';
-    if (mode & S_ISVTX) out[8] = (mode & 0100) ? 't' : 'T';
-    out[9] = '\0';
+	strcpy(&out[0], rwx[(mode >> 6) & 0x07]);
+	strcpy(&out[3], rwx[(mode >> 3) & 0x07]);
+	strcpy(&out[6], rwx[(mode & 7)]);
+	if (mode & S_ISUID) out[2] = (mode & 0100) ? 's' : 'S';
+	if (mode & S_ISGID) out[5] = (mode & 0010) ? 's' : 'l';
+	if (mode & S_ISVTX) out[8] = (mode & 0100) ? 't' : 'T';
+	out[9] = '\0';
 }
 
 void rad_mode_to_oct(char out[5], mode_t mode)
@@ -1290,7 +1272,7 @@ void rad_file_error(int num)
 	if (rad_getpwuid(NULL, &user, geteuid()) < 0) goto finish;
 	if (rad_getgrgid(NULL, &group, getegid()) < 0) goto finish;
 
-	fr_strerror_printf("Effective user/group %s:%s: %s", user->pw_name, group->gr_name, error);
+	fr_strerror_printf("Effective user/group - %s:%s: %s", user->pw_name, group->gr_name, error);
 finish:
 	talloc_free(user);
 	talloc_free(group);

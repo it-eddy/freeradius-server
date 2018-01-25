@@ -25,6 +25,7 @@ RCSID("$Id$")
 
 #include <freeradius-devel/radiusd.h>
 #include <freeradius-devel/modules.h>
+#include <freeradius-devel/unlang.h>
 #include <freeradius-devel/map_proc.h>
 #include <freeradius-devel/state.h>
 #include <freeradius-devel/rad_assert.h>
@@ -42,79 +43,63 @@ char const *radacct_dir = NULL;
 char const *radlog_dir = NULL;
 bool log_stripped_names = false;
 
-static bool memory_report = false;
 static bool filedone = false;
 
-char const *radiusd_version = "FreeRADIUS Version " RADIUSD_VERSION_STRING
-#ifdef RADIUSD_VERSION_COMMIT
-" (git #" STRINGIFY(RADIUSD_VERSION_COMMIT) ")"
-#endif
-", for host " HOSTINFO ", built on " __DATE__ " at " __TIME__;
+char const *radiusd_version = RADIUSD_VERSION_STRING_BUILD("unittest");
 
 /*
  *	Static functions.
  */
 static void usage(int);
 
-int listen_compile(UNUSED CONF_SECTION *server, UNUSED CONF_SECTION *cs)
+
+static RADCLIENT *client_alloc(TALLOC_CTX *ctx, char const *ip, char const *name)
 {
-	return 0;
-}
-
-int listen_bootstrap(UNUSED CONF_SECTION *server, UNUSED CONF_SECTION *cs, UNUSED char const *server_name)
-{
-	return -1;
-}
-
-void listen_free(UNUSED rad_listen_t **head)
-{
-	/* do nothing */
-}
-
-
-static rad_listen_t *listen_alloc(void *ctx)
-{
-	rad_listen_t *this;
-
-	this = talloc_zero(ctx, rad_listen_t);
-	if (!this) return NULL;
-
-	this->type = RAD_LISTEN_AUTH;
-	this->recv = NULL;
-	this->send = NULL;
-	this->print = NULL;
-	this->encode = NULL;
-	this->decode = NULL;
-
-	/*
-	 *	We probably don't care about this.  We can always add
-	 *	fields later.
-	 */
-	this->data = talloc_zero(this, listen_socket_t);
-	if (!this->data) {
-		talloc_free(this);
-		return NULL;
-	}
-
-	return this;
-}
-
-static RADCLIENT *client_alloc(void *ctx)
-{
+	CONF_SECTION *cs;
+	CONF_PAIR *cp;
 	RADCLIENT *client;
 
-	client = talloc_zero(ctx, RADCLIENT);
-	if (!client) return NULL;
+	cs = cf_section_alloc(ctx, NULL, "client", name);
+	cp = cf_pair_alloc(cs, "ipaddr", ip, T_OP_EQ, T_BARE_WORD, T_BARE_WORD);
+	cf_pair_add(cs, cp);
+
+	cp = cf_pair_alloc(cs, "secret", "supersecret", T_OP_EQ, T_BARE_WORD, T_DOUBLE_QUOTED_STRING);
+	cf_pair_add(cs, cp);
+
+	cp = cf_pair_alloc(cs, "nas_type", "test", T_OP_EQ, T_BARE_WORD, T_DOUBLE_QUOTED_STRING);
+	cf_pair_add(cs, cp);
+
+	cp = cf_pair_alloc(cs, "shortname", "test", T_OP_EQ, T_BARE_WORD, T_DOUBLE_QUOTED_STRING);
+	cf_pair_add(cs, cp);
+
+	cp = cf_pair_alloc(cs, "groups", "foo", T_OP_EQ, T_BARE_WORD, T_DOUBLE_QUOTED_STRING);
+	cf_pair_add(cs, cp);
+
+	cp = cf_pair_alloc(cs, "groups", "bar", T_OP_EQ, T_BARE_WORD, T_DOUBLE_QUOTED_STRING);
+	cf_pair_add(cs, cp);
+
+	cp = cf_pair_alloc(cs, "groups", "baz", T_OP_EQ, T_BARE_WORD, T_DOUBLE_QUOTED_STRING);
+	cf_pair_add(cs, cp);
+
+	client = client_afrom_cs(ctx, cs, NULL);
+	if (!client) {
+		PERROR("Failed creating test client");
+		rad_assert(0);
+	}
+	talloc_steal(client, cs);
+	rad_assert(client);
 
 	return client;
 }
 
-static REQUEST *request_from_file(FILE *fp)
+static REQUEST *request_from_file(FILE *fp, fr_event_list_t *el, RADCLIENT *client)
 {
 	VALUE_PAIR	*vp;
 	REQUEST		*request;
-	vp_cursor_t	cursor;
+	fr_cursor_t	cursor;
 	struct timeval	now;
+
+	static int	number = 0;
 
 	/*
 	 *	Create and initialize the new request.
@@ -137,15 +122,13 @@ static REQUEST *request_from_file(FILE *fp)
 		return NULL;
 	}
 
-	request->listener = listen_alloc(request);
-	request->client = client_alloc(request);
+	request->client = client;
 
-	request->number = 0;
+	request->number = number++;
+	request->name = talloc_typed_asprintf(request, "%" PRIu64, request->number);
 
 	request->master_state = REQUEST_ACTIVE;
-	request->child_state = REQUEST_RUNNING;
-	request->handle = NULL;
-	request->server = talloc_typed_strdup(request, "default");
+	request->server_cs = virtual_server_find("default");
 
 	request->root = &main_config;
 
@@ -161,14 +144,16 @@ static REQUEST *request_from_file(FILE *fp)
 	/*
 	 *	Set the defaults for IPs, etc.
 	 */
-	request->packet->code = PW_CODE_ACCESS_REQUEST;
+	request->packet->code = FR_CODE_ACCESS_REQUEST;
 
 	request->packet->src_ipaddr.af = AF_INET;
-	request->packet->src_ipaddr.ipaddr.ip4addr.s_addr = htonl(INADDR_LOOPBACK);
+	request->packet->src_ipaddr.prefix = 32;
+	request->packet->src_ipaddr.addr.v4.s_addr = htonl(INADDR_LOOPBACK);
 	request->packet->src_port = 18120;
 
 	request->packet->dst_ipaddr.af = AF_INET;
-	request->packet->dst_ipaddr.ipaddr.ip4addr.s_addr = htonl(INADDR_LOOPBACK);
+	request->packet->dst_ipaddr.prefix = 32;
+	request->packet->dst_ipaddr.addr.v4.s_addr = htonl(INADDR_LOOPBACK);
 	request->packet->dst_port = 1812;
 
 	/*
@@ -199,43 +184,29 @@ static REQUEST *request_from_file(FILE *fp)
 			 *	Allow it to set the packet type in
 			 *	the attributes read from the file.
 			 */
-		case PW_PACKET_TYPE:
-			request->packet->code = vp->vp_integer;
+		case FR_PACKET_TYPE:
+			request->packet->code = vp->vp_uint32;
 			break;
 
-		case PW_PACKET_DST_PORT:
-			request->packet->dst_port = (vp->vp_integer & 0xffff);
+		case FR_PACKET_DST_PORT:
+			request->packet->dst_port = vp->vp_uint16;
 			break;
 
-		case PW_PACKET_DST_IP_ADDRESS:
-			request->packet->dst_ipaddr.af = AF_INET;
-			request->packet->dst_ipaddr.ipaddr.ip4addr.s_addr = vp->vp_ipaddr;
-			request->packet->dst_ipaddr.prefix = 32;
+		case FR_PACKET_DST_IP_ADDRESS:
+		case FR_PACKET_DST_IPV6_ADDRESS:
+			memcpy(&request->packet->dst_ipaddr, &vp->vp_ip, sizeof(request->packet->dst_ipaddr));
 			break;
 
-		case PW_PACKET_DST_IPV6_ADDRESS:
-			request->packet->dst_ipaddr.af = AF_INET6;
-			request->packet->dst_ipaddr.ipaddr.ip6addr = vp->vp_ipv6addr;
-			request->packet->dst_ipaddr.prefix = 128;
+		case FR_PACKET_SRC_PORT:
+			request->packet->src_port = vp->vp_uint16;
 			break;
 
-		case PW_PACKET_SRC_PORT:
-			request->packet->src_port = (vp->vp_integer & 0xffff);
+		case FR_PACKET_SRC_IP_ADDRESS:
+		case FR_PACKET_SRC_IPV6_ADDRESS:
+			memcpy(&request->packet->src_ipaddr, &vp->vp_ip, sizeof(request->packet->src_ipaddr));
 			break;
 
-		case PW_PACKET_SRC_IP_ADDRESS:
-			request->packet->src_ipaddr.af = AF_INET;
-			request->packet->src_ipaddr.ipaddr.ip4addr.s_addr = vp->vp_ipaddr;
-			request->packet->src_ipaddr.prefix = 32;
-			break;
-
-		case PW_PACKET_SRC_IPV6_ADDRESS:
-			request->packet->src_ipaddr.af = AF_INET6;
-			request->packet->src_ipaddr.ipaddr.ip6addr = vp->vp_ipv6addr;
-			request->packet->src_ipaddr.prefix = 128;
-			break;
-
-		case PW_CHAP_PASSWORD: {
+		case FR_CHAP_PASSWORD: {
 			int i, already_hex = 0;
 
 			/*
@@ -275,16 +246,16 @@ static REQUEST *request_from_file(FILE *fp)
 		}
 			break;
 
-		case PW_DIGEST_REALM:
-		case PW_DIGEST_NONCE:
-		case PW_DIGEST_METHOD:
-		case PW_DIGEST_URI:
-		case PW_DIGEST_QOP:
-		case PW_DIGEST_ALGORITHM:
-		case PW_DIGEST_BODY_DIGEST:
-		case PW_DIGEST_CNONCE:
-		case PW_DIGEST_NONCE_COUNT:
-		case PW_DIGEST_USER_NAME:
+		case FR_DIGEST_REALM:
+		case FR_DIGEST_NONCE:
+		case FR_DIGEST_METHOD:
+		case FR_DIGEST_URI:
+		case FR_DIGEST_QOP:
+		case FR_DIGEST_ALGORITHM:
+		case FR_DIGEST_BODY_DIGEST:
+		case FR_DIGEST_CNONCE:
+		case FR_DIGEST_NONCE_COUNT:
+		case FR_DIGEST_USER_NAME:
 			/* overlapping! */
 		{
 			fr_dict_attr_t const *da;
@@ -293,11 +264,11 @@ static REQUEST *request_from_file(FILE *fp)
 			p = talloc_array(vp, uint8_t, vp->vp_length + 2);
 
 			memcpy(p + 2, vp->vp_octets, vp->vp_length);
-			p[0] = vp->da->attr - PW_DIGEST_REALM + 1;
+			p[0] = vp->da->attr - FR_DIGEST_REALM + 1;
 			vp->vp_length += 2;
 			p[1] = vp->vp_length;
 
-			da = fr_dict_attr_by_num(NULL, 0, PW_DIGEST_ATTRIBUTES);
+			da = fr_dict_attr_by_num(NULL, 0, FR_DIGEST_ATTRIBUTES);
 			rad_assert(da != NULL);
 			vp->da = da;
 
@@ -314,9 +285,11 @@ static REQUEST *request_from_file(FILE *fp)
 			talloc_free(q);
 
 			vp->vp_octets = talloc_steal(vp, p);
+			vp->data.type = FR_TYPE_OCTETS;
+			vp->data.enumv = NULL;
 			vp->type = VT_DATA;
 
-			VERIFY_VP(vp);
+			VP_VERIFY(vp);
 		}
 
 		break;
@@ -346,14 +319,16 @@ static REQUEST *request_from_file(FILE *fp)
 	/*
 	 *	FIXME: set IPs, etc.
 	 */
-	request->packet->code = PW_CODE_ACCESS_REQUEST;
+	request->packet->code = FR_CODE_ACCESS_REQUEST;
 
 	request->packet->src_ipaddr.af = AF_INET;
-	request->packet->src_ipaddr.ipaddr.ip4addr.s_addr = htonl(INADDR_LOOPBACK);
+	request->packet->src_ipaddr.prefix = 32;
+	request->packet->src_ipaddr.addr.v4.s_addr = htonl(INADDR_LOOPBACK);
 	request->packet->src_port = 18120;
 
 	request->packet->dst_ipaddr.af = AF_INET;
-	request->packet->dst_ipaddr.ipaddr.ip4addr.s_addr = htonl(INADDR_LOOPBACK);
+	request->packet->dst_ipaddr.prefix = 32;
+	request->packet->dst_ipaddr.addr.v4.s_addr = htonl(INADDR_LOOPBACK);
 	request->packet->dst_port = 1812;
 
 	/*
@@ -375,11 +350,16 @@ static REQUEST *request_from_file(FILE *fp)
 	/*
 	 *	Debugging
 	 */
-	request->log.lvl = rad_debug_lvl;
-	request->log.func = vradlog_request;
+	request->log.dst = talloc_zero(request, log_dst_t);
+	request->log.dst->func = vradlog_request;
+	request->log.dst->uctx = &default_log;
 
-	request->username = fr_pair_find_by_num(request->packet->vps, 0, PW_USER_NAME, TAG_ANY);
-	request->password = fr_pair_find_by_num(request->packet->vps, 0, PW_USER_PASSWORD, TAG_ANY);
+	request->log.lvl = rad_debug_lvl;
+
+	request->username = fr_pair_find_by_num(request->packet->vps, 0, FR_USER_NAME, TAG_ANY);
+	request->password = fr_pair_find_by_num(request->packet->vps, 0, FR_USER_PASSWORD, TAG_ANY);
+
+	fr_request_async_bootstrap(request, el);
 
 	return request;
 }
@@ -388,7 +368,7 @@ static REQUEST *request_from_file(FILE *fp)
 static void print_packet(FILE *fp, RADIUS_PACKET *packet)
 {
 	VALUE_PAIR *vp;
-	vp_cursor_t cursor;
+	fr_cursor_t cursor;
 
 	if (!packet) {
 		fprintf(fp, "\n");
@@ -421,19 +401,19 @@ static void print_packet(FILE *fp, RADIUS_PACKET *packet)
 /*
  *	%{poke:sql.foo=bar}
  */
-static ssize_t xlat_poke(char **out, size_t outlen,
-			 UNUSED void const *mod_inst, UNUSED void const *xlat_inst,
+static ssize_t xlat_poke(TALLOC_CTX *ctx, char **out, size_t outlen,
+			 UNUSED void const *inst, UNUSED void const *xlat_inst,
 			 REQUEST *request, char const *fmt)
 {
-	int i;
-	void *data, *base;
-	char *p, *q;
-	module_instance_t *instance;
-	char *buffer;
-	CONF_SECTION *modules;
-	CONF_PAIR *cp;
-	CONF_PARSER const *variables;
-	size_t len;
+	int			i;
+	void			*data, *base;
+	char			*p, *q;
+	module_instance_t	*mod_inst;
+	char			*buffer;
+	CONF_SECTION		*modules;
+	CONF_PAIR		*cp;
+	CONF_PARSER const	*variables;
+	size_t			len;
 
 	rad_assert(outlen > 1);
 	rad_assert(request != NULL);
@@ -441,7 +421,7 @@ static ssize_t xlat_poke(char **out, size_t outlen,
 	rad_assert(out != NULL);
 	rad_assert(*out);
 
-	modules = cf_section_sub_find(request->root->config, "modules");
+	modules = cf_section_find(request->root->config, "modules", NULL);
 	if (!modules) return 0;
 
 	buffer = talloc_strdup(request, fmt);
@@ -452,8 +432,8 @@ static ssize_t xlat_poke(char **out, size_t outlen,
 
 	*(p++) = '\0';
 
-	instance = module_find(modules, buffer);
-	if (!instance) {
+	mod_inst = module_find(modules, buffer);
+	if (!mod_inst) {
 		RDEBUG("Failed finding module '%s'", buffer);
 	fail:
 		talloc_free(buffer);
@@ -473,7 +453,7 @@ static ssize_t xlat_poke(char **out, size_t outlen,
 		goto fail;
 	}
 
-	cp = cf_pair_find(instance->cs, p);
+	cp = cf_pair_find(mod_inst->dl_inst->conf, p);
 	if (!cp) {
 		RDEBUG("No such item '%s'", p);
 		goto fail;
@@ -485,21 +465,22 @@ static ssize_t xlat_poke(char **out, size_t outlen,
 	 */
 	len = strlcpy(*out, cf_pair_value(cp), outlen);
 
-	if (cf_pair_replace(instance->cs, cp, q) < 0) {
+	if (cf_pair_replace(mod_inst->dl_inst->conf, cp, q) < 0) {
 		RDEBUG("Failed replacing pair");
 		goto fail;
 	}
 
-	base = instance->data;
-	variables = instance->module->config;
+	base = mod_inst->dl_inst->data;
+	variables = mod_inst->dl_inst->module->common->config;
 
 	/*
 	 *	Handle the known configuration parameters.
 	 */
 	for (i = 0; variables[i].name != NULL; i++) {
-		int ret;
+		int		ret;
+		char const	*quote;
 
-		if (PW_BASE_TYPE(variables[i].type) == PW_TYPE_SUBSECTION) continue;
+		if (FR_BASE_TYPE(variables[i].type) == FR_TYPE_SUBSECTION) continue;
 		/* else it's a CONF_PAIR */
 
 		/*
@@ -519,12 +500,17 @@ static ssize_t xlat_poke(char **out, size_t outlen,
 		/*
 		 *	Parse the pair we found, or a default value.
 		 */
-		ret = cf_pair_parse(instance->cs, variables[i].name, variables[i].type,
+		ret = cf_pair_parse(ctx, mod_inst->dl_inst->conf, variables[i].name, variables[i].type,
 				    data, variables[i].dflt, variables[i].quote);
 		if (ret < 0) {
 			DEBUG2("Failed inserting new value into module instance data");
 			goto fail;
 		}
+
+		quote = fr_int2str(fr_token_quotes_table, variables[i].quote, "<INVALID>");
+
+		DEBUG2("Setting config item to %s = %s%s%s", variables[i].name, quote, q, quote);
+
 		break;		/* we found it, don't do any more */
 	}
 
@@ -553,9 +539,11 @@ static bool do_xlats(char const *filename, FILE *fp)
 	request = request_alloc(NULL);
 	gettimeofday(&now, NULL);
 
-	request->log.lvl = rad_debug_lvl;
-	request->log.func = vradlog_request;
+	request->log.dst = talloc_zero(request, log_dst_t);
+	request->log.dst->func = vradlog_request;
+	request->log.dst->uctx = &default_log;
 
+	request->log.lvl = rad_debug_lvl;
 	output[0] = '\0';
 
 	while (fgets(input, sizeof(input), fp) != NULL) {
@@ -604,7 +592,7 @@ static bool do_xlats(char const *filename, FILE *fp)
 				continue;
 			}
 
-			len = radius_xlat_struct(output, sizeof(output), request, head, NULL, NULL);
+			len = xlat_eval_compiled(output, sizeof(output), request, head, NULL, NULL);
 			if (len < 0) {
 				snprintf(output, sizeof(output), "ERROR expanding xlat: %s", fr_strerror());
 				continue;
@@ -636,9 +624,23 @@ static bool do_xlats(char const *filename, FILE *fp)
 	return true;
 }
 
+/*
+ *	Verify the result of the map.
+ */
+static int map_proc_verify(CONF_SECTION *cs, UNUSED void *mod_inst, UNUSED void *proc_inst,
+			   vp_tmpl_t const *src, UNUSED vp_map_t const *maps)
+{
+	if (!src) {
+		cf_log_err(cs, "Missing source");
+
+		return -1;
+	}
+
+	return 0;
+}
 
 static rlm_rcode_t mod_map_proc(UNUSED void *mod_inst, UNUSED void *proc_inst, UNUSED REQUEST *request,
-			      	UNUSED char const *src, UNUSED vp_map_t const *maps)
+			      	UNUSED vp_tmpl_t const *src, UNUSED vp_map_t const *maps)
 {
 	return RLM_MODULE_FAIL;
 }
@@ -659,7 +661,10 @@ int main(int argc, char *argv[])
 	VALUE_PAIR		*filter_vps = NULL;
 	bool			xlat_only = false;
 	fr_state_tree_t		*state = NULL;
-
+	fr_event_list_t		*el = NULL;
+	RADCLIENT		*client = NULL;
+	CONF_SECTION		*unlang;
+	char			*auth_type;
 	fr_talloc_fault_setup();
 
 	/*
@@ -675,6 +680,7 @@ int main(int argc, char *argv[])
 
 	rad_debug_lvl = 0;
 	set_radius_dir(NULL, RADIUS_DIR);
+	fr_time_start();
 
 	/*
 	 *	Ensure that the configuration is initialized.
@@ -719,7 +725,7 @@ int main(int argc, char *argv[])
 				break;
 
 			case 'M':
-				memory_report = true;
+				talloc_enable_leak_report();
 				break;
 
 			case 'n':
@@ -756,7 +762,7 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	if (rad_debug_lvl) version_print();
+	if (rad_debug_lvl) dependency_version_print();
 	fr_debug_lvl = rad_debug_lvl;
 
 	/*
@@ -777,16 +783,15 @@ int main(int argc, char *argv[])
 	}
 #endif
 
-	if (xlat_register(NULL, "poke", xlat_poke, NULL, NULL, 0, XLAT_DEFAULT_BUF_LEN) < 0) {
+	if (xlat_register(NULL, "poke", xlat_poke, NULL, NULL, 0, XLAT_DEFAULT_BUF_LEN, true) < 0) {
 		rcode = EXIT_FAILURE;
 		goto finish;
 	}
 
-	if (map_proc_register(NULL, "test-fail", mod_map_proc, NULL,  NULL, 0) < 0) {
+	if (map_proc_register(NULL, "test-fail", mod_map_proc, map_proc_verify, 0) < 0) {
 		rcode = EXIT_FAILURE;
 		goto finish;
 	}
-
 
 	/*  Read the configuration files, BEFORE doing anything else.  */
 	if (main_config_init() < 0) {
@@ -796,9 +801,34 @@ int main(int argc, char *argv[])
 	}
 
 	/*
+	 *	Create a dummy client on 127.0.0.1
+	 */
+	{
+		fr_ipaddr_t	ip;
+		char const	*ip_str = "127.0.0.1";
+
+		if (fr_inet_pton(&ip, ip_str, strlen(ip_str), AF_UNSPEC, false, true) < 0) {
+			rcode = EXIT_FAILURE;
+			goto finish;
+		}
+
+		client = client_find(NULL, &ip, IPPROTO_IP);
+		if (!client) {
+			client = client_alloc(NULL, ip_str, "test");
+			client_add(NULL, client);
+		}
+	}
+
+	/*
 	 *	Setup dummy virtual server
 	 */
-	cf_section_add(main_config.config, cf_section_alloc(main_config.config, "server", "unit_test"));
+	cf_section_add(main_config.config, cf_section_alloc(main_config.config,
+							    main_config.config, "server", "unit_test"));
+
+	/*
+	 *	Initialise the interpreter, registering operations.
+	 */
+	if (unlang_initialize() < 0) exit(EXIT_FAILURE);
 
 	/*
 	 *	Initialize Auth-Type, etc. in the virtual servers
@@ -813,17 +843,34 @@ int main(int argc, char *argv[])
 	 *
 	 *	After this step, all dynamic attributes, xlats, etc. are defined.
 	 */
-	if (modules_bootstrap(main_config.config) < 0) exit(EXIT_FAILURE);
+	if (modules_bootstrap(main_config.config) < 0) goto exit_failure;
 
 	/*
-	 *	Load the modules
+	 *	Instantiate the modules
 	 */
-	if (modules_init(main_config.config) < 0) goto exit_failure;
+	if (modules_instantiate(main_config.config) < 0) goto exit_failure;
+
+	/*
+	 *	Call xlat instantiation functions.
+	 */
+	if (xlat_instantiate() < 0) exit(EXIT_FAILURE);
+
+	/*
+	 *	Create a dummy event list
+	 */
+	el = fr_event_list_alloc(NULL, NULL, NULL);
+	rad_assert(el != NULL);
+
+	/*
+	 *	Perform any thread specific instantiation
+	 */
+	if (modules_thread_instantiate(main_config.config, el) < 0) goto exit_failure;
+	if (xlat_thread_instantiate() < 0) goto exit_failure;
 
 	/*
 	 *	And then load the virtual servers.
 	 */
-	if (virtual_servers_init(main_config.config) < 0) goto exit_failure;
+	if (virtual_servers_instantiate() < 0) goto exit_failure;
 
 	state = fr_state_tree_init(NULL, main_config.max_requests * 2, 10);
 
@@ -868,12 +915,13 @@ int main(int argc, char *argv[])
 	/*
 	 *	Grab the VPs from stdin, or from the file.
 	 */
-	request = request_from_file(fp);
+	request = request_from_file(fp, el, client);
 	if (!request) {
 		fprintf(stderr, "Failed reading input: %s\n", fr_strerror());
 		rcode = EXIT_FAILURE;
 		goto finish;
 	}
+	request->el = el;
 
 	/*
 	 *	No filter file, OR there's no more input, OR we're
@@ -917,8 +965,69 @@ int main(int argc, char *argv[])
 		fclose(fp);
 	}
 
-	rad_virtual_server(request);
+	/*
+	 *	Simulate an authorize section
+	 */
+	unlang = cf_section_find(request->server_cs, "recv", "Access-Request");
+	if (!unlang) {
+		REDEBUG("Failed to find 'recv Access-Request' section");
+		request->reply->code = FR_CODE_ACCESS_REJECT;
+		goto done;
+	}
 
+	switch (unlang_interpret_synchronous(request, unlang, RLM_MODULE_NOOP)) {
+	case RLM_MODULE_OK:
+	case RLM_MODULE_UPDATED:
+	case RLM_MODULE_NOOP:
+		request->reply->code = FR_CODE_ACCESS_ACCEPT;
+		break;
+
+	default:
+		request->reply->code = FR_CODE_ACCESS_REJECT;
+		goto done;
+	}
+
+	/*
+	 *	Simulate an authenticate section
+	 */
+	vp = fr_pair_find_by_num(request->control, 0, FR_AUTH_TYPE, TAG_ANY);
+	if (!vp) goto done;
+
+	switch (vp->vp_int32) {
+	case FR_AUTH_TYPE_ACCEPT:
+		request->reply->code = FR_CODE_ACCESS_ACCEPT;
+		goto done;
+
+	case FR_AUTH_TYPE_REJECT:
+		request->reply->code = FR_CODE_ACCESS_REJECT;
+		goto done;
+
+	default:
+		break;
+	}
+
+	auth_type = fr_pair_value_asprint(vp, vp, '\0');
+	unlang = cf_section_find(request->server_cs, "authenticate", auth_type);
+	talloc_free(auth_type);
+	if (!unlang) {
+		REDEBUG("Failed to find 'recv %s' section", auth_type);
+		request->reply->code = FR_CODE_ACCESS_REJECT;
+		goto done;
+	}
+
+	switch (unlang_interpret_synchronous(request, unlang, RLM_MODULE_NOOP)) {
+	case RLM_MODULE_OK:
+	case RLM_MODULE_UPDATED:
+	case RLM_MODULE_NOOP:
+		request->reply->code = FR_CODE_ACCESS_ACCEPT;
+		break;
+
+	default:
+		request->reply->code = FR_CODE_ACCESS_REJECT;
+		goto done;
+	}
+
+done:
 	if (!output_file || (strcmp(output_file, "-") == 0)) {
 		fp = stdout;
 	} else {
@@ -937,8 +1046,8 @@ int main(int argc, char *argv[])
 	/*
 	 *	Update the list with the response type.
 	 */
-	vp = radius_pair_create(request->reply, &request->reply->vps, PW_RESPONSE_PACKET_TYPE, 0);
-	vp->vp_integer = request->reply->code;
+	vp = radius_pair_create(request->reply, &request->reply->vps, FR_RESPONSE_PACKET_TYPE, 0);
+	vp->vp_uint32 = request->reply->code;
 
 	{
 		VALUE_PAIR const *failed[2];
@@ -958,7 +1067,20 @@ finish:
 	talloc_free(request);
 	talloc_free(state);
 
-	xlat_unregister(NULL, "poke", xlat_poke);
+	/*
+	 *	Free the event list.
+	 */
+	talloc_free(el);
+
+	/*
+	 *	Free xlat instance data, and call any detach methods
+	 */
+	xlat_instances_free();
+
+	/*
+	 *	Unregister poke *after* freeing instances that depend on it
+	 */
+	xlat_unregister("poke");
 
 	/*
 	 *	Detach modules, connection pools, registered xlats / paircompares / maps.
@@ -981,10 +1103,10 @@ finish:
 	 */
 	main_config_free();
 
-	if (memory_report) {
-		INFO("Allocated memory at time of report:");
-		fr_log_talloc_report(NULL);
-	}
+	/*
+	 *	Free the strerror buffer.
+	 */
+	fr_strerror_free();
 
 	return rcode;
 }

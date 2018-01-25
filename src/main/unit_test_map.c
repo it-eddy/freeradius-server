@@ -44,17 +44,18 @@ char const *get_radius_dir(void)
 	return NULL;
 }
 
-module_instance_t *module_instantiate(UNUSED CONF_SECTION *modules, UNUSED char const *askedname)
-{
-	return NULL;
-}
-
-module_instance_t *module_instantiate_method(UNUSED CONF_SECTION *modules, UNUSED char const *name, UNUSED rlm_components_t *method)
+module_instance_t *module_find_with_method(UNUSED rlm_components_t *method,
+					   UNUSED CONF_SECTION *modules, UNUSED char const *name)
 {
 	return NULL;
 }
 
 main_config_t		main_config;				//!< Main server configuration.
+
+module_thread_instance_t *module_thread_instance_find(UNUSED module_instance_t *mi)
+{
+	return NULL;
+}
 
 /* Linker hacks */
 
@@ -67,30 +68,30 @@ static void NEVER_RETURNS usage(void)
 	fprintf(stderr, "  -x                     Debugging mode.\n");
 	fprintf(stderr, "  -M                     Show program version information.\n");
 
-	exit(1);
+	exit(EXIT_FAILURE);
 }
 
 static int process_file(char const *filename)
 {
-	int rcode;
-	char const *name1, *name2;
-	CONF_SECTION *cs;
-	vp_map_t *head, *map;
-	char buffer[8192];
+	int		rcode;
+	char const	*name1, *name2;
+	CONF_SECTION	*cs;
+	vp_map_t	*head, *map;
+	char		buffer[8192];
 
 	memset(&main_config, 0, sizeof(main_config));
 
-	main_config.config = cf_section_alloc(NULL, "main", NULL);
+	main_config.config = cf_section_alloc(NULL, NULL, "main", NULL);
 	if (cf_file_read(main_config.config, filename) < 0) {
 		fprintf(stderr, "unit_test_map: Failed parsing %s\n",
 			filename);
-		exit(1);
+		exit(EXIT_FAILURE);
 	}
 
 	/*
 	 *	Always has to be an "update" section.
 	 */
-	cs = cf_section_sub_find(main_config.config, "update");
+	cs = cf_section_find(main_config.config, "update", CF_IDENT_ANY);
 	if (!cs) {
 		talloc_free(main_config.config);
 		return -1;
@@ -100,9 +101,12 @@ static int process_file(char const *filename)
 	 *	Convert the update section to a list of maps.
 	 */
 	rcode = map_afrom_cs(&head, cs, PAIR_LIST_REQUEST, PAIR_LIST_REQUEST, unlang_fixup_update, NULL, 128);
-	if (rcode < 0) return -1; /* message already printed */
+	if (rcode < 0) {
+		cf_log_err(cs, "map_afrom_cs failed: %s", fr_strerror());
+		return -1; /* message already printed */
+	}
 	if (!head) {
-		cf_log_err_cs(cs, "'update' sections cannot be empty");
+		cf_log_err(cs, "'update' sections cannot be empty");
 		return -1;
 	}
 
@@ -133,7 +137,6 @@ static int process_file(char const *filename)
 int main(int argc, char *argv[])
 {
 	int			c, rcode = 0;
-	bool			report = false;
 	char const		*radius_dir = RADDBDIR;
 	char const		*dict_dir = DICTDIR;
 	fr_dict_t		*dict = NULL;
@@ -151,16 +154,20 @@ int main(int argc, char *argv[])
 		case 'd':
 			radius_dir = optarg;
 			break;
+
 		case 'D':
 			dict_dir = optarg;
 			break;
+
 		case 'x':
 			fr_debug_lvl++;
 			rad_debug_lvl = fr_debug_lvl;
 			break;
+
 		case 'M':
-			report = true;
+			talloc_enable_leak_report();
 			break;
+
 		case 'h':
 		default:
 			usage();
@@ -173,17 +180,17 @@ int main(int argc, char *argv[])
 	 */
 	if (fr_check_lib_magic(RADIUSD_MAGIC_NUMBER) < 0) {
 		fr_perror("unit_test_attribute");
-		exit(1);
+		exit(EXIT_FAILURE);
 	}
 
-	if (fr_dict_from_file(NULL, &dict, dict_dir, FR_DICTIONARY_FILE, "radius") < 0) {
+	if (fr_dict_from_file(autofree, &dict, dict_dir, FR_DICTIONARY_FILE, "radius") < 0) {
 		fr_perror("unit_test_attribute");
-		exit(1);
+		exit(EXIT_FAILURE);
 	}
 
 	if (fr_dict_read(dict, radius_dir, FR_DICTIONARY_FILE) == -1) {
-		fr_perror("unit_test_attribute");
-		exit(1);
+		fr_log_perror(&default_log, L_ERR, "Failed to initialize the dictionaries");
+		exit(EXIT_FAILURE);
 	}
 
 	if (argc < 2) {
@@ -193,13 +200,14 @@ int main(int argc, char *argv[])
 		rcode = process_file(argv[1]);
 	}
 
-	if (report) {
-		talloc_free(dict);
-		fr_log_talloc_report(NULL);
-	}
-
 	if (rcode < 0) rcode = 1; /* internal to Unix process return code */
 
+	/*
+	 *	Try really hard to free any allocated
+	 *	memory, so we get clean talloc reports.
+	 */
+	xlat_free();
+	fr_strerror_free();
 	talloc_free(autofree);
 
 	return rcode;

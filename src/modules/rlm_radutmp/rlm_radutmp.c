@@ -37,8 +37,7 @@ RCSID("$Id$")
 static char const porttypes[] = "ASITX";
 
 /*
- *	used for caching radutmp lookups in the accounting component. The
- *	session (checksimul) component doesn't use it, but probably should.
+ *	used for caching radutmp lookups in the accounting component.
  */
 typedef struct nas_port {
 	uint32_t		nasaddr;
@@ -58,12 +57,12 @@ typedef struct rlm_radutmp_t {
 } rlm_radutmp_t;
 
 static const CONF_PARSER module_config[] = {
-	{ FR_CONF_OFFSET("filename", PW_TYPE_FILE_OUTPUT | PW_TYPE_REQUIRED, rlm_radutmp_t, filename), .dflt = RADUTMP },
-	{ FR_CONF_OFFSET("username", PW_TYPE_STRING | PW_TYPE_REQUIRED | PW_TYPE_XLAT, rlm_radutmp_t, username), .dflt = "%{User-Name}" },
-	{ FR_CONF_OFFSET("case_sensitive", PW_TYPE_BOOLEAN, rlm_radutmp_t, case_sensitive), .dflt = "yes" },
-	{ FR_CONF_OFFSET("check_with_nas", PW_TYPE_BOOLEAN, rlm_radutmp_t, check_nas), .dflt = "yes" },
-	{ FR_CONF_OFFSET("permissions", PW_TYPE_INTEGER, rlm_radutmp_t, permission), .dflt = "0644" },
-	{ FR_CONF_OFFSET("caller_id", PW_TYPE_BOOLEAN, rlm_radutmp_t, caller_id_ok), .dflt = "no" },
+	{ FR_CONF_OFFSET("filename", FR_TYPE_FILE_OUTPUT | FR_TYPE_REQUIRED, rlm_radutmp_t, filename), .dflt = RADUTMP },
+	{ FR_CONF_OFFSET("username", FR_TYPE_STRING | FR_TYPE_REQUIRED | FR_TYPE_XLAT, rlm_radutmp_t, username), .dflt = "%{User-Name}" },
+	{ FR_CONF_OFFSET("case_sensitive", FR_TYPE_BOOL, rlm_radutmp_t, case_sensitive), .dflt = "yes" },
+	{ FR_CONF_OFFSET("check_with_nas", FR_TYPE_BOOL, rlm_radutmp_t, check_nas), .dflt = "yes" },
+	{ FR_CONF_OFFSET("permissions", FR_TYPE_UINT32, rlm_radutmp_t, permission), .dflt = "0644" },
+	{ FR_CONF_OFFSET("caller_id", FR_TYPE_BOOL, rlm_radutmp_t, caller_id_ok), .dflt = "no" },
 	CONF_PARSER_TERMINATOR
 };
 
@@ -143,11 +142,11 @@ static NAS_PORT *nas_port_find(NAS_PORT *nas_port_list, uint32_t nasaddr, uint16
 /*
  *	Store logins in the RADIUS utmp file.
  */
-static rlm_rcode_t CC_HINT(nonnull) mod_accounting(void *instance, REQUEST *request)
+static rlm_rcode_t CC_HINT(nonnull) mod_accounting(void *instance, UNUSED void *thread, REQUEST *request)
 {
 	rlm_rcode_t	rcode = RLM_MODULE_OK;
 	struct radutmp	ut, u;
-	vp_cursor_t	cursor;
+	fr_cursor_t	cursor;
 	VALUE_PAIR	*vp;
 	int		status = -1;
 	int		protocol = -1;
@@ -172,17 +171,17 @@ static rlm_rcode_t CC_HINT(nonnull) mod_accounting(void *instance, REQUEST *requ
 	/*
 	 *	Which type is this.
 	 */
-	if ((vp = fr_pair_find_by_num(request->packet->vps, 0, PW_ACCT_STATUS_TYPE, TAG_ANY)) == NULL) {
+	if ((vp = fr_pair_find_by_num(request->packet->vps, 0, FR_ACCT_STATUS_TYPE, TAG_ANY)) == NULL) {
 		RDEBUG2("No Accounting-Status-Type record");
 		return RLM_MODULE_NOOP;
 	}
-	status = vp->vp_integer;
+	status = vp->vp_uint32;
 
 	/*
 	 *	Look for weird reboot packets.
 	 *
 	 *	ComOS (up to and including 3.5.1b20) does not send
-	 *	standard PW_STATUS_ACCOUNTING_XXX messages.
+	 *	standard FR_STATUS_ACCOUNTING_XXX messages.
 	 *
 	 *	Check for:  o no Acct-Session-Time, or time of 0
 	 *		    o Acct-Session-Id of "00000000".
@@ -190,15 +189,15 @@ static rlm_rcode_t CC_HINT(nonnull) mod_accounting(void *instance, REQUEST *requ
 	 *	We could also check for NAS-Port, that attribute
 	 *	should NOT be present (but we don't right now).
 	 */
-	if ((status != PW_STATUS_ACCOUNTING_ON) &&
-	    (status != PW_STATUS_ACCOUNTING_OFF)) do {
+	if ((status != FR_STATUS_ACCOUNTING_ON) &&
+	    (status != FR_STATUS_ACCOUNTING_OFF)) do {
 		int check1 = 0;
 		int check2 = 0;
 
-		if ((vp = fr_pair_find_by_num(request->packet->vps, 0, PW_ACCT_SESSION_TIME, TAG_ANY))
+		if ((vp = fr_pair_find_by_num(request->packet->vps, 0, FR_ACCT_SESSION_TIME, TAG_ANY))
 		     == NULL || vp->vp_date == 0)
 			check1 = 1;
-		if ((vp = fr_pair_find_by_num(request->packet->vps, 0, PW_ACCT_SESSION_ID, TAG_ANY))
+		if ((vp = fr_pair_find_by_num(request->packet->vps, 0, FR_ACCT_SESSION_ID, TAG_ANY))
 		     != NULL && vp->vp_length == 8 &&
 		     memcmp(vp->vp_strvalue, "00000000", 8) == 0)
 			check2 = 1;
@@ -206,8 +205,8 @@ static rlm_rcode_t CC_HINT(nonnull) mod_accounting(void *instance, REQUEST *requ
 			break;
 		}
 		RIDEBUG("Converting reboot records");
-		if (status == PW_STATUS_STOP) status = PW_STATUS_ACCOUNTING_OFF;
-		else if (status == PW_STATUS_START) status = PW_STATUS_ACCOUNTING_ON;
+		if (status == FR_STATUS_STOP) status = FR_STATUS_ACCOUNTING_OFF;
+		else if (status == FR_STATUS_START) status = FR_STATUS_ACCOUNTING_ON;
 	} while(0);
 
 	time(&t);
@@ -222,29 +221,29 @@ static rlm_rcode_t CC_HINT(nonnull) mod_accounting(void *instance, REQUEST *requ
 	     vp;
 	     vp = fr_cursor_next(&cursor)) {
 		if (!vp->da->vendor) switch (vp->da->attr) {
-		case PW_LOGIN_IP_HOST:
-		case PW_FRAMED_IP_ADDRESS:
-			ut.framed_address = vp->vp_ipaddr;
+		case FR_LOGIN_IP_HOST:
+		case FR_FRAMED_IP_ADDRESS:
+			ut.framed_address = vp->vp_ipv4addr;
 			break;
 
-		case PW_FRAMED_PROTOCOL:
-			protocol = vp->vp_integer;
+		case FR_FRAMED_PROTOCOL:
+			protocol = vp->vp_uint32;
 			break;
 
-		case PW_NAS_IP_ADDRESS:
-			ut.nas_address = vp->vp_ipaddr;
+		case FR_NAS_IP_ADDRESS:
+			ut.nas_address = vp->vp_ipv4addr;
 			break;
 
-		case PW_NAS_PORT:
-			ut.nas_port = vp->vp_integer;
+		case FR_NAS_PORT:
+			ut.nas_port = vp->vp_uint32;
 			port_seen = true;
 			break;
 
-		case PW_ACCT_DELAY_TIME:
-			ut.delay = vp->vp_integer;
+		case FR_ACCT_DELAY_TIME:
+			ut.delay = vp->vp_uint32;
 			break;
 
-		case PW_ACCT_SESSION_ID:
+		case FR_ACCT_SESSION_ID:
 			/*
 			 *	If length > 8, only store the
 			 *	last 8 bytes.
@@ -263,12 +262,12 @@ static rlm_rcode_t CC_HINT(nonnull) mod_accounting(void *instance, REQUEST *requ
 				sizeof(ut.session_id));
 			break;
 
-		case PW_NAS_PORT_TYPE:
-			if (vp->vp_integer <= 4)
-				ut.porttype = porttypes[vp->vp_integer];
+		case FR_NAS_PORT_TYPE:
+			if (vp->vp_uint32 <= 4)
+				ut.porttype = porttypes[vp->vp_uint32];
 			break;
 
-		case PW_CALLING_STATION_ID:
+		case FR_CALLING_STATION_ID:
 			if (inst->caller_id_ok) strlcpy(ut.caller_id, vp->vp_strvalue, sizeof(ut.caller_id));
 			break;
 		}
@@ -279,10 +278,10 @@ static rlm_rcode_t CC_HINT(nonnull) mod_accounting(void *instance, REQUEST *requ
 	 *	originator's IP address.
 	 */
 	if (ut.nas_address == htonl(INADDR_NONE)) {
-		ut.nas_address = request->packet->src_ipaddr.ipaddr.ip4addr.s_addr;
+		ut.nas_address = request->packet->src_ipaddr.addr.v4.s_addr;
 		nas = request->client->shortname;
 
-	} else if (request->packet->src_ipaddr.ipaddr.ip4addr.s_addr == ut.nas_address) {		/* might be a client, might not be. */
+	} else if (request->packet->src_ipaddr.addr.v4.s_addr == ut.nas_address) {		/* might be a client, might not be. */
 		nas = request->client->shortname;
 
 	/*
@@ -297,9 +296,9 @@ static rlm_rcode_t CC_HINT(nonnull) mod_accounting(void *instance, REQUEST *requ
 	/*
 	 *	Set the protocol field.
 	 */
-	if (protocol == PW_PPP) {
+	if (protocol == FR_PPP) {
 		ut.proto = 'P';
-	} else if (protocol == PW_SLIP) {
+	} else if (protocol == FR_SLIP) {
 		ut.proto = 'S';
 	} else {
 		ut.proto = 'T';
@@ -311,7 +310,7 @@ static rlm_rcode_t CC_HINT(nonnull) mod_accounting(void *instance, REQUEST *requ
 	 *	Get the utmp filename, via xlat.
 	 */
 	filename = NULL;
-	if (radius_axlat(&filename, request, inst->filename, NULL, NULL) < 0) {
+	if (xlat_aeval(request, &filename, request, inst->filename, NULL, NULL) < 0) {
 		return RLM_MODULE_FAIL;
 	}
 
@@ -321,14 +320,14 @@ static rlm_rcode_t CC_HINT(nonnull) mod_accounting(void *instance, REQUEST *requ
 	 *	Hmm... we may not want to zap all of the users when the NAS comes up, because of issues with receiving
 	 *	UDP packets out of order.
 	 */
-	if (status == PW_STATUS_ACCOUNTING_ON && (ut.nas_address != htonl(INADDR_NONE))) {
+	if (status == FR_STATUS_ACCOUNTING_ON && (ut.nas_address != htonl(INADDR_NONE))) {
 		RIDEBUG("NAS %s restarted (Accounting-On packet seen)", nas);
 		rcode = radutmp_zap(request, filename, ut.nas_address, ut.time);
 
 		goto finish;
 	}
 
-	if (status == PW_STATUS_ACCOUNTING_OFF && (ut.nas_address != htonl(INADDR_NONE))) {
+	if (status == FR_STATUS_ACCOUNTING_OFF && (ut.nas_address != htonl(INADDR_NONE))) {
 		RIDEBUG("NAS %s rebooted (Accounting-Off packet seen)", nas);
 		rcode = radutmp_zap(request, filename, ut.nas_address, ut.time);
 
@@ -338,7 +337,7 @@ static rlm_rcode_t CC_HINT(nonnull) mod_accounting(void *instance, REQUEST *requ
 	/*
 	 *	If we don't know this type of entry pretend we succeeded.
 	 */
-	if (status != PW_STATUS_START && status != PW_STATUS_STOP && status != PW_STATUS_ALIVE) {
+	if (status != FR_STATUS_START && status != FR_STATUS_STOP && status != FR_STATUS_ALIVE) {
 		REDEBUG("NAS %s port %u unknown packet type %d)", nas, ut.nas_port, status);
 		rcode = RLM_MODULE_NOOP;
 
@@ -348,7 +347,7 @@ static rlm_rcode_t CC_HINT(nonnull) mod_accounting(void *instance, REQUEST *requ
 	/*
 	 *	Translate the User-Name attribute, or whatever else they told us to use.
 	 */
-	if (radius_axlat(&expanded, request, inst->username, NULL, NULL) < 0) {
+	if (xlat_aeval(request, &expanded, request, inst->username, NULL, NULL) < 0) {
 		rcode = RLM_MODULE_FAIL;
 
 		goto finish;
@@ -419,11 +418,11 @@ static rlm_rcode_t CC_HINT(nonnull) mod_accounting(void *instance, REQUEST *requ
 		/*
 		 *	Don't compare stop records to unused entries.
 		 */
-		if (status == PW_STATUS_STOP && u.type == P_IDLE) {
+		if (status == FR_STATUS_STOP && u.type == P_IDLE) {
 			continue;
 		}
 
-		if ((status == PW_STATUS_STOP) && strncmp(ut.session_id, u.session_id, sizeof(u.session_id)) != 0) {
+		if ((status == FR_STATUS_STOP) && strncmp(ut.session_id, u.session_id, sizeof(u.session_id)) != 0) {
 			/*
 			 *	Don't complain if this is not a
 			 *	login record (some clients can
@@ -437,7 +436,7 @@ static rlm_rcode_t CC_HINT(nonnull) mod_accounting(void *instance, REQUEST *requ
 			break;
 		}
 
-		if ((status == PW_STATUS_START) && strncmp(ut.session_id, u.session_id, sizeof(u.session_id)) == 0  &&
+		if ((status == FR_STATUS_START) && strncmp(ut.session_id, u.session_id, sizeof(u.session_id)) == 0  &&
 		    u.time >= ut.time) {
 			if (u.type == P_LOGIN) {
 				RIDEBUG("Login entry for NAS %s port %u duplicate", nas, u.nas_port);
@@ -454,7 +453,7 @@ static rlm_rcode_t CC_HINT(nonnull) mod_accounting(void *instance, REQUEST *requ
 		 *	FIXME: the ALIVE record could need some more checking, but anyway I'd
 		 *	rather rewrite this mess -- miquels.
 		 */
-		if ((status == PW_STATUS_ALIVE) && strncmp(ut.session_id, u.session_id, sizeof(u.session_id)) == 0  &&
+		if ((status == FR_STATUS_ALIVE) && strncmp(ut.session_id, u.session_id, sizeof(u.session_id)) == 0  &&
 		    u.type == P_LOGIN) {
 			/*
 			 *	Keep the original login time.
@@ -478,7 +477,7 @@ static rlm_rcode_t CC_HINT(nonnull) mod_accounting(void *instance, REQUEST *requ
 	 *	Found the entry, do start/update it with
 	 *	the information from the packet.
 	 */
-	if ((r >= 0) && (status == PW_STATUS_START || status == PW_STATUS_ALIVE)) {
+	if ((r >= 0) && (status == FR_STATUS_START || status == FR_STATUS_ALIVE)) {
 		/*
 		 *	Remember where the entry was, because it's
 		 *	easier than searching through the entire file.
@@ -507,7 +506,7 @@ static rlm_rcode_t CC_HINT(nonnull) mod_accounting(void *instance, REQUEST *requ
 	 *	The user has logged off, delete the entry by
 	 *	re-writing it in place.
 	 */
-	if (status == PW_STATUS_STOP) {
+	if (status == FR_STATUS_STOP) {
 		if (r > 0) {
 			u.type = P_IDLE;
 			u.time = ut.time;
@@ -535,217 +534,17 @@ static rlm_rcode_t CC_HINT(nonnull) mod_accounting(void *instance, REQUEST *requ
 }
 #endif
 
-#ifdef WITH_SESSION_MGMT
-/*
- *	See if a user is already logged in. Sets request->simul_count to the
- *	current session count for this user and sets request->simul_mpp to 2
- *	if it looks like a multilink attempt based on the requested IP
- *	address, otherwise leaves request->simul_mpp alone.
- *
- *	Check twice. If on the first pass the user exceeds his
- *	max. number of logins, do a second pass and validate all
- *	logins by querying the terminal server (using eg. SNMP).
- */
-static rlm_rcode_t CC_HINT(nonnull) mod_checksimul(void *instance, REQUEST *request)
-{
-	rlm_rcode_t	rcode = RLM_MODULE_OK;
-	struct radutmp	u;
-	int		fd = -1;
-	VALUE_PAIR	*vp;
-	uint32_t	ipno = 0;
-	char const     	*call_num = NULL;
-	rlm_radutmp_t	*inst = instance;
-
-	char		*expanded = NULL;
-	ssize_t		len;
-
-	/*
-	 *	Get the filename, via xlat.
-	 */
-	if (radius_axlat(&expanded, request, inst->filename, NULL, NULL) < 0) {
-		return RLM_MODULE_FAIL;
-	}
-
-	fd = open(expanded, O_RDWR);
-	if (fd < 0) {
-		/*
-		 *	If the file doesn't exist, then no users
-		 *	are logged in.
-		 */
-		if (errno == ENOENT) {
-			request->simul_count=0;
-			return RLM_MODULE_OK;
-		}
-
-		/*
-		 *	Error accessing the file.
-		 */
-		REDEBUG("Error accessing file %s: %s", expanded, fr_syserror(errno));
-		rcode = RLM_MODULE_FAIL;
-
-		goto finish;
-	}
-
-	TALLOC_FREE(expanded);
-
-	len = radius_axlat(&expanded, request, inst->username, NULL, NULL);
-	if (len < 0) {
-		rcode = RLM_MODULE_FAIL;
-
-		goto finish;
-	}
-
-	if (!len) {
-		rcode = RLM_MODULE_NOOP;
-
-		goto finish;
-	}
-
-	/*
-	 *	WTF?  This is probably wrong... we probably want to
-	 *	be able to check users across multiple session accounting
-	 *	methods.
-	 */
-	request->simul_count = 0;
-
-	/*
-	 *	Loop over utmp, counting how many people MAY be logged in.
-	 */
-	while (read(fd, &u, sizeof(u)) == sizeof(u)) {
-		if (((strncmp(expanded, u.login, RUT_NAMESIZE) == 0) ||
-		    (!inst->case_sensitive && (strncasecmp(expanded, u.login, RUT_NAMESIZE) == 0))) &&
-		     (u.type == P_LOGIN)) {
-			++request->simul_count;
-		}
-	}
-
-	/*
-	 *	The number of users logged in is OK,
-	 *	OR, we've been told to not check the NAS.
-	 */
-	if ((request->simul_count < request->simul_max) || !inst->check_nas) {
-		rcode = RLM_MODULE_OK;
-
-		goto finish;
-	}
-	lseek(fd, (off_t)0, SEEK_SET);
-
-	/*
-	 *	Setup some stuff, like for MPP detection.
-	 */
-	if ((vp = fr_pair_find_by_num(request->packet->vps, 0, PW_FRAMED_IP_ADDRESS, TAG_ANY)) != NULL) {
-		ipno = vp->vp_ipaddr;
-	}
-
-	if ((vp = fr_pair_find_by_num(request->packet->vps, 0, PW_CALLING_STATION_ID, TAG_ANY)) != NULL) {
-		call_num = vp->vp_strvalue;
-	}
-
-	/*
-	 *	lock the file while reading/writing.
-	 */
-	rad_lockfd(fd, LOCK_LEN);
-
-	/*
-	 *	FIXME: If we get a 'Start' for a user/nas/port which is
-	 *	listed, but for which we did NOT get a 'Stop', then
-	 *	it's not a duplicate session.  This happens with
-	 *	static IP's like DSL.
-	 */
-	request->simul_count = 0;
-	while (read(fd, &u, sizeof(u)) == sizeof(u)) {
-		if (((strncmp(expanded, u.login, RUT_NAMESIZE) == 0) || (!inst->case_sensitive &&
-		    (strncasecmp(expanded, u.login, RUT_NAMESIZE) == 0))) && (u.type == P_LOGIN)) {
-			char session_id[sizeof(u.session_id) + 1];
-			char utmp_login[sizeof(u.login) + 1];
-
-			/* Guarantee string is NULL terminated */
-			u.session_id[sizeof(u.session_id) - 1] = '\0';
-			strlcpy(session_id, u.session_id, sizeof(session_id));
-
-			/*
-			 *	The login name MAY fill the whole field,
-			 *	and thus won't be zero-filled.
-			 *
-			 *	Note that we take the user name from
-			 *	the utmp file, as that's the canonical
-			 *	form.  The 'login' variable may contain
-			 *	a string which is an upper/lowercase
-			 *	version of u.login.  When we call the
-			 *	routine to check the terminal server,
-			 *	the NAS may be case sensitive.
-			 *
-			 *	e.g. We ask if "bob" is using a port,
-			 *	and the NAS says "no", because "BOB"
-			 *	is using the port.
-			 */
-			memset(utmp_login, 0, sizeof(utmp_login));
-			memcpy(utmp_login, u.login, sizeof(u.login));
-
-			/*
-			 *	rad_check_ts may take seconds
-			 *	to return, and we don't want
-			 *	to block everyone else while
-			 *	that's happening.  */
-			rad_unlockfd(fd, LOCK_LEN);
-			rcode = rad_check_ts(u.nas_address, u.nas_port, utmp_login, session_id);
-			rad_lockfd(fd, LOCK_LEN);
-
-			if (rcode == 0) {
-				/*
-				 *	Stale record - zap it.
-				 */
-				session_zap(request, u.nas_address, u.nas_port, expanded, session_id,
-					    u.framed_address, u.proto, 0);
-			}
-			else if (rcode == 1) {
-				/*
-				 *	User is still logged in.
-				 */
-				++request->simul_count;
-
-				/*
-				 *	Does it look like a MPP attempt?
-				 */
-				if (strchr("SCPA", u.proto) && ipno && u.framed_address == ipno) {
-					request->simul_mpp = 2;
-				} else if (strchr("SCPA", u.proto) && call_num && !strncmp(u.caller_id, call_num,16)) {
-					request->simul_mpp = 2;
-				}
-			} else {
-				RWDEBUG("Failed to check the terminal server for user '%s'.", utmp_login);
-				rcode = RLM_MODULE_FAIL;
-
-				goto finish;
-			}
-		}
-	}
-	finish:
-
-	talloc_free(expanded);
-
-	if (fd > -1) {
-		close(fd);		/* and implicitely release the locks */
-	}
-
-	return rcode;
-}
-#endif
-
 /* globally exported name */
 extern rad_module_t rlm_radutmp;
 rad_module_t rlm_radutmp = {
 	.magic		= RLM_MODULE_INIT,
 	.name		= "radutmp",
-	.type		= RLM_TYPE_THREAD_UNSAFE | RLM_TYPE_HUP_SAFE,
+	.type		= RLM_TYPE_THREAD_UNSAFE,
 	.inst_size	= sizeof(rlm_radutmp_t),
 	.config		= module_config,
 	.methods = {
 #ifdef WITH_ACCOUNTING
 		[MOD_ACCOUNTING]	= mod_accounting,
-#endif
-#ifdef WITH_SESSION_MGMT
-		[MOD_SESSION]		= mod_checksimul
 #endif
 	},
 };

@@ -31,6 +31,7 @@ RCSID("$Id$")
 
 #include <freeradius-devel/radiusd.h>
 #include <freeradius-devel/modules.h>
+#include <freeradius-devel/unlang.h>
 #include <freeradius-devel/state.h>
 #include <freeradius-devel/map_proc.h>
 #include <freeradius-devel/rad_assert.h>
@@ -54,6 +55,10 @@ RCSID("$Id$")
 #  define WIFEXITED(stat_val) (((stat_val) & 255) == 0)
 #endif
 
+#ifdef HAVE_SYSTEMD
+#  include <systemd/sd-daemon.h>
+#endif
+
 /*
  *  Global variables.
  */
@@ -62,13 +67,13 @@ char const	*radlog_dir = NULL;
 
 bool		log_stripped_names;
 
-char const *radiusd_version = "FreeRADIUS Version " RADIUSD_VERSION_STRING
-#ifdef RADIUSD_VERSION_COMMIT
-" (git #" STRINGIFY(RADIUSD_VERSION_COMMIT) ")"
-#endif
-", for host " HOSTINFO ", built on " __DATE__ " at " __TIME__;
-
+char const *radiusd_version = RADIUSD_VERSION_STRING_BUILD("FreeRADIUS");
 static pid_t radius_pid;
+
+#ifdef HAVE_SYSTEMD_WATCHDOG
+struct timeval sd_watchdog_interval;
+#endif
+
 
 /*
  *  Configuration items.
@@ -84,6 +89,58 @@ static void sig_fatal (int);
 static void sig_hup (int);
 #endif
 
+/** Configure talloc debugging features
+ *
+ * @param[in] config	The main config.
+ * @return
+ *	- 1 on config conflict.
+ *	- 0 on success.
+ *	- -1 on error.
+ */
+static int talloc_config_set(main_config_t *config)
+{
+	if (config->spawn_workers) {
+		if (config->talloc_memory_limit || config->talloc_memory_report) {
+			fr_strerror_printf("talloc_memory_limit and talloc_memory_report "
+					   "require single threaded mode (-s | -X)");
+			return 1;
+		}
+		return 0;
+	}
+
+	if (!config->talloc_memory_limit && !config->talloc_memory_report) {
+		talloc_disable_null_tracking();
+		return 0;
+	}
+
+	talloc_enable_null_tracking();
+
+	if (config->talloc_memory_limit) {
+		TALLOC_CTX *null_child = talloc_new(NULL);
+		TALLOC_CTX *null_ctx = talloc_parent(null_child);
+
+		talloc_free(null_child);
+
+		if (talloc_set_memlimit(null_ctx, config->talloc_memory_limit) < 0) {
+			fr_strerror_printf("Failed applying memory limit");
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
+/** Create module and xlat per-thread instances
+ *
+ */
+static int thread_instantiate(void *ctx, fr_event_list_t *el)
+{
+	if (modules_thread_instantiate(ctx, el) < 0) return -1;
+	if (xlat_thread_instantiate() < 0) return -1;
+
+	return 0;
+}
+
 /*
  *	The main guy.
  */
@@ -95,11 +152,12 @@ int main(int argc, char *argv[])
 	bool		display_version = false;
 	int		from_child[2] = {-1, -1};
 	char		*p;
+	fr_schedule_t	*sc = NULL;
 
 	/*
 	 *	Setup talloc callbacks so we get useful errors
 	 */
-	fr_talloc_fault_setup();
+	(void) fr_talloc_fault_setup();
 
 	/*
 	 *  We probably don't want to free the talloc autofree context
@@ -124,8 +182,8 @@ int main(int argc, char *argv[])
 #endif
 
 	rad_debug_lvl = 0;
-	req_debug_lvl = L_DBG_LVL_2;
 	set_radius_dir(autofree, RADIUS_DIR);
+	fr_time_start();
 
 	/*
 	 *	Ensure that the configuration is initialized.
@@ -150,109 +208,125 @@ int main(int argc, char *argv[])
 	main_config.log_file = NULL;
 
 	/*
-	 *  Set the panic action (if required)
+	 *  Set the panic action and enable other debugging facilities
 	 */
-	{
-		char const *panic_action = NULL;
-
-		panic_action = getenv("PANIC_ACTION");
-		if (!panic_action) panic_action = main_config.panic_action;
-
-		if (panic_action && (fr_fault_setup(panic_action, argv[0]) < 0)) {
-			fr_perror("Failed configuring panic action: %s", main_config.name);
-			fr_exit(EXIT_FAILURE);
-		}
+	if (fr_fault_setup(getenv("PANIC_ACTION"), argv[0]) < 0) {
+		fr_perror("Failed installing fault handlers... continuing");
 	}
 
 	/*  Process the options.  */
-	while ((argval = getopt(argc, argv, "Cd:D:fhi:l:Mn:p:PstvxX")) != EOF) {
-
+	while ((argval = getopt(argc, argv, "Cd:D:fhi:l:L:Mn:p:PstTvxX")) != EOF) {
 		switch (argval) {
-			case 'C':
-				check_config = true;
-				main_config.spawn_workers = false;
-				main_config.daemonize = false;
-				break;
+		case 'C':
+			check_config = true;
+			main_config.spawn_workers = false;
+			main_config.daemonize = false;
+			break;
 
-			case 'd':
-				set_radius_dir(autofree, optarg);
-				break;
+		case 'd':
+			set_radius_dir(autofree, optarg);
+			break;
 
-			case 'D':
-				main_config.dictionary_dir = talloc_typed_strdup(autofree, optarg);
-				break;
+		case 'D':
+			main_config.dictionary_dir = talloc_typed_strdup(autofree, optarg);
+			break;
 
-			case 'f':
-				main_config.daemonize = false;
-				break;
+		case 'f':
+			main_config.daemonize = false;
+			break;
 
-			case 'h':
-				usage(0);
-				break;
+		case 'h':
+			usage(0);
+			break;
 
-			case 'l':
-				if (strcmp(optarg, "stdout") == 0) {
-					goto do_stdout;
-				}
-				main_config.log_file = talloc_typed_strdup(autofree, optarg);
-				default_log.dst = L_DST_FILES;
-				default_log.fd = open(main_config.log_file, O_WRONLY | O_APPEND | O_CREAT, 0640);
-				if (default_log.fd < 0) {
-					fprintf(stderr, "%s: Failed to open log file %s: %s\n",
-						main_config.name, main_config.log_file, fr_syserror(errno));
-					exit(EXIT_FAILURE);
-				}
-				fr_log_fp = fdopen(default_log.fd, "a");
-				break;
+		case 'l':
+			if (strcmp(optarg, "stdout") == 0) {
+				goto do_stdout;
+			}
 
-			case 'n':
-				main_config.name = optarg;
-				break;
+			main_config.log_file = talloc_typed_strdup(autofree, optarg);
+			default_log.file = talloc_typed_strdup(autofree, optarg);
+			default_log.dst = L_DST_FILES;
+			default_log.fd = open(main_config.log_file, O_WRONLY | O_APPEND | O_CREAT, 0640);
+			if (default_log.fd < 0) {
+				fprintf(stderr, "%s: Failed to open log file %s: %s\n",
+					main_config.name, main_config.log_file, fr_syserror(errno));
+				exit(EXIT_FAILURE);
+			}
+			fr_log_fp = fdopen(default_log.fd, "a");
+			break;
 
-			case 'M':
-				main_config.memory_report = true;
-				break;
+		case 'L':
+		{
+			size_t limit;
 
-			case 'P':
-				/* Force the PID to be written, even in -f mode */
-				main_config.write_pid = true;
-				break;
+			if (fr_size_from_str(&limit, optarg) < 0) {
+				fr_perror("%s: Invalid memory limit", main_config.name);
+				exit(EXIT_FAILURE);
+			}
 
-			case 's':	/* Single process mode */
-				main_config.spawn_workers = false;
-				main_config.daemonize = false;
-				break;
+			if ((limit > (((size_t)((1024 * 1024) * 1024)) * 16) || (limit < ((1024 * 1024) * 10)))) {
+				fprintf(stderr, "%s: Memory limit must be between 10M-16G\n", main_config.name);
+				exit(EXIT_FAILURE);
+			}
 
-			case 't':	/* no child threads */
-				main_config.spawn_workers = false;
-				break;
+			main_config.talloc_memory_limit = limit;
+		}
+			break;
 
-			case 'v':
-				display_version = true;
-				break;
+		case 'n':
+			main_config.name = optarg;
+			break;
 
-			case 'X':
-				main_config.spawn_workers = false;
-				main_config.daemonize = false;
-				rad_debug_lvl += 2;
-				main_config.log_auth = true;
-				main_config.log_auth_badpass = true;
-				main_config.log_auth_goodpass = true;
-		do_stdout:
-				fr_log_fp = stdout;
-				default_log.dst = L_DST_STDOUT;
-				default_log.fd = STDOUT_FILENO;
-				break;
+		case 'M':
+			main_config.talloc_memory_report = true;
+			break;
 
-			case 'x':
-				rad_debug_lvl++;
-				break;
+		case 'P':	/* Force the PID to be written, even in -f mode */
+			main_config.write_pid = true;
+			break;
 
-			default:
-				usage(1);
-				break;
+		case 's':	/* Single process mode */
+			main_config.spawn_workers = false;
+			main_config.daemonize = false;
+			break;
+
+		case 't':	/* no child threads */
+			main_config.spawn_workers = false;
+			break;
+
+		case 'T':	/* enable timestamps */
+			default_log.timestamp = L_TIMESTAMP_ON;
+			break;
+
+		case 'v':
+			display_version = true;
+			break;
+
+		case 'X':
+			main_config.spawn_workers = false;
+			main_config.daemonize = false;
+			rad_debug_lvl += 2;
+			main_config.log_auth = true;
+			main_config.log_auth_badpass = true;
+			main_config.log_auth_goodpass = true;
+	do_stdout:
+			fr_log_fp = stdout;
+			default_log.dst = L_DST_STDOUT;
+			default_log.fd = STDOUT_FILENO;
+			break;
+
+		case 'x':
+			rad_debug_lvl++;
+			break;
+
+		default:
+			usage(1);
+			break;
 		}
 	}
+
+	fr_debug_lvl = req_debug_lvl = main_config.debug_level = rad_debug_lvl;
 
 	/*
 	 *  Mismatch between the binary and the libraries it depends on.
@@ -278,15 +352,9 @@ int main(int argc, char *argv[])
 	 *
 	 *  So we can't run with a null context and threads.
 	 */
-	if (main_config.memory_report) {
-		if (main_config.spawn_workers) {
-			fprintf(stderr, "%s: The server cannot produce memory reports (-M) in threaded mode\n",
-				main_config.name);
-			fr_exit(EXIT_FAILURE);
-		}
-		talloc_enable_null_tracking();
-	} else {
-		talloc_disable_null_tracking();
+	if (talloc_config_set(&main_config) != 0) {
+		fr_perror("%s", main_config.name);
+		fr_exit(EXIT_FAILURE);
 	}
 
 	/*
@@ -307,18 +375,18 @@ int main(int argc, char *argv[])
 		default_log.fd = STDOUT_FILENO;
 
 		INFO("%s: %s", main_config.name, radiusd_version);
-		version_print();
+		dependency_version_print();
 		exit(EXIT_SUCCESS);
 	}
 
-	if (rad_debug_lvl) version_print();
+	if (rad_debug_lvl) dependency_version_print();
 
 	/*
 	 *  Under linux CAP_SYS_PTRACE is usually only available before setuid/setguid,
 	 *  so we need to check whether we can attach before calling those functions
 	 *  (in main_config_init()).
 	 */
-	fr_store_debug_state();
+	fr_debug_state_store();
 
 	/*
 	 *  Write the PID always if we're running as a daemon.
@@ -331,15 +399,57 @@ int main(int argc, char *argv[])
 	if (main_config_init() < 0) exit(EXIT_FAILURE);
 
 	/*
+	 *  Set panic_action from the main config if one wasn't specified in the
+	 *  environment.
+	 */
+	if (main_config.panic_action && !getenv("PANIC_ACTION") &&
+	    (fr_fault_setup(main_config.panic_action, argv[0]) < 0)) {
+		fr_perror("Failed configuring panic action: %s", main_config.name);
+		fr_exit(EXIT_FAILURE);
+	}
+
+	/*
 	 *  This is very useful in figuring out why the panic_action didn't fire.
 	 */
 	INFO("%s", fr_debug_state_to_msg(fr_debug_state));
+
+	/*
+	 *  Initialise trigger rate limiting
+	 */
+	trigger_exec_init(main_config.config);
+
+	/*
+	 *  Call this again now we've loaded the configuration. Yes I know...
+	 */
+	if (talloc_config_set(&main_config) < 0) {
+		fr_perror("%s", main_config.name);
+		fr_exit(EXIT_FAILURE);
+	}
 
 	/*
 	 *  Check for vulnerabilities in the version of libssl were linked against.
 	 */
 #if defined(HAVE_OPENSSL_CRYPTO_H) && defined(ENABLE_OPENSSL_VERSION_CHECK)
 	if (tls_global_version_check(main_config.allow_vulnerable_openssl) < 0) exit(EXIT_FAILURE);
+#endif
+
+	/*
+	 *  The systemd watchdog enablement must be checked before we
+	 *  daemonize, but the notifications can come from any process.
+	 */
+#ifdef HAVE_SYSTEMD_WATCHDOG
+	if (!check_config) {
+		uint64_t usec;
+
+		if ((sd_watchdog_enabled(0, &usec) > 0) && (usec > 0)) {
+			usec /= 2;
+			fr_timeval_from_usec(&sd_watchdog_interval, usec);
+
+			INFO("systemd watchdog interval is %pT secs", &sd_watchdog_interval);
+		} else {
+			INFO("systemd watchdog is disabled");
+		}
+	}
 #endif
 
 #ifndef __MINGW32__
@@ -407,6 +517,10 @@ int main(int argc, char *argv[])
 				exit(EXIT_FAILURE);
 			}
 
+#ifdef HAVE_SYSTEMD
+			sd_notify(0, "READY=1");
+#endif
+
 			exit(EXIT_SUCCESS);
 		}
 
@@ -425,9 +539,9 @@ int main(int argc, char *argv[])
 	radius_pid = getpid();
 
 	/*
-	 *	Parse the thread pool configuration.
+	 *	Initialise the interpreter, registering operations.
 	 */
-	if (thread_pool_bootstrap(main_config.config, &main_config.spawn_workers) < 0) exit(EXIT_FAILURE);
+	if (unlang_initialize() < 0) exit(EXIT_FAILURE);
 
 	/*
 	 *	Initialize Auth-Type, etc. in the virtual servers
@@ -445,26 +559,46 @@ int main(int argc, char *argv[])
 	if (modules_bootstrap(main_config.config) < 0) exit(EXIT_FAILURE);
 
 	/*
-	 *	Load the modules before starting up any threads.
+	 *	And then load the virtual servers.
+	 *
+	 *	This function also opens the listeners in each virtual
+	 *	server.  These listeners MUST be started before the
+	 *	modules.  If there is another server already running,
+	 *	we will discover it here and exit BEFORE opening
+	 *	connections to back-end DBs.
 	 */
-	if (modules_init(main_config.config) < 0) exit(EXIT_FAILURE);
+	if (virtual_servers_instantiate() < 0) exit(EXIT_FAILURE);
 
 	/*
-	 *	And then load the virtual servers.
+	 *	Call the module's initialisation methods.  These create
+	 *	connection pools and open connections to external resources.
 	 */
-	if (virtual_servers_init(main_config.config) < 0) exit(EXIT_FAILURE);
+	if (modules_instantiate(main_config.config) < 0) exit(EXIT_FAILURE);
+
+	/*
+	 *	Instantiate "permanent" xlats
+	 */
+	if (xlat_instantiate() < 0) exit(EXIT_FAILURE);
+
+	/*
+	 *  Everything seems to have loaded OK, exit gracefully.
+	 */
+	if (check_config) {
+		DEBUG("Configuration appears to be OK");
+		goto cleanup;
+	}
 
 	/*
 	 *	Initialise the SNMP stats structures
 	 */
 	if (fr_snmp_init() < 0) {
-		ERROR("Failed initialising SNMP: %s", fr_strerror());
+		PERROR("Failed initialising SNMP");
 		fr_exit(EXIT_FAILURE);
 	}
 
 	/*
-	 *  Initialize any event loops just enough so module instantiations can
-	 *  add fd/event to them, but do not start them yet.
+	 *  Initialize the global event loop which handles things like
+	 *  systemd, and single-server mode.
 	 *
 	 *  This has to be done post-fork in case we're using kqueue, where the
 	 *  queue isn't inherited by the child process.
@@ -474,21 +608,60 @@ int main(int argc, char *argv[])
 	/*
 	 *  Redirect stderr/stdout as appropriate.
 	 */
-	if (radlog_init(&default_log, main_config.daemonize) < 0) {
-		ERROR("Failed initialising log: %s", fr_strerror());
+	if (fr_log_init(&default_log, main_config.daemonize) < 0) {
+		PERROR("Failed initialising log");
 		fr_exit(EXIT_FAILURE);
 	}
 
 	/*
-	 *	Initialize the threads ONLY if we're spawning, AND
-	 *	we're running normally.
+	 *	Start the network / worker threads.
 	 */
-	if (main_config.spawn_workers && (thread_pool_init() < 0)) exit(EXIT_FAILURE);
+	if (1) {
+		int networks = main_config.num_networks;
+		int workers = main_config.num_workers;
+		fr_event_list_t *el = NULL;
 
-	event_loop_started = true;
+		/*
+		 *	Single server mode: use the global event list.
+		 *	Otherwise, each network thread will create
+		 *	it's own event list.
+		 */
+		if (!main_config.spawn_workers) {
+			networks = 0;
+			workers = 0;
+			el = fr_global_event_list();
+		}
+
+		sc = fr_schedule_create(NULL, el, &default_log, rad_debug_lvl,
+					networks, workers,
+					thread_instantiate,
+					main_config.config);
+		if (!sc) {
+			exit(EXIT_FAILURE);
+		}
+
+		/*
+		 *	Tell the virtual servers to open their sockets.
+		 */
+		if (virtual_servers_open(sc) < 0) exit(EXIT_FAILURE);
+	}
+
+#ifndef NDEBUG
+	{
+		size_t size;
+
+		size = talloc_total_size(main_config.config);
+
+		if (talloc_set_memlimit(main_config.config, size)) {
+			PERROR("Failed setting memory limit for global configuration");
+		} else {
+			DEBUG3("Memory limit for global configuration is set to %zd bytes", size);
+		}
+	}
+#endif
 
 	/*
-	 *  Start the event loop.
+	 *  Start the main event loop.
 	 */
 	if (radius_event_start(main_config.spawn_workers) < 0) {
 		ERROR("Failed starting event loop");
@@ -500,23 +673,15 @@ int main(int argc, char *argv[])
 	 *  immediately.  Use SIGTERM to shut down the server cleanly in
 	 *  that case.
 	 */
-	if ((fr_set_signal(SIGINT, sig_fatal) < 0)
-#ifdef SIGQUIT
-	     || (fr_set_signal(SIGQUIT, sig_fatal) < 0)
-#endif
-	) {
-		ERROR("Failed installing signal handler: %s", fr_strerror());
+	if (fr_set_signal(SIGINT, sig_fatal) < 0) {
+	set_signal_error:
+		PERROR("Failed installing signal handler");
 		fr_exit(EXIT_FAILURE);
 	}
 
-	/*
-	 *  Everything seems to have loaded OK, exit gracefully.
-	 */
-	if (check_config) {
-		DEBUG("Configuration appears to be OK");
-
-		goto cleanup;
-	}
+#ifdef SIGQUIT
+	if (fr_set_signal(SIGQUIT, sig_fatal) < 0) goto set_signal_error;
+#endif
 
 	/*
 	 *  Now that we've set everything up, we can install the signal
@@ -527,11 +692,8 @@ int main(int argc, char *argv[])
 	signal(SIGPIPE, SIG_IGN);
 #endif
 
-	if ((fr_set_signal(SIGHUP, sig_hup) < 0) ||
-	    (fr_set_signal(SIGTERM, sig_fatal) < 0)) {
-		ERROR("Failed installing signal handler: %s", fr_strerror());
-		fr_exit(EXIT_FAILURE);
-	}
+	if (fr_set_signal(SIGHUP, sig_hup) < 0) goto set_signal_error;
+	if (fr_set_signal(SIGTERM, sig_fatal) < 0) goto set_signal_error;
 
 #ifdef WITH_STATS
 	radius_stats_init(0);
@@ -594,7 +756,7 @@ int main(int argc, char *argv[])
 	}
 
 	if (status < 0) {
-		ERROR("Exiting due to internal error: %s", fr_strerror());
+		PERROR("Exiting due to internal error");
 		rcode = EXIT_FAILURE;
 	} else {
 		INFO("Exiting normally");
@@ -628,6 +790,11 @@ int main(int argc, char *argv[])
 	if (main_config.daemonize) unlink(main_config.pid_file);
 
 	/*
+	 *	Stop the scheduler
+	 */
+	(void) fr_schedule_destroy(sc);
+
+	/*
 	 *	Free memory in an explicit and consistent order
 	 *
 	 *	We could let everything be freed by the autofree
@@ -637,11 +804,14 @@ int main(int argc, char *argv[])
 	 */
 	radius_event_free();		/* Free the requests */
 
-	thread_pool_stop();		/* stop all the threads */
-
 	talloc_free(global_state);	/* Free state entries */
 
 cleanup:
+	/*
+	 *	Free xlat instance data, and call any detach methods
+	 */
+	xlat_instances_free();
+
 	/*
 	 *	Detach modules, connection pools, registered xlats / paircompares / maps.
 	 */
@@ -663,24 +833,22 @@ cleanup:
 	 */
 	main_config_free();
 
-#ifdef WIN32
-	WSACleanup();
-#endif
-
 #if defined(HAVE_OPENSSL_CRYPTO_H) && OPENSSL_VERSION_NUMBER < 0x10100000L
 	tls_global_cleanup();		/* Cleanup any memory alloced by OpenSSL and placed into globals */
 #endif
+
 	talloc_free(autofree);		/* Cleanup everything else */
+
+	trigger_exec_free();		/* Now we're sure no more triggers can fire, free the trigger tree */
 
 	/*
 	 *  Anything not cleaned up by the above is allocated in the NULL
 	 *  top level context, and is likely leaked memory.
 	 */
-	if (main_config.memory_report) fr_log_talloc_report(NULL);
+	if (main_config.talloc_memory_report) fr_log_talloc_report(NULL);
 
 	return rcode;
 }
-
 
 /*
  *  Display the syntax for starting this program.
@@ -697,10 +865,17 @@ static void NEVER_RETURNS usage(int status)
 	fprintf(output, "  -f            Run as a foreground process, not a daemon.\n");
 	fprintf(output, "  -h            Print this help message.\n");
 	fprintf(output, "  -l <log_file> Logging output will be written to this file.\n");
+#ifndef NDEBUG
+	fprintf(output, "  -L <size>     When running in memory debug mode, set a hard limit on talloced memory\n");
+#endif
 	fprintf(output, "  -n <name>     Read raddb/name.conf instead of raddb/radiusd.conf.\n");
+#ifndef NDEBUG
+	fprintf(output, "  -M            Enable talloc memory debugging, and issue a memory report when the server terminates\n");
+#endif
 	fprintf(output, "  -P            Always write out PID, even with -f.\n");
 	fprintf(output, "  -s            Do not spawn child processes to handle requests (same as -ft).\n");
 	fprintf(output, "  -t            Disable threads.\n");
+	fprintf(output, "  -T            Prepend timestamps to  log messages.\n");
 	fprintf(output, "  -v            Print server version information.\n");
 	fprintf(output, "  -X            Turn on full debugging (similar to -tfxxl stdout).\n");
 	fprintf(output, "  -x            Turn on additional debugging (-xx gives more debugging).\n");

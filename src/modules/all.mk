@@ -8,6 +8,8 @@ CFLAGS += -DIS_MODULE=1
 SUBMAKEFILES := $(wildcard ${top_srcdir}/src/modules/rlm_*/all.mk)
 SUBMAKEFILES += $(wildcard ${top_srcdir}/src/modules/proto_*/all.mk)
 
+EXT_MODULES := $(subst ${top_srcdir}/,,$(wildcard ${top_srcdir}/src/modules/*_ext))
+
 #
 #  If we haven't run configure, ignore the modules which require it.
 #  Otherwise, load in all of the module makefiles, including ones
@@ -16,6 +18,10 @@ SUBMAKEFILES += $(wildcard ${top_srcdir}/src/modules/proto_*/all.mk)
 #
 ifeq "$(CONFIGURE_ARGS)" ""
 NEEDS_CONFIG := $(patsubst %.in,%,$(foreach file,$(SUBMAKEFILES),$(wildcard $(file).in)))
-SUBMAKEFILES := $(sort $(SUBMAKEFILES) $(NEED_CONFIG))
+SUBMAKEFILES := $(sort $(SUBMAKEFILES) $(NEEDS_CONFIG))
 endif
 
+ifneq "$(MAKECMDGOALS)" "reconfig"
+src/modules/%/configure: src/modules/%/configure.ac
+	@echo WARNING - may need "'make reconfig'" for AUTOCONF $(dir $@)
+endif

@@ -35,34 +35,35 @@ RCSIDH(rlm_sql_h, "$Id$")
 #endif
 
 #include <freeradius-devel/radiusd.h>
-#include <freeradius-devel/connection.h>
+#include <freeradius-devel/pool.h>
 #include <freeradius-devel/modpriv.h>
 #include <freeradius-devel/exfile.h>
 
-#define PW_ITEM_CHECK 0
-#define PW_ITEM_REPLY 1
+#define FR_ITEM_CHECK 0
+#define FR_ITEM_REPLY 1
 
 
 /* SQL Errors */
 typedef enum {
-	RLM_SQL_QUERY_INVALID = -3,	//!< Query syntax error
-	RLM_SQL_ERROR = -2,		//!< General connection/server error
-	RLM_SQL_OK = 0,			//!< Success
-	RLM_SQL_RECONNECT = 1,		//!< Stale connection, should reconnect
-	RLM_SQL_ALT_QUERY = 2		//!< Key constraint violation
+	RLM_SQL_QUERY_INVALID = -3,	//!< Query syntax error.
+	RLM_SQL_ERROR = -2,		//!< General connection/server error.
+	RLM_SQL_OK = 0,			//!< Success.
+	RLM_SQL_RECONNECT = 1,		//!< Stale connection, should reconnect.
+	RLM_SQL_ALT_QUERY,		//!< Key constraint violation, use an alternative query.
+	RLM_SQL_NO_MORE_ROWS,		//!< No more rows available
 } sql_rcode_t;
 
 typedef enum {
-	FALL_THROUGH_DEFAULT = 0,
+	FALL_THROUGH_NO = 0,
 	FALL_THROUGH_YES,
-	FALL_THROUGH_NO
+	FALL_THROUGH_DEFAULT,
 } sql_fall_through_t;
 
 
 typedef char **rlm_sql_row_t;
 
 typedef struct sql_log_entry {
-	log_type_t	type;		//!< Type of log entry L_ERR, L_WARN, L_INFO, L_DBG etc..
+	fr_log_type_t	type;		//!< Type of log entry L_ERR, L_WARN, L_INFO, L_DBG etc..
 	char const	*msg;		//!< Log message.
 } sql_log_entry_t;
 
@@ -99,20 +100,12 @@ typedef struct sql_config {
 	char const		*default_profile;		//!< Default profile to use if no other
 								//!< profiles were configured.
 
-	char const		*client_query;			//!< Query used to get FreeRADIUS client
-								//!< definitions.
-
 	char const		*authorize_check_query;		//!< Query used get check VPs for a user.
 	char const 		*authorize_reply_query;		//!< Query used get reply VPs for a user.
 	char const		*authorize_group_check_query;	//!< Query used get check VPs for a group.
 	char const		*authorize_group_reply_query;	//!< Query used get reply VPs for a group.
-	char const		*simul_count_query;		//!< Query used get number of active sessions
-								//!< for a user (basic simultaneous use check).
-	char const		*simul_verify_query;		//!< Query to get active sessions for a user
-								//!< the result is fed to session_zap.
 	char const 		*groupmemb_query;		//!< Query to determine group membership.
 
-	bool			do_clients;			//!< Read clients from SQL database.
 	bool			read_groups;			//!< Read user groups by default.
 								//!< If false, Fall-Through = yes is required
 								//!< in the previous reply list to process
@@ -124,10 +117,6 @@ typedef struct sql_config {
 	char const		*logfile;			//!< Keep a log of all SQL queries executed
 								//!< Useful for batch insertion with the
 								//!< NULL drivers.
-
-	bool			delete_stale_sessions;		//!< Whether we should use session_zap to create
-								//!< a fake stop packet, to terminate any
-								//!< stale sessions.
 
 	char const		*allowed_chars;			//!< Chars which done need escaping..
 	uint32_t		query_timeout;			//!< How long to allow queries to run for.
@@ -155,7 +144,7 @@ typedef struct sql_inst rlm_sql_t;
 typedef struct rlm_sql_handle {
 	void			*conn;				//!< Database specific connection handle.
 	rlm_sql_row_t		row;				//!< Row data from the last query.
-	rlm_sql_t		*inst;				//!< The rlm_sql instance this connection belongs to.
+	rlm_sql_t const		*inst;				//!< The rlm_sql instance this connection belongs to.
 	TALLOC_CTX		*log_ctx;			//!< Talloc pool used to avoid allocing memory
 								//!< when log strings need to be copied.
 } rlm_sql_handle_t;
@@ -221,7 +210,7 @@ typedef struct rlm_sql_driver_t {
 
 struct sql_inst {
 	rlm_sql_config_t	myconfig; /* HACK */
-	fr_connection_pool_t	*pool;
+	fr_pool_t		*pool;
 	rlm_sql_config_t	*config;
 	CONF_SECTION		*cs;
 
@@ -229,8 +218,7 @@ struct sql_inst {
 							//!< dictionary attribute.
 	exfile_t		*ef;
 
-	dl_module_t const	*driver_handle;		//!< Driver's dl_handle.
-	void			*driver_inst;		//!< Driver's instance data.
+	dl_instance_t		*driver_inst;		//!< Driver's instance data.
 	rlm_sql_driver_t const	*driver;		//!< Driver's exported interface.
 
 	int (*sql_set_user)(rlm_sql_t const *inst, REQUEST *request, char const *username);

@@ -5,10 +5,6 @@ update control {
        Cleartext-Password := 'hello'
 }
 
-update reply {
-	Filter-Id := "filter"
-}
-
 update request {
 	FreeRADIUS-Proxied-To  := 127.0.0.2
 }
@@ -21,9 +17,7 @@ update request {
 }
 
 if (&Attr-26.24757.84.9.5.7 != 0xab) {
-	update reply {
-		Filter-Id += 'Fail 1'
-	}
+	test_fail
 }
 
 #
@@ -34,51 +28,47 @@ update request {
 }
 
 if (&Attr-26.24757.84.9.5.15 != 0xabcdef) {
-	update reply {
-		Filter-Id += 'Fail 2'
-	}
+	test_fail
 }
 
 #
 #  Check that unknown attributes which are defined
 #  get automatically resolved to the real attribute.
 #
-if (&Vendor-11344-Attr-1 == 127.0.0.1) {
-	update reply {
-		Filter-Id += 'Fail 3'
-	}
+if (&Attr-26.11344.1 == 127.0.0.1) {
+	test_fail
 }
 
-if (&Vendor-11344-Attr-1 != 127.0.0.2) {
-	update reply {
-		Filter-Id += 'Fail 4'
-	}
+if (&Attr-26.11344.1 != 127.0.0.2) {
+	test_fail
 }
 
 update request {
-	&Vendor-11344-Attr-1 := 127.0.0.1
+	&Attr-26.11344.1 := 0x7f000001
 }
 
 if (&FreeRADIUS-Proxied-To == 127.0.0.2) {
-	update reply {
-		Filter-Id += 'Fail 5'
-	}
+	test_fail
 }
 
 if (&FreeRADIUS-Proxied-To != 127.0.0.1) {
-	update reply {
-		Filter-Id += 'Fail 6'
-	}
+	test_fail
 }
 
-if (&Vendor-11344-Attr-1 == 127.0.0.2) {
-	update reply {
-		Filter-Id += 'Fail 7'
-	}
+if (&Attr-26.11344.1 == 127.0.0.2) {
+	test_fail
 }
 
-if (&Vendor-11344-Attr-1 != 127.0.0.1) {
-	update reply {
-		Filter-Id += 'Fail 8'
-	}
+if (&Attr-26.11344.1 != 127.0.0.1) {
+	test_fail
 }
+
+update request {
+	&Attr-26.66.1 = 0x01020304
+}
+
+if (&Attr-26.66.1 != 0x01020304) {
+	test_fail
+}
+
+success

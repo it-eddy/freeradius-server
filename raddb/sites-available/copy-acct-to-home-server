@@ -29,6 +29,11 @@ server copy-acct-to-home-server {
 	listen {
 		type = detail
 
+		#
+		#  See sites-available/buffered-sql for more details on
+		#  all the options available for the detail reader.
+		#
+
 		######################################################
 		#
 		#  !!!! WARNING !!!!
@@ -63,6 +68,7 @@ server copy-acct-to-home-server {
 		#  one large file.  File globbing also means that with
 		#  a common naming scheme for detail files, then you can
 		#  have many detail file writers, and only one reader.
+		#
 		filename = ${radacctdir}/detail
 
 		#
@@ -107,22 +113,7 @@ server copy-acct-to-home-server {
 	#
 	#  Pre-accounting.  Decide which accounting type to use.
 	#
-	preacct {
-		preprocess
-
-		# Since we're just proxying, we don't need acct_unique.
-
-		#
-		#  Look for IPASS-style 'realm/', and if not found, look for
-		#  '@realm', and decide whether or not to proxy, based on
-		#  that.
-		#
-		#  Accounting requests are generally proxied to the same
-		#  home server as authentication requests.
-	#	IPASS
-		suffix
-	#	ntdomain
-
+	recv Accounting-Request {
 		#
 		#  Read the 'acct_users' file.  This isn't always
 		#  necessary, and can be deleted if you do not use it.
@@ -132,7 +123,7 @@ server copy-acct-to-home-server {
 	#
 	#  Accounting.  Log the accounting data.
 	#
-	accounting {
+	send Accounting-Response {
 		   #
 		   # Since we're proxying, we don't log anything
 		   # locally.  Ensure that the accounting section

@@ -30,66 +30,131 @@ RCSID("$Id$")
 #include "eap_types.h"
 #include "sim_proto.h"
 #include "comp128.h"
+#include "milenage.h"
 
 #include <freeradius-devel/rad_assert.h>
 
-static int vector_gsm_from_ki(eap_session_t *eap_session, VALUE_PAIR *vps,
-			      int idx, fr_sim_keys_t *keys)
+static int vector_opc_from_op(REQUEST *request, uint8_t const **out, uint8_t opc_buff[MILENAGE_OPC_SIZE],
+			      VALUE_PAIR *list, uint8_t const ki[MILENAGE_KI_SIZE])
 {
-	REQUEST	*request = eap_session->request;
-	VALUE_PAIR *vp, *version;
-	int i;
+	VALUE_PAIR	*opc_vp;
+	VALUE_PAIR	*op_vp;
+
+	opc_vp = fr_pair_find_by_child_num(list, fr_dict_root(fr_dict_internal), FR_SIM_OPC, TAG_ANY);
+	if (opc_vp) {
+		if (opc_vp->vp_length != MILENAGE_OPC_SIZE) {
+			REDEBUG("&control:SIM-OPc has incorrect length, expected %u bytes got %zu bytes",
+				MILENAGE_OPC_SIZE, opc_vp->vp_length);
+			return -1;
+		}
+		*out = opc_vp->vp_octets;
+		return 0;
+	}
+
+	op_vp = fr_pair_find_by_child_num(list, fr_dict_root(fr_dict_internal), FR_SIM_OP, TAG_ANY);
+	if (op_vp) {
+		if (op_vp->vp_length != MILENAGE_OP_SIZE) {
+			REDEBUG("&control:SIM-OP has incorrect length, expected %u bytes got %zu bytes",
+				MILENAGE_OP_SIZE, op_vp->vp_length);
+			return -1;
+		}
+		if (milenage_opc_generate(opc_buff, op_vp->vp_octets, ki) < 0) {
+			RPEDEBUG("Deriving OPc failed");
+			return -1;
+		}
+		*out = opc_buff;
+		return 0;
+	}
+
+	*out = NULL;
+	return 1;
+}
+
+static int vector_gsm_from_ki(eap_session_t *eap_session, VALUE_PAIR *vps, int idx, fr_sim_keys_t *keys)
+{
+	REQUEST		*request = eap_session->request;
+	VALUE_PAIR	*ki_vp, *version_vp;
+	uint8_t		opc_buff[MILENAGE_OPC_SIZE];
+	uint8_t	const	*opc_p;
+	uint32_t	version;
+	int		i;
 
 	/*
 	 *	Generate a new RAND value, and derive Kc and SRES from Ki
 	 */
-	vp = fr_pair_find_by_child_num(vps, dict_sim_root, PW_SIM_KI, TAG_ANY);
-	if (!vp) {
-		RDEBUG3("No &control:SIM-KI found, not generating triplets locally");
+	ki_vp = fr_pair_find_by_child_num(vps, fr_dict_root(fr_dict_internal), FR_SIM_KI, TAG_ANY);
+	if (!ki_vp) {
+		RDEBUG3("No &control:SIM-Ki found, not generating triplets locally");
 		return 1;
+	} else if (ki_vp->vp_length != MILENAGE_KI_SIZE) {
+		REDEBUG("&control:SIM-Ki has incorrect length, expected 16 bytes got %zu bytes", ki_vp->vp_length);
+		return -1;
 	}
 
 	/*
 	 *	Check to see if have a Ki for the IMSI, this allows us to generate the rest
 	 *	of the triplets.
 	 */
-	version = fr_pair_find_by_child_num(vps, dict_sim_root, PW_SIM_ALGO_VERSION, TAG_ANY);
-	if (!version) {
-		RDEBUG3("No &control:SIM-ALGO-VERSION found, not generating triplets locally");
-		return 1;
+	version_vp = fr_pair_find_by_child_num(vps, fr_dict_root(fr_dict_internal), FR_SIM_ALGO_VERSION, TAG_ANY);
+	if (!version_vp) {
+		if (vector_opc_from_op(request, &opc_p, opc_buff, vps, ki_vp->vp_octets) < 0) return -1;
+		version = opc_p ? 4 : 3;
+	/*
+	 *	Version we explicitly specified, see if we can find the prerequisite
+	 *	attributes.
+	 */
+	} else {
+		version = version_vp->vp_uint32;
+		if (version == 4) {
+			if (vector_opc_from_op(request, &opc_p, opc_buff, vps, ki_vp->vp_octets) < 0) return -1;
+			if (!opc_p) {
+				RPEDEBUG2("No &control:SIM-OP or &control:SIM-OPc found, "
+					  "can't run Milenage (COMP128-4)");
+				return -1;
+			}
+		}
 	}
 
-	for (i = 0; i < SIM_VECTOR_GSM_RAND_SIZE; i++) {
-		keys->gsm.vector[idx].rand[i] = fr_rand();
+	for (i = 0; i < SIM_VECTOR_GSM_RAND_SIZE; i += sizeof(uint32_t)) {
+		uint32_t rand = fr_rand();
+		memcpy(&keys->gsm.vector[idx].rand[i], &rand, sizeof(rand));
 	}
 
-	switch (version->vp_integer) {
+	switch (version) {
 	case 1:
 		comp128v1(keys->gsm.vector[idx].sres,
-			  keys->gsm.vector[idx].kc, vp->vp_octets,
+			  keys->gsm.vector[idx].kc,
+			  ki_vp->vp_octets,
 			  keys->gsm.vector[idx].rand);
 		break;
 
 	case 2:
 		comp128v23(keys->gsm.vector[idx].sres,
 			   keys->gsm.vector[idx].kc,
-			   vp->vp_octets,
+			   ki_vp->vp_octets,
 			   keys->gsm.vector[idx].rand, true);
 		break;
 
 	case 3:
 		comp128v23(keys->gsm.vector[idx].sres,
 			   keys->gsm.vector[idx].kc,
-			   vp->vp_octets,
+			   ki_vp->vp_octets,
 			   keys->gsm.vector[idx].rand, false);
 		break;
 
 	case 4:
-		REDEBUG("Milenage not supported (feel free to implement it)");
-		return 1;
+		if (milenage_gsm_generate(keys->gsm.vector[idx].sres,
+					  keys->gsm.vector[idx].kc,
+					  opc_p,
+					  ki_vp->vp_octets,
+					  keys->gsm.vector[idx].rand) < 0) {
+			RPEDEBUG2("Failed deriving GSM triplet");
+			return -1;
+		}
+		return 0;
 
 	default:
-		REDEBUG("Unknown/unsupported algorithm Comp128-%i", version->vp_integer);
+		REDEBUG("Unknown/unsupported algorithm %i", version);
 		return -1;
 	}
 	return 0;
@@ -103,8 +168,8 @@ static int vector_gsm_from_triplets(eap_session_t *eap_session, VALUE_PAIR *vps,
 	vp_cursor_t	cursor;
 	int		i;
 
-	for (i = 0, fr_cursor_init(&cursor, &vps);
-	     (i <= idx) && (kc = fr_cursor_next_by_child_num(&cursor, dict_sim_root, PW_EAP_SIM_KC, TAG_ANY)); i++);
+	for (i = 0, fr_pair_cursor_init(&cursor, &vps);
+	     (i <= idx) && (kc = fr_pair_cursor_next_by_child_num(&cursor, dict_sim_root, FR_EAP_SIM_KC, TAG_ANY)); i++);
 	if (!kc) {
 		RDEBUG3("No &control:EAP-SIM-KC[%i] attribute found, not using GSM triplets", idx);
 		return 1;
@@ -115,8 +180,8 @@ static int vector_gsm_from_triplets(eap_session_t *eap_session, VALUE_PAIR *vps,
 		return -1;
 	}
 
-	for (i = 0, fr_cursor_init(&cursor, &vps);
-	     (i <= idx) && (rand = fr_cursor_next_by_child_num(&cursor, dict_sim_root, PW_EAP_SIM_RAND, TAG_ANY));
+	for (i = 0, fr_pair_cursor_init(&cursor, &vps);
+	     (i <= idx) && (rand = fr_pair_cursor_next_by_child_num(&cursor, dict_sim_root, FR_EAP_SIM_RAND, TAG_ANY));
 	     i++);
 	if (!rand) {
 		RDEBUG3("No &control:EAP-SIM-Rand[%i] attribute found, not using GSM triplets", idx);
@@ -128,8 +193,8 @@ static int vector_gsm_from_triplets(eap_session_t *eap_session, VALUE_PAIR *vps,
 		return -1;
 	}
 
-	for (i = 0, fr_cursor_init(&cursor, &vps);
-	     (i <= idx) && (sres = fr_cursor_next_by_child_num(&cursor, dict_sim_root, PW_EAP_SIM_SRES, TAG_ANY)); i++);
+	for (i = 0, fr_pair_cursor_init(&cursor, &vps);
+	     (i <= idx) && (sres = fr_pair_cursor_next_by_child_num(&cursor, dict_sim_root, FR_EAP_SIM_SRES, TAG_ANY)); i++);
 	if (!sres) {
 		RDEBUG3("No &control:EAP-SIM-SRES[%i] attribute found, not using GSM triplets", idx);
 		return 1;
@@ -173,8 +238,8 @@ static int vector_gsm_from_quintuplets(eap_session_t *eap_session, VALUE_PAIR *v
 	/*
 	 *	Fetch CK
 	 */
-	for (i = 0, fr_cursor_init(&cursor, &vps);
-	     (i <= idx) && (ck = fr_cursor_next_by_child_num(&cursor, dict_aka_root, PW_EAP_AKA_CK, TAG_ANY)); i++);
+	for (i = 0, fr_pair_cursor_init(&cursor, &vps);
+	     (i <= idx) && (ck = fr_pair_cursor_next_by_child_num(&cursor, dict_aka_root, FR_EAP_AKA_CK, TAG_ANY)); i++);
 	if (!ck) {
 		RDEBUG3("No &control:EAP-AKA-CK[%i] attribute found, not using quintuplet derivation", idx);
 		return 1;
@@ -183,8 +248,8 @@ static int vector_gsm_from_quintuplets(eap_session_t *eap_session, VALUE_PAIR *v
 	/*
 	 *	Fetch IK
 	 */
-	for (i = 0, fr_cursor_init(&cursor, &vps);
-	     (i <= idx) && (ik = fr_cursor_next_by_child_num(&cursor, dict_aka_root, PW_EAP_AKA_IK, TAG_ANY)); i++);
+	for (i = 0, fr_pair_cursor_init(&cursor, &vps);
+	     (i <= idx) && (ik = fr_pair_cursor_next_by_child_num(&cursor, dict_aka_root, FR_EAP_AKA_IK, TAG_ANY)); i++);
 	if (!ik) {
 		RDEBUG3("No &control:EAP-AKA-IK[%i] attribute found, not using quintuplet derivation", idx);
 		return 1;
@@ -193,8 +258,8 @@ static int vector_gsm_from_quintuplets(eap_session_t *eap_session, VALUE_PAIR *v
 	/*
 	 *	Fetch RAND
 	 */
-	for (i = 0, fr_cursor_init(&cursor, &vps); (i <= idx) &&
-	     (rand = fr_cursor_next_by_child_num(&cursor, dict_aka_root, PW_EAP_AKA_RAND, TAG_ANY)); i++);
+	for (i = 0, fr_pair_cursor_init(&cursor, &vps); (i <= idx) &&
+	     (rand = fr_pair_cursor_next_by_child_num(&cursor, dict_aka_root, FR_EAP_AKA_RAND, TAG_ANY)); i++);
 	if (!rand) {
 		RDEBUG3("No &control:EAP-AKA-Rand[%i] attribute found, not using quintuplet derivation", idx);
 		return 1;
@@ -210,8 +275,8 @@ static int vector_gsm_from_quintuplets(eap_session_t *eap_session, VALUE_PAIR *v
 	/*
 	 *	Fetch XRES
 	 */
-	for (i = 0, fr_cursor_init(&cursor, &vps);
-	     (i <= idx) && (xres = fr_cursor_next_by_child_num(&cursor, dict_aka_root, PW_EAP_AKA_XRES, TAG_ANY)); i++);
+	for (i = 0, fr_pair_cursor_init(&cursor, &vps);
+	     (i <= idx) && (xres = fr_pair_cursor_next_by_child_num(&cursor, dict_aka_root, FR_EAP_AKA_XRES, TAG_ANY)); i++);
 	if (!xres) {
 		RDEBUG3("No &control:EAP-AKA-XRES[%i] attribute found, not using quintuplet derivation", idx);
 		return 1;
@@ -332,75 +397,111 @@ int fr_sim_vector_gsm_from_attrs(eap_session_t *eap_session, VALUE_PAIR *vps,
 	return 0;
 }
 
-#if 0
-static int vector_umts_from_ki(eap_session_t *eap_session, VALUE_PAIR *vps,
-			       fr_sim_keys_t *keys)
+static int vector_umts_from_ki(eap_session_t *eap_session, VALUE_PAIR *vps, fr_sim_keys_t *keys)
 {
-	REQUEST	*request = eap_session->request;
-	VALUE_PAIR *vp, *version;
-	int i;
+	REQUEST		*request = eap_session->request;
+	VALUE_PAIR	*ki_vp, *amf_vp, *sqn_vp, *version_vp;
+
+	uint64_t	sqn;
+	uint8_t		amf_buff[MILENAGE_AMF_SIZE] = { 0x00, 0x00 };
+	uint8_t 	opc_buff[MILENAGE_OPC_SIZE];
+	uint8_t	const	*opc_p;
+	uint32_t	version = 4;
+	int		i;
+
+	ki_vp = fr_pair_find_by_child_num(vps, fr_dict_root(fr_dict_internal), FR_SIM_KI, TAG_ANY);
+	if (!ki_vp) {
+		RDEBUG3("No &control:SIM-Ki found, not generating quintuplets locally");
+		return 1;
+	} else if (ki_vp->vp_length != MILENAGE_KI_SIZE) {
+		REDEBUG("&control:SIM-Ki has incorrect length, expected %u bytes got %zu bytes",
+			MILENAGE_KI_SIZE, ki_vp->vp_length);
+		return -1;
+	}
+
+	if (vector_opc_from_op(request, &opc_p, opc_buff, vps, ki_vp->vp_octets) < 0) return -1;
+
+	amf_vp = fr_pair_find_by_child_num(vps, fr_dict_root(fr_dict_internal), FR_SIM_AMF, TAG_ANY);
+	if (amf_vp) {
+		if (amf_vp->vp_length != sizeof(amf_buff)) {
+			REDEBUG("&control:SIM-AMF has incorrect length, expected %u bytes got %zu bytes",
+				MILENAGE_AMF_SIZE, amf_vp->vp_length);
+			return -1;
+		}
+		memcpy(amf_buff, amf_vp->vp_octets, sizeof(amf_buff));
+	}
+
+	sqn_vp = fr_pair_find_by_child_num(vps, fr_dict_root(fr_dict_internal), FR_SIM_SQN, TAG_ANY);
+	sqn = sqn_vp ? sqn_vp->vp_uint64 : 2;
 
 	/*
-	 *	Generate a new RAND value, and derive Kc and SRES from Ki
+	 *	We default to milenage
 	 */
-	vp = fr_pair_find_by_num(vps, 0, PW_SIM_KI, TAG_ANY);
-	if (!vp) {
-		RDEBUG3("No &control:aka-KI found, not generating triplets locally");
-		return 1;
+	version_vp = fr_pair_find_by_num(vps, 0, FR_SIM_ALGO_VERSION, TAG_ANY);
+	if (version_vp) version = version_vp->vp_uint32;
+
+	for (i = 0; i < SIM_VECTOR_UMTS_RAND_SIZE; i += sizeof(uint32_t)) {
+		uint32_t rand = fr_rand();
+		memcpy(&keys->umts.vector.rand[i], &rand, sizeof(rand));
 	}
 
-	/*
-	 *	Check to see if have a Ki for the IMSI, this allows us to generate the rest
-	 *	of the triplets.
-	 */
-	version = fr_pair_find_by_num(vps, 0, PW_SIM_ALGO_VERSION, TAG_ANY);
-	if (!version) {
-		RDEBUG3("No &control:SIM-ALGO-VERSION found, not generating triplets locally");
-		return 1;
-	}
-
-	for (i = 0; i < SIM_VECTOR_UMTS_RAND_SIZE; i++) {
-		keys->umts.vector.rand[i] = fr_rand();
-	}
-
-	switch (version->vp_integer) {
-	case 1:
-		comp128v1(keys->umts.vector.sres,
-			  keys->umts.vector.kc, vp->vp_octets,
-			  keys->umts.vector.rand);
-		break;
-
-	case 2:
-		comp128v23(keys->umts.vector.sres,
-			   keys->umts.vector.kc,
-			   vp->vp_octets,
-			   keys->umts.vector.rand, true);
-		break;
-
-	case 3:
-		comp128v23(keys->umts.vector.sres,
-			   keys->umts.vector.kc,
-			   vp->vp_octets,
-			   keys->umts.vector.rand, false);
-		break;
-
+	switch (version) {
 	case 4:
-		REDEBUG("Milenage not supported (feel free to implement it)");
-		return 1;
+	{
+		uint8_t sqn_buff[MILENAGE_SQN_SIZE];
+
+		keys->sqn = sqn_vp ? sqn_vp->vp_uint64 : 0;
+		uint48_to_buff(sqn_buff, keys->sqn);
+
+		RDEBUG3("Milenage inputs");
+		RINDENT();
+		/*
+		 *	Don't change colon indent, matches other messages later...
+		 */
+		RHEXDUMP_INLINE(L_DBG_LVL_3,
+				ki_vp->vp_octets, MILENAGE_KI_SIZE,
+				"Ki           :");
+		RHEXDUMP_INLINE(L_DBG_LVL_3,
+				opc_p, MILENAGE_OPC_SIZE,
+				"OPc          :");
+		RHEXDUMP_INLINE(L_DBG_LVL_3,
+				sqn_buff, MILENAGE_SQN_SIZE,
+				"SQN          :");
+		RHEXDUMP_INLINE(L_DBG_LVL_3,
+				amf_buff, MILENAGE_AMF_SIZE,
+				"AMF          :");
+		REXDENT();
+
+		if (milenage_umts_generate(keys->umts.vector.autn,
+					   keys->umts.vector.ik,
+					   keys->umts.vector.ck,
+					   keys->umts.vector.ak,
+					   keys->umts.vector.xres,
+					   opc_p,
+					   amf_buff,
+					   ki_vp->vp_octets,
+					   sqn,
+					   keys->umts.vector.rand) < 0) {
+			RPEDEBUG2("Failed deriving UMTS Quintuplet");
+			return -1;
+		}
+
+		keys->umts.vector.xres_len = 8;
+	}
+		return 0;
+
+	case 1:
+	case 2:
+	case 3:
+		REDEBUG("Only Milenage can be used to generate quintuplets");
+		return -1;
 
 	default:
-		REDEBUG("Unknown/unsupported algorithm Comp128-%i", version->vp_integer);
+		REDEBUG("Unknown/unsupported algorithm %i", version);
 		return -1;
 	}
 	return 0;
 }
-#else
-static int vector_umts_from_ki(UNUSED eap_session_t *eap_session, UNUSED VALUE_PAIR *vps,
-			       UNUSED fr_sim_keys_t *keys)
-{
-	return 1;
-}
-#endif
 
 /** Get one set of quintuplets from the request
  *
@@ -409,89 +510,140 @@ static int vector_umts_from_quintuplets(eap_session_t *eap_session, VALUE_PAIR *
 {
 	REQUEST		*request = eap_session->request;
 
-	VALUE_PAIR	*rand = NULL, *xres = NULL, *ck = NULL, *ik = NULL, *autn = NULL;
+	VALUE_PAIR	*rand_vp = NULL, *xres_vp = NULL, *ck_vp = NULL, *ik_vp = NULL;
+	VALUE_PAIR	*autn_vp = NULL, *sqn_vp = NULL, *ak_vp = NULL;
 
 	/*
 	 *	Fetch AUTN
 	 */
-	autn = fr_pair_find_by_child_num(vps, dict_aka_root, PW_EAP_AKA_AUTN, TAG_ANY);
-	if (!autn) {
-		RDEBUG3("No &control:PW_EAP_AKA_AUTN attribute found, not using UMTS quintuplets");
+	autn_vp = fr_pair_find_by_child_num(vps, dict_aka_root, FR_EAP_AKA_AUTN, TAG_ANY);
+	if (!autn_vp) {
+		RDEBUG3("No &control:FR_EAP_AKA_AUTN attribute found, not using UMTS quintuplets");
 		return 1;
 	}
 
-	if (autn->vp_length > SIM_VECTOR_UMTS_AUTN_SIZE) {
+	if (autn_vp->vp_length > SIM_VECTOR_UMTS_AUTN_SIZE) {
 		REDEBUG("&control:EAP-AKA-AUTN incorrect length.  Expected "
-			STRINGIFY(SIM_VECTOR_UMTS_AUTN_SIZE) " bytes, got %zu bytes", autn->vp_length);
+			STRINGIFY(SIM_VECTOR_UMTS_AUTN_SIZE) " bytes, got %zu bytes", autn_vp->vp_length);
 		return -1;
 	}
 
 	/*
 	 *	Fetch CK
 	 */
-	ck = fr_pair_find_by_child_num(vps, dict_aka_root, PW_EAP_AKA_CK, TAG_ANY);
-	if (!ck) {
+	ck_vp = fr_pair_find_by_child_num(vps, dict_aka_root, FR_EAP_AKA_CK, TAG_ANY);
+	if (!ck_vp) {
 		RDEBUG3("No &control:EAP-AKA-CK attribute found, not using UMTS quintuplets");
 		return 1;
 	}
 
-	if (ck->vp_length > SIM_VECTOR_UMTS_CK_SIZE) {
+	if (ck_vp->vp_length > SIM_VECTOR_UMTS_CK_SIZE) {
 		REDEBUG("&control:EAP-AKA-CK incorrect length.  Expected "
-			STRINGIFY(EAP_AKA_XRES_MAX_SIZE) " bytes, got %zu bytes", ck->vp_length);
+			STRINGIFY(EAP_AKA_XRES_MAX_SIZE) " bytes, got %zu bytes", ck_vp->vp_length);
 		return -1;
 	}
 
 	/*
 	 *	Fetch IK
 	 */
-	ik = fr_pair_find_by_child_num(vps, dict_aka_root, PW_EAP_AKA_IK, TAG_ANY);
-	if (!ik) {
+	ik_vp = fr_pair_find_by_child_num(vps, dict_aka_root, FR_EAP_AKA_IK, TAG_ANY);
+	if (!ik_vp) {
 		RDEBUG3("No &control:EAP-AKA-IK attribute found, not using UMTS quintuplets");
 		return 1;
 	}
 
-	if (ik->vp_length > SIM_VECTOR_UMTS_IK_SIZE) {
+	if (ik_vp->vp_length > SIM_VECTOR_UMTS_IK_SIZE) {
 		REDEBUG("&control:EAP-AKA-IK incorrect length.  Expected "
-			STRINGIFY(SIM_VECTOR_UMTS_IK_SIZE) " bytes, got %zu bytes", ik->vp_length);
+			STRINGIFY(SIM_VECTOR_UMTS_IK_SIZE) " bytes, got %zu bytes", ik_vp->vp_length);
 		return -1;
 	}
 
 	/*
 	 *	Fetch RAND
 	 */
-	rand = fr_pair_find_by_child_num(vps, dict_aka_root, PW_EAP_AKA_RAND, TAG_ANY);
-	if (!rand) {
+	rand_vp = fr_pair_find_by_child_num(vps, dict_aka_root, FR_EAP_AKA_RAND, TAG_ANY);
+	if (!rand_vp) {
 		RDEBUG3("No &control:EAP-AKA-Rand attribute found, not using quintuplet derivation");
 		return 1;
 	}
 
-	if (rand->vp_length != SIM_VECTOR_UMTS_RAND_SIZE) {
+	if (rand_vp->vp_length != SIM_VECTOR_UMTS_RAND_SIZE) {
 		REDEBUG("&control:EAP-AKA-RAND incorrect length.  Expected " STRINGIFY(SIM_VECTOR_UMTS_RAND_SIZE) " bytes, "
-			"got %zu bytes", rand->vp_length);
+			"got %zu bytes", rand_vp->vp_length);
 		return -1;
 	}
 
 	/*
 	 *	Fetch XRES
 	 */
-	xres = fr_pair_find_by_child_num(vps, dict_aka_root, PW_EAP_AKA_XRES, TAG_ANY);
-	if (!xres) {
+	xres_vp = fr_pair_find_by_child_num(vps, dict_aka_root, FR_EAP_AKA_XRES, TAG_ANY);
+	if (!xres_vp) {
 		RDEBUG3("No &control:EAP-AKA-XRES attribute found, not using UMTS quintuplets");
 		return 1;
 	}
 
-	if (xres->vp_length > SIM_VECTOR_UMTS_XRES_MAX_SIZE) {
+	if (xres_vp->vp_length > SIM_VECTOR_UMTS_XRES_MAX_SIZE) {
 		REDEBUG("&control:EAP-AKA-XRES incorrect length.  Expected < "
-			STRINGIFY(EAP_AKA_XRES_MAX_SIZE) " bytes, got %zu bytes", xres->vp_length);
+			STRINGIFY(EAP_AKA_XRES_MAX_SIZE) " bytes, got %zu bytes", xres_vp->vp_length);
 		return -1;
 	}
 
-	memcpy(keys->umts.vector.autn, autn->vp_octets, SIM_VECTOR_UMTS_AUTN_SIZE);
-	memcpy(keys->umts.vector.ck, ck->vp_octets, SIM_VECTOR_UMTS_CK_SIZE);
-	memcpy(keys->umts.vector.ik, ik->vp_octets, SIM_VECTOR_UMTS_IK_SIZE);
-	memcpy(keys->umts.vector.rand, rand->vp_octets, SIM_VECTOR_UMTS_RAND_SIZE);
-	memcpy(keys->umts.vector.xres, xres->vp_octets, xres->vp_length);
-	keys->umts.vector.xres_len = xres->vp_length;	/* xres is variable length */
+	/*
+	 *	Fetch (optional) AK
+	 */
+	ak_vp = fr_pair_find_by_child_num(vps, dict_aka_root, FR_EAP_AKA_AK, TAG_ANY);
+	if (ak_vp && (ak_vp->vp_length != MILENAGE_AK_SIZE)) {
+		REDEBUG("&control:EAP-AKA-AK incorrect length.  Expected "
+			STRINGIFY(MILENAGE_AK_SIZE) " bytes, got %zu bytes", ak_vp->vp_length);
+		return -1;
+	}
+
+	/*
+	 *	Fetch (optional) SQN
+	 */
+	sqn_vp = fr_pair_find_by_child_num(vps, dict_aka_root, FR_SIM_SQN, TAG_ANY);
+	if (sqn_vp && (sqn_vp->vp_length != MILENAGE_SQN_SIZE)) {
+		REDEBUG("&control:EAP-AKA-SQN incorrect length.  Expected "
+			STRINGIFY(MILENAGE_AK_SIZE) " bytes, got %zu bytes", sqn_vp->vp_length);
+		return -1;
+	}
+
+	/*
+	 *	SQN = AUTN[0..5] ⊕ AK
+	 *	AK = AK
+	 */
+	if (ak_vp && !sqn_vp) {
+		keys->sqn = uint48_from_buff(autn_vp->vp_octets) ^ uint48_from_buff(ak_vp->vp_octets);
+		memcpy(keys->umts.vector.ak, ak_vp->vp_octets, sizeof(keys->umts.vector.ak));
+	/*
+	 *	SQN = SQN
+	 *	AK = AUTN[0..5] ⊕ SQN
+	 */
+	} else if (sqn_vp && !ak_vp) {
+		keys->sqn = sqn_vp->vp_uint64;
+		uint48_to_buff(keys->umts.vector.ak, uint48_from_buff(autn_vp->vp_octets) ^ sqn_vp->vp_uint64);
+	/*
+	 *	SQN = SQN
+	 *	AK = AK
+	 */
+	} else if (sqn_vp && ak_vp) {
+		keys->sqn = sqn_vp->vp_uint64;
+		memcpy(keys->umts.vector.ak, ak_vp->vp_octets, sizeof(keys->umts.vector.ak));
+	/*
+	 *	SQN = AUTN[0..5]
+	 *	AK = 0x000000000000
+	 */
+	} else {
+		keys->sqn = uint48_from_buff(autn_vp->vp_octets);
+		memset(keys->umts.vector.ak, 0, sizeof(keys->umts.vector.ak));
+	}
+
+	memcpy(keys->umts.vector.autn, autn_vp->vp_octets, SIM_VECTOR_UMTS_AUTN_SIZE);
+	memcpy(keys->umts.vector.ck, ck_vp->vp_octets, SIM_VECTOR_UMTS_CK_SIZE);
+	memcpy(keys->umts.vector.ik, ik_vp->vp_octets, SIM_VECTOR_UMTS_IK_SIZE);
+	memcpy(keys->umts.vector.rand, rand_vp->vp_octets, SIM_VECTOR_UMTS_RAND_SIZE);
+	memcpy(keys->umts.vector.xres, xres_vp->vp_octets, xres_vp->vp_length);
+	keys->umts.vector.xres_len = xres_vp->vp_length;	/* xres is variable length */
 
 	return 0;
 }

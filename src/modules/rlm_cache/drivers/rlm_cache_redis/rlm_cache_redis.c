@@ -39,8 +39,8 @@ typedef struct rlm_cache_redis {
 	fr_redis_conf_t		conf;		//!< Connection parameters for the Redis server.
 						//!< Must be first field in this struct.
 
-	vp_tmpl_t		created_attr;	//!< LHS of the Cache-Created map.
-	vp_tmpl_t		expires_attr;	//!< LHS of the Cache-Expires map.
+	vp_tmpl_t		*created_attr;	//!< LHS of the Cache-Created map.
+	vp_tmpl_t		*expires_attr;	//!< LHS of the Cache-Expires map.
 
 	fr_redis_cluster_t	*cluster;
 } rlm_cache_redis_t;
@@ -56,7 +56,8 @@ static int mod_instantiate(rlm_cache_config_t const *config, void *instance, CON
 
 	buffer[0] = '\0';
 
-	if (cf_section_parse(conf, driver, driver_config) < 0) return -1;
+	if (cf_section_rules_push(conf, driver_config) < 0) return -1;
+	if (cf_section_parse(driver, driver, conf) < 0) return -1;
 
 	snprintf(buffer, sizeof(buffer), "rlm_cache (%s)", config->name);
 
@@ -70,14 +71,14 @@ static int mod_instantiate(rlm_cache_config_t const *config, void *instance, CON
 	/*
 	 *	These never change, so do it once on instantiation
 	 */
-	if (tmpl_from_attr_str(&driver->created_attr, "&Cache-Created",
-			       REQUEST_CURRENT, PAIR_LIST_REQUEST, false, false) < 0) {
+	if (tmpl_afrom_attr_str(driver, &driver->created_attr, "&Cache-Created",
+			        REQUEST_CURRENT, PAIR_LIST_REQUEST, false, false) < 0) {
 		ERROR("Cache-Created attribute not defined");
 		return -1;
 	}
 
-	if (tmpl_from_attr_str(&driver->expires_attr, "&Cache-Expires",
-			       REQUEST_CURRENT, PAIR_LIST_REQUEST, false, false) < 0) {
+	if (tmpl_afrom_attr_str(driver, &driver->expires_attr, "&Cache-Expires",
+			        REQUEST_CURRENT, PAIR_LIST_REQUEST, false, false) < 0) {
 		ERROR("Cache-Expires attribute not defined");
 		return -1;
 	}
@@ -184,7 +185,7 @@ static cache_status_t cache_entry_find(rlm_cache_entry_t **out,
 	 *	are three chunks per map
 	 */
 
-	c = talloc_pooled_object(NULL,  rlm_cache_entry_t, reply->elements, pool_size);
+	c = talloc_pooled_object(NULL, rlm_cache_entry_t, reply->elements, pool_size);
 	memset(&pool, 0, sizeof(rlm_cache_entry_t));
 #else
 	c = talloc_zero(NULL, rlm_cache_entry_t);
@@ -206,10 +207,10 @@ static cache_status_t cache_entry_find(rlm_cache_entry_t **out,
 	/*
 	 *	Pull out the cache created date
 	 */
-	if ((head->lhs->tmpl_da->vendor == 0) && (head->lhs->tmpl_da->attr == PW_CACHE_CREATED)) {
+	if ((head->lhs->tmpl_da->vendor == 0) && (head->lhs->tmpl_da->attr == FR_CACHE_CREATED)) {
 		vp_map_t *map;
 
-		c->created = head->rhs->tmpl_data_value.date;
+		c->created = head->rhs->tmpl_value.vb_date;
 
 		map = head;
 		head = head->next;
@@ -219,10 +220,10 @@ static cache_status_t cache_entry_find(rlm_cache_entry_t **out,
 	/*
 	 *	Pull out the cache expires date
 	 */
-	if ((head->lhs->tmpl_da->vendor == 0) && (head->lhs->tmpl_da->attr == PW_CACHE_EXPIRES)) {
+	if ((head->lhs->tmpl_da->vendor == 0) && (head->lhs->tmpl_da->attr == FR_CACHE_EXPIRES)) {
 		vp_map_t *map;
 
-		c->expires = head->rhs->tmpl_data_value.date;
+		c->expires = head->rhs->tmpl_value.vb_date;
 
 		map = head;
 		head = head->next;
@@ -262,7 +263,7 @@ static cache_status_t cache_entry_insert(UNUSED rlm_cache_config_t const *config
 	char const		**argv_p;
 	size_t			*argv_len_p;
 
-	int			pipelined = 0;	/* How many commands pending in the pipeline */
+	unsigned int		pipelined = 0;	/* How many commands pending in the pipeline */
 	redisReply		*replies[5];	/* Should have the same number of elements as pipelined commands */
 	size_t			reply_num = 0, i;
 
@@ -272,14 +273,14 @@ static cache_status_t cache_entry_insert(UNUSED rlm_cache_config_t const *config
 	vp_tmpl_t		expires_value;
 	vp_map_t		expires = {
 					.op	= T_OP_SET,
-					.lhs	= &driver->expires_attr,
+					.lhs	= driver->expires_attr,
 					.rhs	= &expires_value,
 				};
 
 	vp_tmpl_t		created_value;
 	vp_map_t		created = {
 					.op	= T_OP_SET,
-					.lhs	= &driver->created_attr,
+					.lhs	= driver->created_attr,
 					.rhs	= &created_value,
 					.next	= &expires
 				};
@@ -288,9 +289,8 @@ static cache_status_t cache_entry_insert(UNUSED rlm_cache_config_t const *config
 	 *	Encode the entry created date
 	 */
 	tmpl_init(&created_value, TMPL_TYPE_DATA, "<TEMP>", 6, T_BARE_WORD);
-	created_value.tmpl_data_type = PW_TYPE_DATE;
-	created_value.tmpl_data_length = sizeof(created_value.tmpl_data_value.date);
-	created_value.tmpl_data_value.date = c->created;
+	created_value.tmpl_value_type = FR_TYPE_DATE;
+	created_value.tmpl_value.vb_date = c->created;
 
 	/*
 	 *	Encode the entry expiry time
@@ -299,9 +299,8 @@ static cache_status_t cache_entry_insert(UNUSED rlm_cache_config_t const *config
 	 *	to ignore entries that were created before the last epoch.
 	 */
 	tmpl_init(&expires_value, TMPL_TYPE_DATA, "<TEMP>", 6, T_BARE_WORD);
-	expires_value.tmpl_data_type = PW_TYPE_DATE;
-	expires_value.tmpl_data_length = sizeof(expires_value.tmpl_data_value.date);
-	expires_value.tmpl_data_value.date = c->expires;
+	expires_value.tmpl_value_type = FR_TYPE_DATE;
+	expires_value.tmpl_value.vb_date = c->expires;
 	expires.next = c->maps;	/* Head of the list */
 
 	for (cnt = 0, map = &created; map; cnt++, map = map->next);
@@ -396,14 +395,15 @@ static cache_status_t cache_entry_insert(UNUSED rlm_cache_config_t const *config
 			pipelined++;
 		}
 
-		reply_num = fr_redis_pipeline_result(&status, replies, sizeof(replies) / sizeof(*replies),
-						     conn, pipelined);
+		reply_num = fr_redis_pipeline_result(&pipelined, &status,
+						     replies, sizeof(replies) / sizeof(*replies),
+						     conn);
 		reply = replies[0];
 	}
 	talloc_free(pool);
 
 	if (s_ret != REDIS_RCODE_SUCCESS) {
-		RERROR("Failed inserting entry");
+		RPERROR("Failed inserting entry");
 		return CACHE_ERROR;
 	}
 
@@ -423,7 +423,7 @@ static cache_status_t cache_entry_insert(UNUSED rlm_cache_config_t const *config
  * @copydetails cache_entry_expire_t
  */
 static cache_status_t cache_entry_expire(UNUSED rlm_cache_config_t const *config, void *instance,
-					 REQUEST *request, UNUSED void *handle,  uint8_t const *key, size_t key_len)
+					 REQUEST *request, UNUSED void *handle, uint8_t const *key, size_t key_len)
 {
 	rlm_cache_redis_t		*driver = instance;
 	fr_redis_cluster_state_t	state;
@@ -431,6 +431,7 @@ static cache_status_t cache_entry_expire(UNUSED rlm_cache_config_t const *config
 	fr_redis_rcode_t			status;
 	redisReply			*reply = NULL;
 	int				s_ret;
+	cache_status_t			cache_status;
 
 	for (s_ret = fr_redis_cluster_state_init(&state, &conn, driver->cluster, request, key, key_len, false);
 	     s_ret == REDIS_RCODE_TRY_AGAIN;	/* Continue */
@@ -448,9 +449,10 @@ static cache_status_t cache_entry_expire(UNUSED rlm_cache_config_t const *config
 	if (!rad_cond_assert(reply)) goto error;
 
 	if (reply->type == REDIS_REPLY_INTEGER) {
+		cache_status = CACHE_MISS;
+		if (reply->integer) cache_status = CACHE_OK;    /* Affected */
 		fr_redis_reply_free(reply);
-		if (reply->integer) return CACHE_OK;	/* Affected */
-		return CACHE_MISS;
+		return cache_status;
 	}
 
 	REDEBUG("Bad result type, expected integer, got %s",

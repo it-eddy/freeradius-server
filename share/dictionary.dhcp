@@ -2,7 +2,7 @@
 # Copyright (C) 2015 The FreeRADIUS Server project and contributors
 ##############################################################################
 #
-#	DHCP to RADUS gateway dictionary.
+#	DHCP to RADIUS gateway dictionary.
 #
 #	http://www.iana.org/assignments/bootp-dhcp-parameters
 #
@@ -32,7 +32,7 @@ VENDOR		DHCP				54
 
 BEGIN-VENDOR	DHCP
 
-FLAGS		internal
+FLAGS	internal
 ATTRIBUTE	DHCP-Opcode				256	byte
 
 VALUE	DHCP-Opcode			Client-Message		1
@@ -338,8 +338,8 @@ ATTRIBUTE	DHCP-Call-Server-IP-address		129	octets
 ATTRIBUTE	DHCP-Ethernet-Interface			130	octets
 ATTRIBUTE	DHCP-Vendor-Discrimination-Str		130	octets
 ATTRIBUTE	DHCP-Remote-Stats-Svr-IP-Address	131	octets
-ATTRIBUTE	DHCP-IEEE-802.1P-VLAN-ID		132	octets
-ATTRIBUTE	DHCP-IEEE-802.1Q-L2-Priority		133	octets
+ATTRIBUTE	DHCP-IEEE-802.1Q-VLAN-ID		132	octets
+ATTRIBUTE	DHCP-IEEE-802.1P-L2-Priority		133	octets
 ATTRIBUTE	DHCP-Diffserv-Code-Point		134	octets
 ATTRIBUTE	DHCP-HTTP-Proxy				135	octets
 

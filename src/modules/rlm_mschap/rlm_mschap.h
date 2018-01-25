@@ -10,7 +10,7 @@ RCSIDH(rlm_mschap_h, "$Id$")
 #ifdef WITH_AUTH_WINBIND
 #  include <wbclient.h>
 
-#include <freeradius-devel/connection.h>
+#include <freeradius-devel/pool.h>
 #endif
 
 /* Method of authentication we are going to use */
@@ -41,7 +41,8 @@ typedef struct rlm_mschap_t {
 	vp_tmpl_t		*wb_username;
 	vp_tmpl_t		*wb_domain;
 #ifdef WITH_AUTH_WINBIND
-	fr_connection_pool_t    *wb_pool;
+	fr_pool_t	*wb_pool;
+	bool			wb_retry_with_normalised_username;
 #endif
 #ifdef __APPLE__
 	bool			open_directory;

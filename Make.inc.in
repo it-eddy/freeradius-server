@@ -45,13 +45,14 @@ MAKE		= @MAKE@
 # flags set on the command line and the environmental variables
 MAKEFLAGS	= @FR_MAKEFLAGS@
 
+TARGET_SYSTEM	= @TARGET_SYSTEM@
 CC		= @CC@
 RANLIB		= @RANLIB@
-INCLUDE		= -I${top_srcdir} -I${top_srcdir}/src \
-		  -include ${top_srcdir}/src/freeradius-devel/autoconf.h \
-		  -include ${top_srcdir}/src/freeradius-devel/build.h \
-		  -include ${top_srcdir}/src/freeradius-devel/features.h \
-		  -include ${top_srcdir}/src/freeradius-devel/radpaths.h
+INCLUDE		= -I. -Isrc \
+		  -include src/freeradius-devel/autoconf.h \
+		  -include src/freeradius-devel/build.h \
+		  -include src/freeradius-devel/features.h \
+		  -include src/freeradius-devel/radpaths.h
 CFLAGS		= $(INCLUDE) -fno-strict-aliasing @CFLAGS@
 CPPFLAGS	= @CPPFLAGS@
 LIBPREFIX	= @LIBPREFIX@
@@ -74,6 +75,9 @@ INSTALLSTRIP	= @INSTALLSTRIP@
 TALLOC_LIBS     = @TALLOC_LIBS@
 TALLOC_LDFLAGS  = @TALLOC_LDFLAGS@
 
+KQUEUE_LIBS     = @KQUEUE_LIBS@
+KQUEUE_LDFLAGS  = @KQUEUE_LDFLAGS@
+
 OPENSSL_LIBS    = @OPENSSL_LIBS@
 OPENSSL_LDFLAGS = @OPENSSL_LDFLAGS@
 OPENSSL_CPPFLAGS = @OPENSSL_CPPFLAGS@
@@ -87,28 +91,27 @@ COLLECTDC_LDFLAGS = @COLLECTDC_LDFLAGS@
 GPERFTOOLS_LIBS	= @GPERFTOOLS_LIBS@
 GPERFTOOLS_LDFLAGS = @GPERFTOOLS_LDFLAGS@
 
+SYSTEMD_LIBS = @SYSTEMD_LIBS@
+SYSTEMD_LDFLAGS = @SYSTEMD_LDFLAGS@
+
 LCRYPT		= @CRYPTLIB@
 
 #
 #  OpenSSL libs (if used) must be linked everywhere in order for
 #  the server to work properly on on all platforms.
 #
-LIBS		= $(OPENSSL_LIBS) $(TALLOC_LIBS) @LIBS@
-LDFLAGS		= $(OPENSSL_LDFLAGS) $(TALLOC_LDFLAGS) @LDFLAGS@
+LIBS		= $(OPENSSL_LIBS) $(TALLOC_LIBS) $(KQUEUE_LIBS) @LIBS@
+LDFLAGS		= $(OPENSSL_LDFLAGS) $(TALLOC_LDFLAGS) $(KQUEUE_LDFLAGS) @LDFLAGS@
 
 LOGDIR		= ${logdir}
 RADDBDIR	= ${raddbdir}
 RUNDIR		= ${localstatedir}/run/radiusd
 SBINDIR		= ${sbindir}
 RADIR		= ${radacctdir}
-LIBRADIUS	= $(top_builddir)/src/lib/$(LIBPREFIX)freeradius-radius.la $(TALLOC_LIBS)
 
-USE_SHARED_LIBS = @USE_SHARED_LIBS@
-bm_shared_libs  = @USE_SHARED_LIBS@
-USE_STATIC_LIBS = @USE_STATIC_LIBS@
-bm_static_libs  = @USE_STATIC_LIBS@
+bm_shared_libs  = yes
+bm_static_libs  = yes
 
-STATIC_MODULES	= @STATIC_MODULES@
 LIBREADLINE	= @LIBREADLINE@
 
 #
@@ -122,7 +125,6 @@ RADIUSD_VERSION_STRING = @RADIUSD_VERSION_STRING@
 #  actually loading.
 #
 MODULES		= @MODULES@
-HOSTINFO	= @HOSTINFO@
 
 #
 #  If the system has OpenSSL, use it's version of MD4/MD5/SHA1, instead of
@@ -131,28 +133,29 @@ HOSTINFO	= @HOSTINFO@
 #  We don't use OpenSSL SHA1 by default because src/modules/rlm_eap/libeap/fips186prf.c
 #  needs access to the SHA internals.
 #
-ifeq "$(WITH_OPENSSL)" "yes"
-CFLAGS		+=  -DWITH_OPENSSL_MD4 -DWITH_OPENSSL_MD5
-CPPFLAGS	:= "$(OPENSSL_CPPFLAGS) $(CPPFLAGS)"
+ifneq ($(OPENSSL_LIBS),)
+CFLAGS			+=  -DWITH_OPENSSL_MD4 -DWITH_OPENSSL_MD5
+CPPFLAGS		:= $(OPENSSL_CPPFLAGS) $(CPPFLAGS)
+#
+#  Add optional dependency for libfreeradius-server if we're building with OpenSSL
+#
+LIBFREERADIUS_SERVER	:= libfreeradius-tls.a
 endif
-
-OPENSSL_LIBS	= @OPENSSL_LIBS@
+LIBFREERADIUS_SERVER	+= libfreeradius-server.a
 
 ifneq ($(WITH_OPENSSL_MD5),)
-LIBRADIUS_WITH_OPENSSL = 1
+WITH_OPENSSL_DIGEST = 1
 CFLAGS += -DWITH_OPENSSL_MD5
 endif
 
 ifneq ($(WITH_OPENSSL_SHA1),)
-LIBRADIUS_WITH_OPENSSL = 1
+WITH_OPENSSL_DIGEST = 1
 CFLAGS += -DWITH_OPENSSL_SHA1
 endif
 
-ifneq ($(LIBRADIUS_WITH_OPENSSL),)
+ifneq ($(WITH_OPENSSL_DIGEST),)
 ifeq ($(OPENSSL_LIBS),)
 $(error OPENSSL_LIBS must be define in order to use WITH_OPENSSL_*)
-else
-LIBRADIUS += $(OPENSSL_LIBS)
 endif
 endif
 
@@ -161,13 +164,7 @@ endif
 ANALYZE.c       := @clang_path@
 
 #
-#  With shared libs, the test binaries are in a different place
-#  AND the method we use to run those binaries changes.
+#  Have wrappers for the test tools, so that they run.
 #
-ifeq "$(USE_SHARED_LIBS)" "yes"
-	TESTBINDIR = ./$(BUILD_DIR)/bin/local
-	TESTBIN    =  $(JLIBTOOL) --quiet --mode=execute $(TESTBINDIR)
-else
-	TESTBINDIR = ./$(BUILD_DIR)/bin
-	TESTBIN    = ./$(BUILD_DIR)/bin
-endif
+TESTBINDIR = ./$(BUILD_DIR)/bin/local
+TESTBIN    =  $(JLIBTOOL) --quiet --mode=execute $(TESTBINDIR)

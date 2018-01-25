@@ -74,20 +74,20 @@ typedef struct rlm_sqlcounter_t {
 } rlm_sqlcounter_t;
 
 static const CONF_PARSER module_config[] = {
-	{ FR_CONF_OFFSET("sql_module_instance", PW_TYPE_STRING | PW_TYPE_REQUIRED, rlm_sqlcounter_t, sqlmod_inst) },
+	{ FR_CONF_OFFSET("sql_module_instance", FR_TYPE_STRING | FR_TYPE_REQUIRED, rlm_sqlcounter_t, sqlmod_inst) },
 
 
-	{ FR_CONF_OFFSET("query", PW_TYPE_STRING | PW_TYPE_XLAT | PW_TYPE_REQUIRED, rlm_sqlcounter_t, query) },
-	{ FR_CONF_OFFSET("reset", PW_TYPE_STRING | PW_TYPE_REQUIRED, rlm_sqlcounter_t, reset) },
+	{ FR_CONF_OFFSET("query", FR_TYPE_STRING | FR_TYPE_XLAT | FR_TYPE_REQUIRED, rlm_sqlcounter_t, query) },
+	{ FR_CONF_OFFSET("reset", FR_TYPE_STRING | FR_TYPE_REQUIRED, rlm_sqlcounter_t, reset) },
 
-	{ FR_CONF_OFFSET("key", PW_TYPE_TMPL | PW_TYPE_ATTRIBUTE, rlm_sqlcounter_t, key_attr), .dflt = "&request:User-Name", .quote = T_BARE_WORD },
+	{ FR_CONF_OFFSET("key", FR_TYPE_TMPL | FR_TYPE_ATTRIBUTE, rlm_sqlcounter_t, key_attr), .dflt = "&request:User-Name", .quote = T_BARE_WORD },
 
 	/* Just used to register a paircompare against */
-	{ FR_CONF_OFFSET("counter_name", PW_TYPE_TMPL | PW_TYPE_ATTRIBUTE | PW_TYPE_REQUIRED, rlm_sqlcounter_t, paircmp_attr) },
-	{ FR_CONF_OFFSET("check_name", PW_TYPE_TMPL | PW_TYPE_ATTRIBUTE | PW_TYPE_REQUIRED, rlm_sqlcounter_t, limit_attr) },
+	{ FR_CONF_OFFSET("counter_name", FR_TYPE_TMPL | FR_TYPE_ATTRIBUTE | FR_TYPE_REQUIRED, rlm_sqlcounter_t, paircmp_attr) },
+	{ FR_CONF_OFFSET("check_name", FR_TYPE_TMPL | FR_TYPE_ATTRIBUTE | FR_TYPE_REQUIRED, rlm_sqlcounter_t, limit_attr) },
 
 	/* Attribute to write remaining session to */
-	{ FR_CONF_OFFSET("reply_name", PW_TYPE_TMPL | PW_TYPE_ATTRIBUTE, rlm_sqlcounter_t, reply_attr) },
+	{ FR_CONF_OFFSET("reply_name", FR_TYPE_TMPL | FR_TYPE_ATTRIBUTE, rlm_sqlcounter_t, reply_attr) },
 	CONF_PARSER_TERMINATOR
 };
 
@@ -234,7 +234,7 @@ static int find_prev_reset(rlm_sqlcounter_t *inst, time_t timeval)
  *	%S	sqlmod_inst
  *
  */
-static size_t sqlcounter_expand(char *out, int outlen, rlm_sqlcounter_t *inst, REQUEST *request, char const *fmt)
+static size_t sqlcounter_expand(char *out, int outlen, rlm_sqlcounter_t const *inst, REQUEST *request, char const *fmt)
 {
 	int freespace;
 	char const *p;
@@ -333,9 +333,9 @@ static size_t sqlcounter_expand(char *out, int outlen, rlm_sqlcounter_t *inst, R
  *	See if the counter matches.
  */
 static int counter_cmp(void *instance, REQUEST *request, UNUSED VALUE_PAIR *req , VALUE_PAIR *check,
-			  UNUSED VALUE_PAIR *check_pairs, UNUSED VALUE_PAIR **reply_pairs)
+		       UNUSED VALUE_PAIR *check_pairs, UNUSED VALUE_PAIR **reply_pairs)
 {
-	rlm_sqlcounter_t *inst = instance;
+	rlm_sqlcounter_t const *inst = instance;
 	uint64_t counter;
 
 	char query[MAX_QUERY_LEN], subst[MAX_QUERY_LEN];
@@ -358,7 +358,7 @@ static int counter_cmp(void *instance, REQUEST *request, UNUSED VALUE_PAIR *req 
 	}
 
 	/* Finally, xlat resulting SQL query */
-	if (radius_axlat(&expanded, request, query, NULL, NULL) < 0) {
+	if (xlat_aeval(request, &expanded, request, query, NULL, NULL) < 0) {
 		return RLM_MODULE_FAIL;
 	}
 
@@ -367,8 +367,8 @@ static int counter_cmp(void *instance, REQUEST *request, UNUSED VALUE_PAIR *req 
 	}
 	talloc_free(expanded);
 
-	if (counter < check->vp_integer64) return -1;
-	if (counter > check->vp_integer64) return 1;
+	if (counter < check->vp_uint64) return -1;
+	if (counter > check->vp_uint64) return 1;
 	return 0;
 }
 
@@ -378,7 +378,7 @@ static int counter_cmp(void *instance, REQUEST *request, UNUSED VALUE_PAIR *req 
  *	from the database. The authentication code only needs to check
  *	the password, the rest is done here.
  */
-static rlm_rcode_t CC_HINT(nonnull) mod_authorize(void *instance, REQUEST *request)
+static rlm_rcode_t CC_HINT(nonnull) mod_authorize(void *instance, UNUSED void *thread, REQUEST *request)
 {
 	rlm_sqlcounter_t	*inst = instance;
 	uint64_t		counter, res;
@@ -409,7 +409,7 @@ static rlm_rcode_t CC_HINT(nonnull) mod_authorize(void *instance, REQUEST *reque
 	 *      The REAL username, after stripping.
 	 */
 	if ((inst->key_attr->tmpl_list == PAIR_LIST_REQUEST) &&
-	    (inst->key_attr->tmpl_da->vendor == 0) && (inst->key_attr->tmpl_da->attr == PW_USER_NAME)) {
+	    (inst->key_attr->tmpl_da->vendor == 0) && (inst->key_attr->tmpl_da->attr == FR_USER_NAME)) {
 		key_vp = request->username;
 	} else {
 		tmpl_find_vp(&key_vp, request, inst->key_attr);
@@ -440,7 +440,7 @@ static rlm_rcode_t CC_HINT(nonnull) mod_authorize(void *instance, REQUEST *reque
 	}
 
 	/* Finally, xlat resulting SQL query */
-	if (radius_axlat(&expanded, request, query, NULL, NULL) < 0) {
+	if (xlat_aeval(request, &expanded, request, query, NULL, NULL) < 0) {
 		return RLM_MODULE_FAIL;
 	}
 	talloc_free(expanded);
@@ -454,21 +454,21 @@ static rlm_rcode_t CC_HINT(nonnull) mod_authorize(void *instance, REQUEST *reque
 	/*
 	 *	Check if check item > counter
 	 */
-	if (limit->vp_integer64 <= counter) {
+	if (limit->vp_uint64 <= counter) {
 		/* User is denied access, send back a reply message */
 		snprintf(msg, sizeof(msg), "Your maximum %s usage time has been reached", inst->reset);
 		pair_make_reply("Reply-Message", msg, T_OP_EQ);
 
 		REDEBUG2("Maximum %s usage time reached", inst->reset);
 		REDEBUG2("Rejecting user, %s value (%" PRIu64 ") is less than counter value (%" PRIu64 ")",
-			 inst->limit_attr->name, limit->vp_integer64, counter);
+			 inst->limit_attr->name, limit->vp_uint64, counter);
 
 		return RLM_MODULE_REJECT;
 	}
 
-	res = limit->vp_integer64 - counter;
+	res = limit->vp_uint64 - counter;
 	RDEBUG2("Allowing user, %s value (%" PRIu64 ") is greater than counter value (%" PRIu64 ")",
-		inst->limit_attr->name, limit->vp_integer64, counter);
+		inst->limit_attr->name, limit->vp_uint64, counter);
 
 	/*
 	 *	We are assuming that simultaneous-use=1. But
@@ -483,13 +483,13 @@ static rlm_rcode_t CC_HINT(nonnull) mod_authorize(void *instance, REQUEST *reque
 		 *	again.  Do this only for Session-Timeout.
 		 */
 		if (((inst->reply_attr->tmpl_da->vendor == 0) &&
-		     (inst->reply_attr->tmpl_da->attr == PW_SESSION_TIMEOUT)) &&
+		     (inst->reply_attr->tmpl_da->attr == FR_SESSION_TIMEOUT)) &&
 		    inst->reset_time && (res >= (uint64_t)(inst->reset_time - request->packet->timestamp.tv_sec))) {
 			uint64_t to_reset = inst->reset_time - request->packet->timestamp.tv_sec;
 
 			RDEBUG2("Time remaining (%" PRIu64 "s) is greater than time to reset (%" PRIu64 "s).  "
 				"Adding %" PRIu64 "s to reply value", to_reset, res, to_reset);
-			res = to_reset + limit->vp_integer;
+			res = to_reset + limit->vp_uint32;
 		}
 
 		/*
@@ -501,9 +501,9 @@ static rlm_rcode_t CC_HINT(nonnull) mod_authorize(void *instance, REQUEST *reque
 			break;
 
 		case 0:		/* found */
-			if (reply_item->vp_integer64 <= res) {
+			if (reply_item->vp_uint64 <= res) {
 				RDEBUG2("Leaving existing %s value of %" PRIu64, inst->reply_attr->name,
-					reply_item->vp_integer64);
+					reply_item->vp_uint64);
 				return RLM_MODULE_OK;
 			}
 			break;
@@ -516,7 +516,7 @@ static rlm_rcode_t CC_HINT(nonnull) mod_authorize(void *instance, REQUEST *reque
 			RDEBUG2("List or request context not available for %s, skipping...", inst->reply_attr->name);
 			return RLM_MODULE_OK;
 		}
-		reply_item->vp_integer64 = res;
+		reply_item->vp_uint64 = res;
 		rdebug_pair(L_DBG_LVL_2, request, reply_item, NULL);
 
 		return RLM_MODULE_UPDATED;
@@ -535,7 +535,7 @@ static rlm_rcode_t CC_HINT(nonnull) mod_authorize(void *instance, REQUEST *reque
  *	that must be referenced in later calls, store a handle to it
  *	in *instance otherwise put a null pointer there.
  */
-static int mod_instantiate(CONF_SECTION *conf, void *instance)
+static int mod_instantiate(void *instance, CONF_SECTION *conf)
 {
 	rlm_sqlcounter_t	*inst = instance;
 	time_t			now;
@@ -546,7 +546,7 @@ static int mod_instantiate(CONF_SECTION *conf, void *instance)
 	inst->reset_time = 0;
 
 	if (find_next_reset(inst, now) == -1) {
-		cf_log_err_cs(conf, "Invalid reset '%s'", inst->reset);
+		cf_log_err(conf, "Invalid reset '%s'", inst->reset);
 		return -1;
 	}
 
@@ -556,16 +556,16 @@ static int mod_instantiate(CONF_SECTION *conf, void *instance)
 	inst->last_reset = 0;
 
 	if (find_prev_reset(inst, now) < 0) {
-		cf_log_err_cs(conf, "Invalid reset '%s'", inst->reset);
+		cf_log_err(conf, "Invalid reset '%s'", inst->reset);
 		return -1;
 	}
 
 	return 0;
 }
 
-static int mod_bootstrap(CONF_SECTION *conf, void *instance)
+static int mod_bootstrap(void *instance, CONF_SECTION *conf)
 {
-	rlm_sqlcounter_t	*inst = instance;
+	rlm_sqlcounter_t		*inst = instance;
 	fr_dict_attr_flags_t		flags;
 
 	/*
@@ -576,32 +576,30 @@ static int mod_bootstrap(CONF_SECTION *conf, void *instance)
 
 	memset(&flags, 0, sizeof(flags));
 	flags.compare = 1;	/* ugly hack */
-	if (tmpl_define_undefined_attr(inst->paircmp_attr, PW_TYPE_INTEGER64, &flags) < 0) {
-		cf_log_err_cs(conf, "Failed defining counter attribute: %s", fr_strerror());
+	if (tmpl_define_undefined_attr(inst->paircmp_attr, FR_TYPE_UINT64, &flags) < 0) {
+		cf_log_perr(conf, "Failed defining counter attribute");
 		return -1;
 	}
 
 	flags.compare = 0;
-	if (tmpl_define_undefined_attr(inst->limit_attr, PW_TYPE_INTEGER64, &flags) < 0) {
-		cf_log_err_cs(conf, "Failed defining check attribute: %s", fr_strerror());
+	if (tmpl_define_undefined_attr(inst->limit_attr, FR_TYPE_UINT64, &flags) < 0) {
+		cf_log_perr(conf, "Failed defining check attribute");
 		return -1;
 	}
 
-	if (inst->paircmp_attr->tmpl_da->type != PW_TYPE_INTEGER64) {
-		cf_log_err_cs(conf, "Counter attribute %s MUST be integer64",
-			      inst->paircmp_attr->tmpl_da->name);
+	if (inst->paircmp_attr->tmpl_da->type != FR_TYPE_UINT64) {
+		cf_log_err(conf, "Counter attribute %s MUST be uint64", inst->paircmp_attr->tmpl_da->name);
 		return -1;
 	}
 	if (paircompare_register_byname(inst->paircmp_attr->tmpl_da->name, NULL, true,
 					counter_cmp, inst) < 0) {
-		cf_log_err_cs(conf, "Failed registering comparison function for counter attribute %s: %s",
-			      inst->paircmp_attr->tmpl_da->name, fr_strerror());
+		cf_log_perr(conf, "Failed registering comparison function for counter attribute %s",
+			    inst->paircmp_attr->tmpl_da->name);
 		return -1;
 	}
 
-	if (inst->limit_attr->tmpl_da->type != PW_TYPE_INTEGER64) {
-		cf_log_err_cs(conf, "Check attribute %s MUST be integer64",
-			      inst->limit_attr->tmpl_da->name);
+	if (inst->limit_attr->tmpl_da->type != FR_TYPE_UINT64) {
+		cf_log_err(conf, "Check attribute %s MUST be uint64", inst->limit_attr->tmpl_da->name);
 		return -1;
 	}
 

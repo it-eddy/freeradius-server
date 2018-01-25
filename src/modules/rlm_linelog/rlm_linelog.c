@@ -56,9 +56,9 @@ typedef enum {
 	LINELOG_DST_UNIX,				//!< Log via Unix socket.
 	LINELOG_DST_UDP,				//!< Log via UDP.
 	LINELOG_DST_TCP,				//!< Log via TCP.
-} linelog_dst_t;
+} linefr_log_dst_t;
 
-static FR_NAME_NUMBER const linelog_dst_table[] = {
+static FR_NAME_NUMBER const linefr_log_dst_table[] = {
 	{ "file",	LINELOG_DST_FILE	},
 	{ "syslog",	LINELOG_DST_SYSLOG	},
 	{ "unix",	LINELOG_DST_UNIX	},
@@ -78,19 +78,19 @@ typedef struct linelog_net {
 /** linelog module instance
  */
 typedef struct linelog_instance_t {
-	char const		*name;			//!< Module instance name.
-	fr_connection_pool_t	*pool;			//!< Connection pool instance.
+	char const			*name;			//!< Module instance name.
+	fr_pool_t			*pool;			//!< Connection pool instance.
 
-	char const		*delimiter;		//!< Line termination string (usually \n).
-	size_t			delimiter_len;		//!< Length of line termination string.
+	char const			*delimiter;		//!< Line termination string (usually \n).
+	size_t				delimiter_len;		//!< Length of line termination string.
 
-	vp_tmpl_t		*log_src;		//!< Source of log messages.
+	vp_tmpl_t			*log_src;		//!< Source of log messages.
 
-	vp_tmpl_t		*log_ref;		//!< Path to a #CONF_PAIR (to use as the source of
-							///< log messages).
+	vp_tmpl_t			*log_ref;		//!< Path to a #CONF_PAIR (to use as the source of
+								///< log messages).
 
-	linelog_dst_t		log_dst;		//!< Logging destination.
-	char const		*log_dst_str;		//!< Logging destination string.
+	linefr_log_dst_t		log_dst;		//!< Logging destination.
+	char const			*log_dst_str;		//!< Logging destination string.
 
 	struct {
 		char const		*facility;		//!< Syslog facility string.
@@ -125,63 +125,63 @@ typedef struct linelog_conn {
 
 
 static const CONF_PARSER file_config[] = {
-	{ FR_CONF_OFFSET("filename", PW_TYPE_FILE_OUTPUT | PW_TYPE_XLAT, linelog_instance_t, file.name) },
-	{ FR_CONF_OFFSET("permissions", PW_TYPE_INTEGER, linelog_instance_t, file.permissions), .dflt = "0600" },
-	{ FR_CONF_OFFSET("group", PW_TYPE_STRING, linelog_instance_t, file.group_str) },
-	{ FR_CONF_OFFSET("escape_filenames", PW_TYPE_BOOLEAN, linelog_instance_t, file.escape), .dflt = "no" },
+	{ FR_CONF_OFFSET("filename", FR_TYPE_FILE_OUTPUT | FR_TYPE_XLAT, linelog_instance_t, file.name) },
+	{ FR_CONF_OFFSET("permissions", FR_TYPE_UINT32, linelog_instance_t, file.permissions), .dflt = "0600" },
+	{ FR_CONF_OFFSET("group", FR_TYPE_STRING, linelog_instance_t, file.group_str) },
+	{ FR_CONF_OFFSET("escape_filenames", FR_TYPE_BOOL, linelog_instance_t, file.escape), .dflt = "no" },
 	CONF_PARSER_TERMINATOR
 };
 
 static const CONF_PARSER syslog_config[] = {
-	{ FR_CONF_OFFSET("facility", PW_TYPE_STRING, linelog_instance_t, syslog.facility) },
-	{ FR_CONF_OFFSET("severity", PW_TYPE_STRING, linelog_instance_t, syslog.severity), .dflt = "info" },
+	{ FR_CONF_OFFSET("facility", FR_TYPE_STRING, linelog_instance_t, syslog.facility) },
+	{ FR_CONF_OFFSET("severity", FR_TYPE_STRING, linelog_instance_t, syslog.severity), .dflt = "info" },
 	CONF_PARSER_TERMINATOR
 };
 
 static const CONF_PARSER unix_config[] = {
-	{ FR_CONF_OFFSET("filename", PW_TYPE_FILE_INPUT, linelog_instance_t, unix_sock.path) },
+	{ FR_CONF_OFFSET("filename", FR_TYPE_FILE_INPUT, linelog_instance_t, unix_sock.path) },
 	CONF_PARSER_TERMINATOR
 };
 
 static const CONF_PARSER udp_config[] = {
-	{ FR_CONF_OFFSET("server", PW_TYPE_COMBO_IP_ADDR, linelog_net_t, dst_ipaddr) },
-	{ FR_CONF_OFFSET("port", PW_TYPE_SHORT, linelog_net_t, port) },
-	{ FR_CONF_OFFSET("timeout", PW_TYPE_TIMEVAL, linelog_net_t, timeout), .dflt = "1000" },
+	{ FR_CONF_OFFSET("server", FR_TYPE_COMBO_IP_ADDR, linelog_net_t, dst_ipaddr) },
+	{ FR_CONF_OFFSET("port", FR_TYPE_UINT16, linelog_net_t, port) },
+	{ FR_CONF_OFFSET("timeout", FR_TYPE_TIMEVAL, linelog_net_t, timeout), .dflt = "1000" },
 	CONF_PARSER_TERMINATOR
 };
 
 static const CONF_PARSER tcp_config[] = {
-	{ FR_CONF_OFFSET("server", PW_TYPE_COMBO_IP_ADDR, linelog_net_t, dst_ipaddr) },
-	{ FR_CONF_OFFSET("port", PW_TYPE_SHORT, linelog_net_t, port) },
-	{ FR_CONF_OFFSET("timeout", PW_TYPE_TIMEVAL, linelog_net_t, timeout), .dflt = "1000" },
+	{ FR_CONF_OFFSET("server", FR_TYPE_COMBO_IP_ADDR, linelog_net_t, dst_ipaddr) },
+	{ FR_CONF_OFFSET("port", FR_TYPE_UINT16, linelog_net_t, port) },
+	{ FR_CONF_OFFSET("timeout", FR_TYPE_TIMEVAL, linelog_net_t, timeout), .dflt = "1000" },
 	CONF_PARSER_TERMINATOR
 };
 
 static const CONF_PARSER module_config[] = {
-	{ FR_CONF_OFFSET("destination", PW_TYPE_STRING | PW_TYPE_REQUIRED, linelog_instance_t, log_dst_str) },
+	{ FR_CONF_OFFSET("destination", FR_TYPE_STRING | FR_TYPE_REQUIRED, linelog_instance_t, log_dst_str) },
 
-	{ FR_CONF_OFFSET("delimiter", PW_TYPE_STRING, linelog_instance_t, delimiter), .dflt = "\n" },
-	{ FR_CONF_OFFSET("format", PW_TYPE_TMPL, linelog_instance_t, log_src) },
-	{ FR_CONF_OFFSET("reference", PW_TYPE_TMPL, linelog_instance_t, log_ref) },
+	{ FR_CONF_OFFSET("delimiter", FR_TYPE_STRING, linelog_instance_t, delimiter), .dflt = "\n" },
+	{ FR_CONF_OFFSET("format", FR_TYPE_TMPL, linelog_instance_t, log_src) },
+	{ FR_CONF_OFFSET("reference", FR_TYPE_TMPL, linelog_instance_t, log_ref) },
 
 	/*
 	 *	Log destinations
 	 */
-	{ FR_CONF_POINTER("file", PW_TYPE_SUBSECTION, NULL), .subcs = (void const *) file_config },
-	{ FR_CONF_POINTER("syslog", PW_TYPE_SUBSECTION, NULL), .subcs = (void const *) syslog_config },
-	{ FR_CONF_POINTER("unix", PW_TYPE_SUBSECTION, NULL), .subcs = (void const *) unix_config },
-	{ FR_CONF_OFFSET("tcp", PW_TYPE_SUBSECTION, linelog_instance_t, tcp), .subcs= (void const *) tcp_config },
-	{ FR_CONF_OFFSET("udp", PW_TYPE_SUBSECTION, linelog_instance_t, udp), .subcs = (void const *) udp_config },
+	{ FR_CONF_POINTER("file", FR_TYPE_SUBSECTION, NULL), .subcs = (void const *) file_config },
+	{ FR_CONF_POINTER("syslog", FR_TYPE_SUBSECTION, NULL), .subcs = (void const *) syslog_config },
+	{ FR_CONF_POINTER("unix", FR_TYPE_SUBSECTION, NULL), .subcs = (void const *) unix_config },
+	{ FR_CONF_OFFSET("tcp", FR_TYPE_SUBSECTION, linelog_instance_t, tcp), .subcs= (void const *) tcp_config },
+	{ FR_CONF_OFFSET("udp", FR_TYPE_SUBSECTION, linelog_instance_t, udp), .subcs = (void const *) udp_config },
 
 	/*
 	 *	Deprecated config items
 	 */
-	{ FR_CONF_OFFSET("filename", PW_TYPE_FILE_OUTPUT | PW_TYPE_DEPRECATED, linelog_instance_t, file.name) },
-	{ FR_CONF_OFFSET("permissions", PW_TYPE_INTEGER | PW_TYPE_DEPRECATED, linelog_instance_t, file.permissions) },
-	{ FR_CONF_OFFSET("group", PW_TYPE_STRING | PW_TYPE_DEPRECATED, linelog_instance_t, file.group_str) },
+	{ FR_CONF_OFFSET("filename", FR_TYPE_FILE_OUTPUT | FR_TYPE_DEPRECATED, linelog_instance_t, file.name) },
+	{ FR_CONF_OFFSET("permissions", FR_TYPE_UINT32 | FR_TYPE_DEPRECATED, linelog_instance_t, file.permissions) },
+	{ FR_CONF_OFFSET("group", FR_TYPE_STRING | FR_TYPE_DEPRECATED, linelog_instance_t, file.group_str) },
 
-	{ FR_CONF_OFFSET("syslog_facility", PW_TYPE_STRING | PW_TYPE_DEPRECATED, linelog_instance_t, syslog.facility) },
-	{ FR_CONF_OFFSET("syslog_severity", PW_TYPE_STRING | PW_TYPE_DEPRECATED, linelog_instance_t, syslog.severity) },
+	{ FR_CONF_OFFSET("syslog_facility", FR_TYPE_STRING | FR_TYPE_DEPRECATED, linelog_instance_t, syslog.facility) },
+	{ FR_CONF_OFFSET("syslog_severity", FR_TYPE_STRING | FR_TYPE_DEPRECATED, linelog_instance_t, syslog.severity) },
 	CONF_PARSER_TERMINATOR
 };
 
@@ -196,16 +196,16 @@ static int _mod_conn_free(linelog_conn_t *conn)
 
 static void *mod_conn_create(TALLOC_CTX *ctx, void *instance, struct timeval const *timeout)
 {
-	linelog_instance_t	*inst = instance;
-	linelog_conn_t		*conn;
-	int			sockfd = -1;
+	linelog_instance_t const	*inst = instance;
+	linelog_conn_t			*conn;
+	int				sockfd = -1;
 
 	switch (inst->log_dst) {
 	case LINELOG_DST_UNIX:
 		DEBUG2("Opening UNIX socket at \"%s\"", inst->unix_sock.path);
 		sockfd = fr_socket_client_unix(inst->unix_sock.path, true);
 		if (sockfd < 0) {
-			ERROR("Failed opening UNIX socket: %s", fr_strerror());
+			PERROR("Failed opening UNIX socket");
 			return NULL;
 		}
 		break;
@@ -221,7 +221,7 @@ static void *mod_conn_create(TALLOC_CTX *ctx, void *instance, struct timeval con
 
 		sockfd = fr_socket_client_tcp(NULL, &inst->tcp.dst_ipaddr, inst->tcp.port, true);
 		if (sockfd < 0) {
-			ERROR("Failed opening TCP socket: %s", fr_strerror());
+			PERROR("Failed opening TCP socket");
 			return NULL;
 		}
 		break;
@@ -235,9 +235,9 @@ static void *mod_conn_create(TALLOC_CTX *ctx, void *instance, struct timeval con
 			DEBUG2("Opening UDP connection to %s:%u", buff, inst->udp.port);
 		}
 
-		sockfd = fr_socket_client_udp(NULL, &inst->udp.dst_ipaddr, inst->udp.port, true);
+		sockfd = fr_socket_client_udp(NULL, NULL, &inst->udp.dst_ipaddr, inst->udp.port, true);
 		if (sockfd < 0) {
-			ERROR("Failed opening UDP socket: %s", fr_strerror());
+			PERROR("Failed opening UDP socket");
 			return NULL;
 		}
 		break;
@@ -259,7 +259,7 @@ static void *mod_conn_create(TALLOC_CTX *ctx, void *instance, struct timeval con
 			DEBUG2("Blocking until connection complete...");
 		}
 		if (fr_socket_wait_for_connect(sockfd, timeout) < 0) {
-			ERROR("%s", fr_strerror());
+			PERROR("Failed connecting to log destination");
 			close(sockfd);
 			return NULL;
 		}
@@ -286,7 +286,7 @@ static int mod_detach(void *instance)
 {
 	linelog_instance_t *inst = instance;
 
-	fr_connection_pool_free(inst->pool);
+	fr_pool_free(inst->pool);
 
 	return 0;
 }
@@ -295,7 +295,7 @@ static int mod_detach(void *instance)
 /*
  *	Instantiate the module.
  */
-static int mod_instantiate(CONF_SECTION *conf, void *instance)
+static int mod_instantiate(void *instance, CONF_SECTION *conf)
 {
 	linelog_instance_t	*inst = instance;
 	char			prefix[100];
@@ -309,14 +309,14 @@ static int mod_instantiate(CONF_SECTION *conf, void *instance)
 		inst->file.escape_func = rad_filename_make_safe;
 	}
 
-	inst->log_dst = fr_str2int(linelog_dst_table, inst->log_dst_str, LINELOG_DST_INVALID);
+	inst->log_dst = fr_str2int(linefr_log_dst_table, inst->log_dst_str, LINELOG_DST_INVALID);
 	if (inst->log_dst == LINELOG_DST_INVALID) {
-		cf_log_err_cs(conf, "Invalid log destination \"%s\"", inst->log_dst_str);
+		cf_log_err(conf, "Invalid log destination \"%s\"", inst->log_dst_str);
 		return -1;
 	}
 
 	if (!inst->log_src && !inst->log_ref) {
-		cf_log_err_cs(conf, "Must specify a log format, or reference");
+		cf_log_err(conf, "Must specify a log format, or reference");
 		return -1;
 	}
 
@@ -332,13 +332,13 @@ static int mod_instantiate(CONF_SECTION *conf, void *instance)
 	case LINELOG_DST_FILE:
 	{
 		if (!inst->file.name) {
-			cf_log_err_cs(conf, "No value provided for 'filename'");
+			cf_log_err(conf, "No value provided for 'file.filename'");
 			return -1;
 		}
 
 		inst->file.ef = module_exfile_init(inst, conf, 256, 30, true, NULL, NULL);
 		if (!inst->file.ef) {
-			cf_log_err_cs(conf, "Failed creating log file context");
+			cf_log_err(conf, "Failed creating log file context");
 			return -1;
 		}
 
@@ -348,7 +348,7 @@ static int mod_instantiate(CONF_SECTION *conf, void *instance)
 			inst->file.group = strtol(inst->file.group_str, &endptr, 10);
 			if (*endptr != '\0') {
 				if (rad_getgid(inst, &(inst->file.group), inst->file.group_str) < 0) {
-					cf_log_err_cs(conf, "Unable to find system group \"%s\"",
+					cf_log_err(conf, "Unable to find system group \"%s\"",
 						      inst->file.group_str);
 					return -1;
 				}
@@ -362,13 +362,13 @@ static int mod_instantiate(CONF_SECTION *conf, void *instance)
 		int num;
 
 #ifndef HAVE_SYSLOG_H
-		cf_log_err_cs(conf, "Syslog output is not supported on this system");
+		cf_log_err(conf, "Syslog output is not supported on this system");
 		return -1;
 #else
 		if (inst->syslog.facility) {
 			num = fr_str2int(syslog_facility_table, inst->syslog.facility, -1);
 			if (num < 0) {
-				cf_log_err_cs(conf, "Invalid syslog facility \"%s\"", inst->syslog.facility);
+				cf_log_err(conf, "Invalid syslog facility \"%s\"", inst->syslog.facility);
 				return -1;
 			}
 			inst->syslog.priority |= num;
@@ -376,7 +376,7 @@ static int mod_instantiate(CONF_SECTION *conf, void *instance)
 
 		num = fr_str2int(syslog_severity_table, inst->syslog.severity, -1);
 		if (num < 0) {
-			cf_log_err_cs(conf, "Invalid syslog severity \"%s\"", inst->syslog.severity);
+			cf_log_err(conf, "Invalid syslog severity \"%s\"", inst->syslog.severity);
 			return -1;
 		}
 		inst->syslog.priority |= num;
@@ -386,23 +386,23 @@ static int mod_instantiate(CONF_SECTION *conf, void *instance)
 
 	case LINELOG_DST_UNIX:
 #ifndef HAVE_SYS_UN_H
-		cf_log_err_cs(conf, "Unix sockets are not supported on this sytem");
+		cf_log_err(conf, "Unix sockets are not supported on this sytem");
 		return -1;
 #else
-		inst->pool = module_connection_pool_init(cf_section_sub_find(conf, "unix"),
+		inst->pool = module_connection_pool_init(cf_section_find(conf, "unix", NULL),
 							 inst, mod_conn_create, NULL, prefix, NULL, NULL);
 		if (!inst->pool) return -1;
 #endif
 		break;
 
 	case LINELOG_DST_UDP:
-		inst->pool = module_connection_pool_init(cf_section_sub_find(conf, "udp"),
+		inst->pool = module_connection_pool_init(cf_section_find(conf, "udp", NULL),
 							 inst, mod_conn_create, NULL, prefix, NULL, NULL);
 		if (!inst->pool) return -1;
 		break;
 
 	case LINELOG_DST_TCP:
-		inst->pool = module_connection_pool_init(cf_section_sub_find(conf, "tcp"),
+		inst->pool = module_connection_pool_init(cf_section_find(conf, "tcp", NULL),
 							 inst, mod_conn_create, NULL, prefix, NULL, NULL);
 		if (!inst->pool) return -1;
 		break;
@@ -437,10 +437,6 @@ static size_t linelog_escape_func(UNUSED REQUEST *request,
 		char *out, size_t outlen, char const *in,
 		UNUSED void *arg)
 {
-	const char *p = in;
-	char *q = out;
-	size_t freespace = outlen;
-
 	if (outlen == 0) return 0;
 
 	if (outlen == 1) {
@@ -448,80 +444,25 @@ static size_t linelog_escape_func(UNUSED REQUEST *request,
 		return 0;
 	}
 
-	while (*p) {
-		int sp;
-		size_t len;
 
-		if (freespace < 2) break;
-
-		switch (*p) {
-		case '\r':
-			sp = 'r';
-			break;
-
-		case '\n':
-			sp = 'n';
-			break;
-
-		case '\t':
-			sp = 't';
-			break;
-
-		case '\\':
-			sp = '\\';
-			break;
-
-		default:
-			sp = 0;
-			break;
-		}
-
-		if (sp) {
-			if (freespace < 3) break;
-
-			*q++ = '\\';
-			*q++ = sp;
-			freespace -= 2;
-			p++;
-			continue;
-		}
-
-		if (*p >= ' ') {
-			*(q++) = *(p++);
-			freespace--;
-			continue;
-		}
-
-		if (freespace < 5) break;
-
-		snprintf(q, freespace, "\\%03o", (uint8_t) *p);
-
-		len = strlen(q);
-		freespace -= len;
-		p++;
-		q += len;
-	}
-
-	*q = '\0';
-
-	return q - out;
+	return fr_snprint(out, outlen, in, -1, 0);
 }
 
 /** Write a linelog message
  *
  * Write a log message to syslog or a flat file.
  *
- * @param instance of rlm_linelog.
- * @param request The current request.
+ * @param[in] instance	of rlm_linelog.
+ * @param[in] thread	Thread specific data.
+ * @param[in] request	The current request.
  * @return
  *	- #RLM_MODULE_NOOP if no message to log.
  *	- #RLM_MODULE_FAIL if we failed writing the message.
  *	- #RLM_MODULE_OK on success.
  */
-static rlm_rcode_t mod_do_linelog(void *instance, REQUEST *request) CC_HINT(nonnull);
-static rlm_rcode_t mod_do_linelog(void *instance, REQUEST *request)
+static rlm_rcode_t mod_do_linelog(void *instance, UNUSED void *thread, REQUEST *request) CC_HINT(nonnull);
+static rlm_rcode_t mod_do_linelog(void *instance, UNUSED void *thread, REQUEST *request)
 {
-	int			fd = -1;
 	linelog_conn_t		*conn;
 	struct timeval		*timeout = NULL;
 
@@ -594,7 +535,7 @@ static rlm_rcode_t mod_do_linelog(void *instance, REQUEST *request)
 		 *	using request as the context (which will hopefully avoid an alloc).
 		 */
 		slen = tmpl_afrom_str(request, &vpt, tmpl_str, talloc_array_length(tmpl_str) - 1,
-				      cf_pair_value_type(cp), REQUEST_CURRENT, PAIR_LIST_REQUEST, true);
+				      cf_pair_value_quote(cp), REQUEST_CURRENT, PAIR_LIST_REQUEST, true);
 		if (slen <= 0) {
 			REMARKER(tmpl_str, -slen, fr_strerror());
 			return RLM_MODULE_FAIL;
@@ -627,14 +568,14 @@ build_vector:
 	case TMPL_TYPE_LIST:
 	{
 		#define VECTOR_INCREMENT 20
-		vp_cursor_t	cursor;
+		fr_cursor_t	cursor;
 		VALUE_PAIR	*vp;
 		int		alloced = VECTOR_INCREMENT, i;
 
 		MEM(vector = talloc_array(request, struct iovec, alloced));
 		for (vp = tmpl_cursor_init(NULL, &cursor, request, vpt_p), i = 0;
 		     vp;
-		     vp = tmpl_cursor_next(&cursor, vpt_p), i++) {
+		     vp = fr_cursor_next(&cursor), i++) {
 		     	/* need extra for line terminator */
 			if ((with_delim && ((i + 1) >= alloced)) ||
 			    (i >= alloced)) {
@@ -642,10 +583,10 @@ build_vector:
 				MEM(vector = talloc_realloc(request, vector, struct iovec, alloced));
 			}
 
-			switch (vp->da->type) {
-			case PW_TYPE_OCTETS:
-			case PW_TYPE_STRING:
-				vector[i].iov_base = vp->data.ptr;
+			switch (vp->vp_type) {
+			case FR_TYPE_OCTETS:
+			case FR_TYPE_STRING:
+				vector[i].iov_base = vp->vp_ptr;
 				vector[i].iov_len = vp->vp_length;
 				break;
 
@@ -707,9 +648,10 @@ build_vector:
 	switch (inst->log_dst) {
 	case LINELOG_DST_FILE:
 	{
+		int fd = -1;
 		char path[2048];
 
-		if (radius_xlat(path, sizeof(path), request, inst->file.name, inst->file.escape_func, NULL) < 0) {
+		if (xlat_eval(path, sizeof(path), request, inst->file.name, inst->file.escape_func, NULL) < 0) {
 			return RLM_MODULE_FAIL;
 		}
 
@@ -725,7 +667,7 @@ build_vector:
 			*p = '/';
 		}
 
-		fd = exfile_open(inst->file.ef, request, path, inst->file.permissions, true);
+		fd = exfile_open(inst->file.ef, request, path, inst->file.permissions);
 		if (fd < 0) {
 			RERROR("Failed to open %s: %s", path, fr_syserror(errno));
 			rcode = RLM_MODULE_FAIL;
@@ -766,8 +708,8 @@ build_vector:
 		if (inst->tcp.timeout.tv_sec || inst->tcp.timeout.tv_usec) timeout = &inst->tcp.timeout;
 
 	do_write:
-		num = fr_connection_pool_state(inst->pool)->num;
-		conn = fr_connection_get(inst->pool, request);
+		num = fr_pool_state(inst->pool)->num;
+		conn = fr_pool_connection_get(inst->pool, request);
 		if (!conn) {
 			rcode = RLM_MODULE_FAIL;
 			goto finish;
@@ -789,7 +731,7 @@ build_vector:
 			case EADDRNOTAVAIL: /* Which is OSX for outbound interface is down? */
 				RWARN("Failed writing to socket: %s.  Will reconnect and try again...",
 				      fr_syserror(errno));
-				conn = fr_connection_reconnect(inst->pool, request, conn);
+				conn = fr_pool_connection_reconnect(inst->pool, request, conn);
 				if (!conn) {
 					rcode = RLM_MODULE_FAIL;
 					goto done;
@@ -815,7 +757,7 @@ build_vector:
 			break;
 		}
 	done:
-	fr_connection_release(inst->pool, request, conn);
+	fr_pool_connection_release(inst->pool, request, conn);
 	}
 		break;
 
@@ -840,6 +782,7 @@ finish:
 	talloc_free(vpt);
 	talloc_free(vector);
 
+	/* coverity[missing_unlock] */
 	return rcode;
 }
 
@@ -851,7 +794,6 @@ extern rad_module_t rlm_linelog;
 rad_module_t rlm_linelog = {
 	.magic		= RLM_MODULE_INIT,
 	.name		= "linelog",
-	.type		= RLM_TYPE_HUP_SAFE,
 	.inst_size	= sizeof(linelog_instance_t),
 	.config		= module_config,
 	.instantiate	= mod_instantiate,

@@ -67,7 +67,7 @@ typedef struct rlm_unix {
 } rlm_unix_t;
 
 static const CONF_PARSER module_config[] = {
-	{ FR_CONF_OFFSET("radwtmp", PW_TYPE_FILE_OUTPUT | PW_TYPE_REQUIRED, rlm_unix_t, radwtmp), .dflt = "NULL" },
+	{ FR_CONF_OFFSET("radwtmp", FR_TYPE_FILE_OUTPUT | FR_TYPE_REQUIRED, rlm_unix_t, radwtmp), .dflt = "NULL" },
 	CONF_PARSER_TERMINATOR
 };
 
@@ -89,12 +89,12 @@ static int groupcmp(UNUSED void *instance, REQUEST *request, UNUSED VALUE_PAIR *
 	if (!request->username) return -1;
 
 	if (rad_getpwnam(request, &pwd, request->username->vp_strvalue) < 0) {
-		RDEBUG("%s", fr_strerror());
+		RPEDEBUG("Failed resolving user name");
 		return -1;
 	}
 
 	if (rad_getgrnam(request, &grp, check->vp_strvalue) < 0) {
-		RDEBUG("%s", fr_strerror());
+		RPEDEBUG("Failed resolving group name");
 		talloc_free(pwd);
 		return -1;
 	}
@@ -126,7 +126,7 @@ static int groupcmp(UNUSED void *instance, REQUEST *request, UNUSED VALUE_PAIR *
 /*
  *	Read the config
  */
-static int mod_bootstrap(CONF_SECTION *conf, void *instance)
+static int mod_bootstrap(void *instance, CONF_SECTION *conf)
 {
 	rlm_unix_t		*inst = instance;
 	fr_dict_attr_t const	*group_da, *user_name_da;
@@ -135,13 +135,13 @@ static int mod_bootstrap(CONF_SECTION *conf, void *instance)
 	inst->name = cf_section_name2(conf);
 	if (!inst->name) inst->name = cf_section_name1(conf);
 
-	group_da = fr_dict_attr_by_num(fr_dict_internal, 0, PW_GROUP);
+	group_da = fr_dict_attr_by_num(fr_dict_internal, 0, FR_GROUP);
 	if (!group_da) {
-		ERROR("&Group attribute not found in dictionary");
+		PERROR("&Group attribute not found in dictionary");
 		return -1;
 	}
 
-	user_name_da = fr_dict_attr_by_num(NULL, 0, PW_USER_NAME);
+	user_name_da = fr_dict_attr_by_num(NULL, 0, FR_USER_NAME);
 	if (!user_name_da) {
 		ERROR("&User-Name attribute not found in dictionary");
 		return -1;
@@ -151,11 +151,11 @@ static int mod_bootstrap(CONF_SECTION *conf, void *instance)
 	 * groupcmp can actually do something */
 	paircompare_register(group_da, user_name_da, false, groupcmp, inst);
 
-#ifdef PW_GROUP_NAME /* compat */
+#ifdef FR_GROUP_NAME /* compat */
 	{
 		fr_dict_attr_t const *group_name_da;
 
-		group_name_da = fr_dict_attr_by_num(fr_dict_internal, 0, PW_GROUP_NAME);
+		group_name_da = fr_dict_attr_by_num(fr_dict_internal, 0, FR_GROUP_NAME);
 		if (!group_name_da) {
 			ERROR("&Group-Name attribute not found in dictionary");
 			return -1;
@@ -169,7 +169,7 @@ static int mod_bootstrap(CONF_SECTION *conf, void *instance)
 				        false,
 					groupcmp,
 					inst) < 0) {
-		ERROR("Failed registering Unix-Group: %s", fr_strerror());
+		PERROR("Failed registering Unix-Group");
 		return -1;
 	}
 
@@ -181,7 +181,7 @@ static int mod_bootstrap(CONF_SECTION *conf, void *instance)
  *	Pull the users password from where-ever, and add it to
  *	the given vp list.
  */
-static rlm_rcode_t CC_HINT(nonnull) mod_authorize(UNUSED void *instance, REQUEST *request)
+static rlm_rcode_t CC_HINT(nonnull) mod_authorize(UNUSED void *instance, UNUSED void *thread, REQUEST *request)
 {
 	char const	*name;
 	char const	*encrypted_pass;
@@ -357,10 +357,10 @@ static char *uue(void *in)
 /*
  *	Unix accounting - write a wtmp file.
  */
-static rlm_rcode_t CC_HINT(nonnull) mod_accounting(void *instance, REQUEST *request)
+static rlm_rcode_t CC_HINT(nonnull) mod_accounting(void *instance, UNUSED void *thread, REQUEST *request)
 {
 	VALUE_PAIR	*vp;
-	vp_cursor_t	cursor;
+	fr_cursor_t	cursor;
 	FILE		*fp;
 	struct utmp	ut;
 	time_t		t;
@@ -393,24 +393,24 @@ static rlm_rcode_t CC_HINT(nonnull) mod_accounting(void *instance, REQUEST *requ
 	/*
 	 *	Which type is this.
 	 */
-	if ((vp = fr_pair_find_by_num(request->packet->vps, 0, PW_ACCT_STATUS_TYPE, TAG_ANY)) == NULL) {
+	if ((vp = fr_pair_find_by_num(request->packet->vps, 0, FR_ACCT_STATUS_TYPE, TAG_ANY)) == NULL) {
 		RDEBUG("no Accounting-Status-Type attribute in request");
 		return RLM_MODULE_NOOP;
 	}
-	status = vp->vp_integer;
+	status = vp->vp_uint32;
 
 	/*
-	 *	FIXME: handle PW_STATUS_ALIVE like 1.5.4.3 did.
+	 *	FIXME: handle FR_STATUS_ALIVE like 1.5.4.3 did.
 	 */
-	if (status != PW_STATUS_START &&
-	    status != PW_STATUS_STOP)
+	if (status != FR_STATUS_START &&
+	    status != FR_STATUS_STOP)
 		return RLM_MODULE_NOOP;
 
 	/*
 	 *	We're only interested in accounting messages
 	 *	with a username in it.
 	 */
-	if (fr_pair_find_by_num(request->packet->vps, 0, PW_USER_NAME, TAG_ANY) == NULL)
+	if (fr_pair_find_by_num(request->packet->vps, 0, FR_USER_NAME, TAG_ANY) == NULL)
 		return RLM_MODULE_NOOP;
 
 	t = request->packet->timestamp.tv_sec;
@@ -423,7 +423,7 @@ static rlm_rcode_t CC_HINT(nonnull) mod_accounting(void *instance, REQUEST *requ
 	     vp;
 	     vp = fr_cursor_next(&cursor)) {
 		if (!vp->da->vendor) switch (vp->da->attr) {
-		case PW_USER_NAME:
+		case FR_USER_NAME:
 			if (vp->vp_length >= sizeof(ut.ut_name)) {
 				memcpy(ut.ut_name, vp->vp_strvalue, sizeof(ut.ut_name));
 			} else {
@@ -431,26 +431,26 @@ static rlm_rcode_t CC_HINT(nonnull) mod_accounting(void *instance, REQUEST *requ
 			}
 			break;
 
-		case PW_LOGIN_IP_HOST:
-		case PW_FRAMED_IP_ADDRESS:
-			framed_address = vp->vp_ipaddr;
+		case FR_LOGIN_IP_HOST:
+		case FR_FRAMED_IP_ADDRESS:
+			framed_address = vp->vp_ipv4addr;
 				break;
 #ifdef USER_PROCESS
-		case PW_FRAMED_PROTOCOL:
-			protocol = vp->vp_integer;
+		case FR_FRAMED_PROTOCOL:
+			protocol = vp->vp_uint32;
 			break;
 #endif
-		case PW_NAS_IP_ADDRESS:
-			nas_address = vp->vp_ipaddr;
+		case FR_NAS_IP_ADDRESS:
+			nas_address = vp->vp_ipv4addr;
 			break;
 
-		case PW_NAS_PORT:
-			nas_port = vp->vp_integer;
+		case FR_NAS_PORT:
+			nas_port = vp->vp_uint32;
 			port_seen = true;
 			break;
 
-		case PW_ACCT_DELAY_TIME:
-			delay = vp->vp_ipaddr;
+		case FR_ACCT_DELAY_TIME:
+			delay = vp->vp_ipv4addr;
 			break;
 		}
 	}
@@ -467,7 +467,7 @@ static rlm_rcode_t CC_HINT(nonnull) mod_accounting(void *instance, REQUEST *requ
 	 *	originator's IP address.
 	 */
 	if (nas_address == 0) {
-		nas_address = request->packet->src_ipaddr.ipaddr.ip4addr.s_addr;
+		nas_address = request->packet->src_ipaddr.addr.v4.s_addr;
 	}
 	s = request->client->shortname;
 	if (!s || s[0] == 0) s = uue(&(nas_address));
@@ -504,15 +504,15 @@ static rlm_rcode_t CC_HINT(nonnull) mod_accounting(void *instance, REQUEST *requ
 	 *	And we can use the ID field to store
 	 *	the protocol.
 	 */
-	if (protocol == PW_PPP)
+	if (protocol == FR_PPP)
 		strcpy(ut.ut_id, "P");
-	else if (protocol == PW_SLIP)
+	else if (protocol == FR_SLIP)
 		strcpy(ut.ut_id, "S");
 	else
 		strcpy(ut.ut_id, "T");
-	ut.ut_type = status == PW_STATUS_STOP ? DEAD_PROCESS : USER_PROCESS;
+	ut.ut_type = status == FR_STATUS_STOP ? DEAD_PROCESS : USER_PROCESS;
 #endif
-	if (status == PW_STATUS_STOP)
+	if (status == FR_STATUS_STOP)
 		ut.ut_name[0] = 0;
 
 	/*

@@ -1,106 +1,120 @@
 language: c
 compiler:
-  - clang
-  - gcc
+- clang
+- gcc
 sudo: true
 dist: trusty
 env:
   global:
-    - LDAP_TEST_SERVER="127.0.0.1"
-    - LDAP_TEST_SERVER_PORT="3890"
-    - PANIC_ACTION="gdb -batch -x raddb/panic.gdb %e %p 1>&0 2>&0"
-    - SQL_MYSQL_TEST_SERVER="127.0.0.1"
-    - SQL_POSTGRESQL_TEST_SERVER="127.0.0.1"
-    - secure: "H+uQeyOgsIyXtIPPG2VzAG8S/8KYGHlHaWhdiNuz1LM3SMcEKoPqG6o/P+HO8HVvYnA6nelyGuEryV90UfuwGY9YC6A/pqPQvx/gXSso63Zt66XSaiZjulCSm9OV8EB3wyWF7VSQ/ZHcn+L01hIlsQXTqLprMaC33cM0FYPr9fY="
+  - ASAN_OPTIONS="symbolize=1 detect_stack_use_after_return=1"
+  - LSAN_OPTIONS="exitcode=0"
+  - KQUEUE_DEBUG="yes"
+  - M_PERTURB=0x42
+  - PANIC_ACTION="gdb -batch -x raddb/panic.gdb %e %p 1>&0 2>&0"
+  - SQL_MYSQL_TEST_SERVER="127.0.0.1"
+  - SQL_POSTGRESQL_TEST_SERVER="127.0.0.1"
+  - LDAP_TEST_SERVER="127.0.0.1"
+  - LDAP_TEST_SERVER_PORT="3890"
+  - ANALYZE_C_DUMP="1"
+  - secure: H+uQeyOgsIyXtIPPG2VzAG8S/8KYGHlHaWhdiNuz1LM3SMcEKoPqG6o/P+HO8HVvYnA6nelyGuEryV90UfuwGY9YC6A/pqPQvx/gXSso63Zt66XSaiZjulCSm9OV8EB3wyWF7VSQ/ZHcn+L01hIlsQXTqLprMaC33cM0FYPr9fY=
   matrix:
-    - DO_BUILD=yes LIBS_OPTIONAL=no LIBS_SHARED=yes BUILD_CFLAGS="-DWITH_EVAL_DEBUG"
-    - DO_BUILD=yes LIBS_OPTIONAL=yes LIBS_SHARED=yes BUILD_CFLAGS="-DWITH_EVAL_DEBUG"
-    - DO_BUILD=yes LIBS_OPTIONAL=yes LIBS_SHARED=yes BUILD_CFLAGS="-DWITH_EVAL_DEBUG -O2 -g3"
-    - DO_BUILD=yes LIBS_OPTIONAL=yes LIBS_SHARED=yes BUILD_CFLAGS="-DNDEBUG"
-    - DO_BUILD=no
+  - TEST_CERTS=yes DO_BUILD=yes LIBS_OPTIONAL=no LIBS_SHARED=yes BUILD_CFLAGS="-DWITH_EVAL_DEBUG"
+  - TEST_CERTS=yes DO_BUILD=yes LIBS_OPTIONAL=yes LIBS_SHARED=yes BUILD_CFLAGS="-DWITH_EVAL_DEBUG"
+  - TEST_CERTS=yes DO_BUILD=yes LIBS_OPTIONAL=yes LIBS_SHARED=yes BUILD_CFLAGS="-DWITH_EVAL_DEBUG -O2 -g3"
+  - TEST_CERTS=yes DO_BUILD=yes LIBS_OPTIONAL=yes LIBS_SHARED=yes BUILD_CFLAGS="-DNDEBUG"
+  - DO_BUILD=no
+notifications:
+  slack:
+    secure: DNYZ31leOmSYXFtHD/bERl4uwI1cZvDgBQQFsoH0/7/pXac2I293RhRS4TVo/ortlL1OCmilb4Hx8iwFLd+/7Pj9AHkxq6JlnVKKp2yhWLEwIYwYY5xPqO/lglzl5les6FIToSsU0dHusoYsNLYnRhQEnuIs+wy4tUp8eq/CvTs=
 addons:
   coverity_scan:
     project:
       name: FreeRADIUS/freeradius-server
-      version: master
+      version: v4.0.x
       description: The FreeRADIUS server project
     notification_email: freeradius-devel@lists.freeradius.org
     build_command_prepend: ./configure -with-rlm-python-bin=/usr/bin/python2.7
     build_command: make
     branch_pattern: coverity_scan
-  postgresql: "9.4"
+  postgresql: '9.4'
   apt:
     sources:
-      - couchbase-precise
+    - couchbase-trusty
+    - llvm-toolchain-trusty-5.0
+    # For newer libkqueue
+    - sourceline: ppa:rjvbertin/misc
     packages:
-      - autoconf
-      - build-essential
-      - debhelper
-      - devscripts
-      - dh-make
-      - doxygen
-      - fakeroot
-      - gcc-4.9
-      - gccgo-4.9
-      - gdb
-      - graphviz
-      - lintian
-      - mysql-server
-      - pbuilder
-      - python-dev
-      - quilt
-      - libruby
-      - ruby-dev
-      - libcollectdclient-dev
-      - firebird-dev
-      - freetds-dev
-      - libcap-dev
-      - libcouchbase2-libevent
-      - libcouchbase-dev
-      - libcurl4-openssl-dev
-      - libgdbm-dev
-      - libhiredis-dev
-      - libidn11-dev
-      - libiodbc2-dev
-      - libiodbc2
-      - libjson0
-      - libjson0-dev
-      - libkrb5-dev
-      - libldap2-dev
-      - libmemcached-dev
-      - libmysqlclient-dev
-      - libnl-genl-3-dev
-      - libpam0g-dev
-      - libpcap-dev
-      - libpcre3-dev
-      - libperl-dev
-      - libpq-dev
-      - libpython-all-dev
-      - libreadline-dev
-      - libsnmp-dev
-      - libssl-dev
-      - libtalloc-dev
-      - libtalloc2-dbg
-      - libunbound-dev
-      - libwbclient-dev
-      - libykclient-dev
-      - libyubikey-dev
-      - slapd
-      - ldap-utils
+    - autoconf
+    - build-essential
+    - clang-5.0
+    - debhelper
+    - devscripts
+    - dh-make
+    - doxygen
+    - fakeroot
+    - gcc-4.9
+    - gccgo-4.9
+    - gdb
+    - graphviz
+    - lintian
+    - mysql-server-5.6
+    - pbuilder
+    - python-dev
+    - quilt
+    - libcollectdclient-dev
+    - firebird-dev
+    - freetds-dev
+    - libcap-dev
+    - libcurl4-openssl-dev
+    - libgdbm-dev
+    - libhiredis-dev
+    - libidn11-dev
+    - libiodbc2-dev
+    - libiodbc2
+    - libjson0
+    - libjson0-dev
+    - libkrb5-dev
+    - libkqueue-dev
+    - libldap2-dev
+    - libluajit-5.1-dev
+    - libmemcached-dev
+    - libmysqlclient-dev
+    - libnl-genl-3-dev
+    - libpam0g-dev
+    - libpcap-dev
+    - libpcre3-dev
+    - libperl-dev
+    - libpq-dev
+    - libpython-all-dev
+    - libreadline-dev
+    - libsnmp-dev
+    - libssl-dev
+    - libtalloc-dev
+    - libtalloc2-dbg
+    - libunbound-dev
+    - libwbclient-dev
+    - libykclient-dev
+    - libyubikey-dev
+    # Needed for llvm-symbolizer
+    - llvm-5.0
+    # For rendering clang scan results
+    - lynx
+    - slapd
+    - ldap-utils
 services:
-  - mysql
-  - postgresql
+- mysql
+- postgresql
+- redis-server
 before_install:
-  - if [ "${CC}" == 'gcc' ]; then sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-4.9 60; fi
-  - if [ "${CC}" == 'gcc' ]; then sudo update-alternatives --config gcc; fi
-  - $CC --version
+- rvm --install --default --binary use 2.4
+- if [ "${CC}" == 'gcc' ]; then sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-4.9 60 && sudo update-alternatives --config gcc; fi
+- if [ "${CC}" == 'clang' ]; then sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-5.0 60 && sudo update-alternatives --config clang; fi
+- if [ "${CC}" == 'clang' ]; then sudo update-alternatives --install /usr/bin/llvm-symbolizer llvm-symbolizer /usr/bin/llvm-symbolizer-5.0 60 && sudo update-alternatives --config llvm-symbolizer; fi
+- $CC --version
 before_script:
-  - ./scripts/travis/build.sh
+- ./scripts/travis/build.sh
 script:
-# If this is not a coverity scan, run the tests.  This is an optimisation to make sure we don't run tests
-# on the same build product multiple times.
-  - if [ "${DO_BUILD}" = 'yes' -a "${COVERITY_SCAN_BRANCH}" != 1 ]; then make travis-test; fi
-# Build the debian packages (disabled until we get the dependencies fixed)
-#  - if [ "${DO_BUILD}" = 'no' ]; then make deb; fi
-# Build the doxygen documentation
-  - if [ "${DO_BUILD}" = 'no' ]; then cd doc/source; doxygen 3>&1 1>&2 2>&3 | grep -iv '^warning:' | tee doxygen_stderr.log && [ ! -n "$(cat doxygen_stderr.log)" ]; fi
+- if [ "${DO_BUILD}" = 'yes' -a "${COVERITY_SCAN_BRANCH}" != 1 ]; then make travis-test;
+  fi
+- if [ "${DO_BUILD}" = 'no' ]; then cd doc/source; doxygen 3>&1 1>&2 2>&3 | grep -iv
+  '^warning:' | tee doxygen_stderr.log && [ ! -n "$(cat doxygen_stderr.log)" ]; fi

@@ -44,29 +44,22 @@ static void _krb5_logging_free(void *arg)
 	talloc_free(arg);
 }
 
-char const *rlm_krb5_error(rlm_krb5_t *inst, krb5_context context, krb5_error_code code)
+char const *rlm_krb5_error(rlm_krb5_t const *inst, krb5_context context, krb5_error_code code)
 {
 	char const *msg;
 	char *buffer;
 
 	if (!rad_cond_assert(inst)) return NULL;
 
-	buffer = fr_thread_local_init(krb5_error_buffer, _krb5_logging_free);
+	buffer = krb5_error_buffer;
 	if (!buffer) {
-		int ret;
-
 		buffer = talloc_array(NULL, char, KRB5_STRERROR_BUFSIZE);
 		if (!buffer) {
 			ERROR("Failed allocating memory for krb5 error buffer");
 			return NULL;
 		}
 
-		ret = fr_thread_local_set(krb5_error_buffer, buffer);
-		if (ret != 0) {
-			ERROR("Failed setting up TLS for krb5 error buffer: %s", fr_syserror(ret));
-			talloc_free(buffer);
-			return NULL;
-		}
+		fr_thread_local_set_destructor(krb5_error_buffer, _krb5_logging_free, buffer);
 	}
 
 	msg = krb5_get_error_message(context, code);
@@ -119,7 +112,7 @@ static int _mod_conn_free(rlm_krb5_handle_t *conn) {
  */
 void *mod_conn_create(TALLOC_CTX *ctx, void *instance, UNUSED struct timeval const *timeout)
 {
-	rlm_krb5_t *inst = instance;
+	rlm_krb5_t const *inst = instance;
 	rlm_krb5_handle_t *conn;
 	krb5_error_code ret;
 

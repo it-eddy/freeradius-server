@@ -60,10 +60,12 @@ static int _sql_socket_destructor(rlm_sql_db2_conn_t *conn)
 	return RLM_SQL_OK;
 }
 
-static sql_rcode_t sql_socket_init(rlm_sql_handle_t *handle, rlm_sql_config_t *config, struct timeval const *timeout)
+static sql_rcode_t sql_socket_init(rlm_sql_handle_t *handle, rlm_sql_config_t *config, UNUSED struct timeval const *timeout)
 {
 	SQLRETURN row;
+#if 0
 	uint32_t timeout_ms = FR_TIMEVAL_TO_MS(timeout);
+#endif
 	rlm_sql_db2_conn_t *conn;
 
 	MEM(conn = handle->conn = talloc_zero(handle, rlm_sql_db2_conn_t));
@@ -74,8 +76,10 @@ static sql_rcode_t sql_socket_init(rlm_sql_handle_t *handle, rlm_sql_config_t *c
 	SQLAllocHandle(SQL_HANDLE_DBC, conn->env_handle, &(conn->dbc_handle));
 
 	/* Set the connection timeout */
+#if 0
+	/* Not suported ? */
 	SQLSetConnectAttr(conn->dbc_handle, SQL_ATTR_LOGIN_TIMEOUT, &timeout_ms, SQL_IS_UINTEGER);
-
+#endif
 	/*
 	 *	The db2 API doesn't qualify arguments as const even when they should be.
 	 */
@@ -96,11 +100,11 @@ static sql_rcode_t sql_socket_init(rlm_sql_handle_t *handle, rlm_sql_config_t *c
 		 *	And probably synthesis the retarded connection string ourselves,
 		 *	probably via config file expansions:
 		 *
-		 *	Driver={IBM DB2 ODBC Driver};Database=testDb;Hostname=remoteHostName.com;UID=username;PWD=mypasswd;PO‌​RT=50000
+		 *	Driver={IBM DB2 ODBC Driver};Database=testDb;Hostname=remoteHostName.com;UID=username;PWD=mypasswd;PORT=50000
 		 */
 		row = SQLConnect(conn->dbc_handle,
 				    server, SQL_NTS,
-				    login,  SQL_NTS,
+				    login, SQL_NTS,
 				    password, SQL_NTS);
 	}
 
@@ -207,7 +211,7 @@ static sql_rcode_t sql_fetch_row(rlm_sql_row_t *out, rlm_sql_handle_t *handle, r
 	c = sql_num_fields(handle, config);
 
 	/* advance cursor */
-	if (SQLFetch(conn->stmt) == SQL_NO_DATA_FOUND) return RLM_SQL_ERROR;
+	if (SQLFetch(conn->stmt) == SQL_NO_DATA_FOUND) return RLM_SQL_NO_MORE_ROWS;
 
 	MEM(row = (rlm_sql_row_t)talloc_zero_array(handle, char *, c + 1));
 	for (i = 0; i < c; i++) {
@@ -266,7 +270,7 @@ static size_t sql_error(TALLOC_CTX *ctx, sql_log_entry_t out[], NDEBUG_UNUSED si
 	if (errbuff[0] == '\0') return 0;
 
 	out[0].type = L_ERR;
-	out[0].msg = talloc_asprintf(ctx, "%s: %s", state, errbuff);
+	out[0].msg = talloc_typed_asprintf(ctx, "%s: %s", state, errbuff);
 
 	return 1;
 }

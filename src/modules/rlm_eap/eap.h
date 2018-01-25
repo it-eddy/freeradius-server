@@ -35,6 +35,8 @@ RCSIDH(eap_h, "$Id$")
 /* TLS configuration name */
 #define TLS_CONFIG_SECTION "tls-config"
 
+#define MAX_PROVIDED_METHODS	10
+
 /** Contains a pair of request and response packets
  *
  * Helps with formulating/correlating requests to responses we've received.
@@ -42,7 +44,7 @@ RCSIDH(eap_h, "$Id$")
 typedef struct eap_round {
 	eap_packet_t	*response;			//!< Packet we received from the peer.
 	eap_packet_t	*request;			//!< Packet we will send to the peer.
-	bool		set_request_id;
+	bool		set_request_id;			//!< Whether the EAP-Method already set the next request ID.
 } eap_round_t;
 
 typedef struct _eap_session eap_session_t;
@@ -59,26 +61,26 @@ typedef rlm_rcode_t (*eap_process_t)(void *instance, eap_session_t *eap_session)
 struct _eap_session {
 	eap_session_t	*prev, *next;			//!< Next/previous eap session in this doubly linked list.
 
-	eap_session_t	*child;				//!< Session for tunnelled EAP method.
+	eap_session_t	*child;				//!< Session for tunneled EAP method.
 
-	void		*inst;				//!< Instance of the eap module this session was created by.
+	void const	*inst;				//!< Instance of the eap module this session was created by.
 	eap_type_t	type;				//!< EAP method number.
 
 	REQUEST		*request;			//!< Current request.  Only used by OpenSSL callbacks to
-							//!< access the current request.  Must be NULL if eap_session
-							//!< is not being processed by rlm_eap.
+							///< access the current request.  Must be NULL if eap_session
+							///< is not being processed by rlm_eap.
 
 	char		*identity;			//!< NAI (User-Name) from EAP-Identity
 
 	eap_round_t 	*prev_round;			//!< Previous response/request pair. #this_round should contain
-							//!< the response to the request in #prev_round.
+							///< the response to the request in #prev_round.
 	eap_round_t 	*this_round;			//!< The EAP response we're processing, and the EAP request
-							//!< we're building.
+							///< we're building.
 
 	void 		*opaque;			//!< Opaque data used by EAP methods.
 
 	eap_process_t	process;			//!< Callback that should be used to process the next round.
-							//!< Usually set to the process functino of an EAP submodule.
+							///< Usually set to the process functino of an EAP submodule.
 	int		rounds;				//!< How many roundtrips have occurred this session.
 
 	time_t		updated;			//!< The last time we received a packet for this EAP session.
@@ -87,40 +89,18 @@ struct _eap_session {
 	bool		finished;			//!< Whether we consider this session complete.
 };
 
-/** Configuration for an instance of rlm_eap
- *
- * @note Is declared here instead of rlm_eap.h because it's passed to submodules
- */
-typedef struct rlm_eap_config {
-	char const		*default_method_name;		//!< Default method to attempt to start.
-	eap_type_t		default_method;			//!< Resolved default_method_name.
-
-	bool			ignore_unknown_types;		//!< Ignore unknown types (for later proxying).
-	bool			mod_accounting_username_bug;
-} rlm_eap_config_t;
-
-/** Instantiate an EAP submodule
- *
- * Function to handle any submodule specific instantiation.
- *
- * @param config	of the rlm_eap instance.  Should not be modified.
- * @param instance	A uint8_t array of inst_size if inst_size > 0, else NULL,
- *			this should contain the result of parsing the submodule's
- *			CONF_PARSER array that it specified in the interface struct.
- * @param cs		section holding driver specific #CONF_PAIR (s).
- * @return
- *	- 0 on success.
- *	- -1 on failure.
- */
-typedef int		(*eap_instantiate_t)(rlm_eap_config_t const *config, void *instance, CONF_SECTION *cs);
-
 /** Interface exported by EAP submodules
  *
  */
 typedef struct rlm_eap_submodule {
 	RAD_MODULE_COMMON;					//!< Common fields to all loadable modules.
 
-	eap_instantiate_t	instantiate;			//!< Create a new submodule instance.
+	eap_type_t		provides[MAX_PROVIDED_METHODS];	//!< Allow the module to register itself for more
+								///< than one EAP-Method.
+
+	module_instantiate_t	bootstrap;			//!< Register any attributes required for the module
+
+	module_instantiate_t	instantiate;			//!< Create a new submodule instance.
 	eap_process_t		session_init;			//!< Callback for creating a new #eap_session_t.
 	eap_process_t		process;			//!< Callback for processing the next #eap_round_t of an
 								//!< #eap_session_t.
@@ -129,8 +109,8 @@ typedef struct rlm_eap_submodule {
 #define REQUEST_DATA_EAP_SESSION	 (1)
 #define REQUEST_DATA_EAP_SESSION_PROXIED (2)
 
-#define REQUEST_DATA_EAP_TUNNEL_CALLBACK PW_EAP_MESSAGE
-#define REQUEST_DATA_EAP_MSCHAP_TUNNEL_CALLBACK ((PW_EAP_MESSAGE << 16) | PW_EAP_MSCHAPV2)
+#define REQUEST_DATA_EAP_TUNNEL_CALLBACK FR_EAP_MESSAGE
+#define REQUEST_DATA_EAP_MSCHAP_TUNNEL_CALLBACK ((FR_EAP_MESSAGE << 16) | FR_EAP_MSCHAPV2)
 #define RAD_REQUEST_OPTION_PROXY_EAP	(1 << 16)
 
 /*

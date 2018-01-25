@@ -23,6 +23,7 @@
 #include <freeradius-devel/radiusd.h>
 #include <freeradius-devel/protocol.h>
 #include <freeradius-devel/modules.h>
+#include <freeradius-devel/unlang.h>
 #include <freeradius-devel/rad_assert.h>
 #include <freeradius-devel/event.h>
 #include <freeradius-devel/md5.h>
@@ -66,7 +67,7 @@ typedef struct bfd_state_t {
 	int		sockfd;
 
 	fr_event_list_t *el;
-	const char	*server;
+	CONF_SECTION	*server_cs;
 	CONF_SECTION	*unlang;
 
 	bool		blocked;
@@ -88,8 +89,8 @@ typedef struct bfd_state_t {
 	struct sockaddr_storage remote_sockaddr;
 	socklen_t	salen;
 
-	fr_event_t	*ev_timeout;
-	fr_event_t	*ev_packet;
+	fr_event_timer_t const	*ev_timeout;
+	fr_event_timer_t const	*ev_packet;
 	struct timeval	last_recv;
 	struct timeval	next_recv;
 	struct timeval	last_sent;
@@ -132,7 +133,7 @@ typedef struct bfd_auth_basic_t {
 	uint8_t		auth_type;
 	uint8_t		auth_len;
 	uint8_t		key_id;
-} bfd_auth_basic_t;
+} __attribute__ ((packed)) bfd_auth_basic_t;
 
 
 typedef struct bfd_auth_simple_t {
@@ -140,7 +141,7 @@ typedef struct bfd_auth_simple_t {
 	uint8_t		auth_len;
 	uint8_t		key_id;
 	uint8_t		password[16];
-} bfd_auth_simple_t;
+} __attribute__ ((packed)) bfd_auth_simple_t;
 
 typedef struct bfd_auth_md5_t {
 	uint8_t		auth_type;
@@ -149,7 +150,7 @@ typedef struct bfd_auth_md5_t {
 	uint8_t		reserved;
 	uint32_t	sequence_no;
 	uint8_t		digest[MD5_DIGEST_LENGTH];
-} bfd_auth_md5_t;
+} __attribute__ ((packed)) bfd_auth_md5_t;
 
 typedef struct bfd_auth_sha1_t {
 	uint8_t		auth_type;
@@ -158,14 +159,14 @@ typedef struct bfd_auth_sha1_t {
 	uint8_t		reserved;
 	uint32_t	sequence_no;
 	uint8_t		digest[SHA1_DIGEST_LENGTH];
-} bfd_auth_sha1_t;
+} __attribute__ ((packed)) bfd_auth_sha1_t;
 
 typedef union bfd_auth_t {
 	bfd_auth_basic_t        basic;
 	bfd_auth_simple_t	password;
 	bfd_auth_md5_t		md5;
 	bfd_auth_sha1_t		sha1;
-} bfd_auth_t;
+} __attribute__ ((packed)) bfd_auth_t;
 
 
 /*
@@ -212,7 +213,7 @@ typedef struct bfd_socket_t {
 	char		const *interface;
 
 	int		number;
-	const char	*server;
+	CONF_SECTION	*server_cs;
 	CONF_SECTION	*unlang;
 
 	uint32_t	min_tx_interval;
@@ -230,16 +231,16 @@ typedef struct bfd_socket_t {
 static int bfd_start_packets(bfd_state_t *session);
 static int bfd_start_control(bfd_state_t *session);
 static int bfd_stop_control(bfd_state_t *session);
-static void bfd_detection_timeout(void *ctx, struct timeval *now);
+static void bfd_detection_timeout(UNUSED fr_event_list_t *eel, struct timeval *now, void *ctx);
 static int bfd_process(bfd_state_t *session, bfd_packet_t *bfd);
 
-static fr_event_list_t *el = NULL; /* don't ask */
+static fr_event_list_t *event_list = NULL; /* don't ask */
 
 void bfd_init(fr_event_list_t *xel);
 
 void bfd_init(fr_event_list_t *xel)
 {
-	el = xel;
+	event_list = xel;
 }
 
 static void bfd_pthread_free(bfd_state_t *session)
@@ -260,7 +261,7 @@ static void bfd_pthread_free(bfd_state_t *session)
 /*
  *	A child thread reads the packet from a pipe, and processes it.
  */
-static void bfd_pipe_recv(UNUSED fr_event_list_t *xel, int fd, void *ctx)
+static void bfd_pipe_recv(UNUSED fr_event_list_t *xel, int fd, UNUSED int flags, void *ctx)
 {
 	ssize_t num;
 	bfd_state_t *session = ctx;
@@ -278,6 +279,11 @@ static void bfd_pipe_recv(UNUSED fr_event_list_t *xel, int fd, void *ctx)
 		session->blocked = true;
 		return;
 	}
+
+	/*
+	 *	This is already checked in the caller, but what the heck...
+	 */
+	if (bfd.length > sizeof(bfd)) goto fail;
 
 	/*
 	 *	Read the rest of the packet.
@@ -317,7 +323,7 @@ static int bfd_pthread_create(bfd_state_t *session)
 		return 0;
 	}
 
-	session->el = fr_event_list_create(session, NULL);
+	session->el = fr_event_list_alloc(session, NULL, NULL);
 	if (!session->el) {
 		ERROR("Failed creating event list");
 	close_pipes:
@@ -332,9 +338,12 @@ static int bfd_pthread_create(bfd_state_t *session)
 	fcntl(session->pipefd[1], F_SETFL, O_NONBLOCK | FD_CLOEXEC);
 #endif
 
-	if (fr_event_fd_insert(session->el, 0, session->pipefd[0],
-			       bfd_pipe_recv, session) < 0) {
-		ERROR("Failed inserting file descriptor into event list: %s", fr_strerror());
+	if (fr_event_fd_insert(session, session->el, session->pipefd[0],
+			       bfd_pipe_recv,
+			       NULL,
+			       NULL,
+			       session) < 0) {
+		PERROR("Failed inserting file descriptor into event list");
 		goto close_pipes;
 	}
 
@@ -376,7 +385,7 @@ static void bfd_request(bfd_state_t *session, REQUEST *request,
 	memset(packet, 0, sizeof(*packet));
 
 	request->packet = packet;
-	request->server = session->server;
+	request->server_cs = session->server_cs;
 	packet->src_ipaddr = session->local_ipaddr;
 	packet->src_port = session->local_port;
 	packet->dst_ipaddr = session->remote_ipaddr;
@@ -404,7 +413,7 @@ static void bfd_session_free(void *ctx)
 {
 	bfd_state_t *session = ctx;
 
-	if (el != session->el) {
+	if (event_list != session->el) {
 		/*
 		 *	FIXME: this isn't particularly safe.
 		 */
@@ -421,7 +430,7 @@ static ssize_t bfd_parse_secret(CONF_SECTION *cs, uint8_t secret[BFD_MAX_SECRET_
 	size_t len;
 	char const *value = NULL;
 
-	rcode = cf_pair_parse(cs, "secret", FR_ITEM_POINTER(PW_TYPE_STRING, &value), NULL, T_INVALID);
+	rcode = cf_pair_parse(NULL, cs, "secret", FR_ITEM_POINTER(FR_TYPE_STRING, &value), NULL, T_INVALID);
 	if (rcode != 0) return 0;
 
 	len = strlen(value);
@@ -472,7 +481,7 @@ static bfd_state_t *bfd_new_session(bfd_socket_t *sock, int sockfd,
 	session->number = sock->number++;
 	session->sockfd = sockfd;
 	session->session_state = BFD_STATE_DOWN;
-	session->server = sock->server;
+	session->server_cs = sock->server_cs;
 	session->unlang = sock->unlang;
 	session->local_disc = fr_rand();
 	session->remote_disc = 0;
@@ -491,26 +500,26 @@ static bfd_state_t *bfd_new_session(bfd_socket_t *sock, int sockfd,
 	/*
 	 *	Allow over-riding of variables per session.
 	 */
-	rcode = cf_pair_parse(cs, "demand", FR_ITEM_POINTER(PW_TYPE_BOOLEAN, &flag), NULL, T_INVALID);
+	rcode = cf_pair_parse(NULL, cs, "demand", FR_ITEM_POINTER(FR_TYPE_BOOL, &flag), NULL, T_INVALID);
 	if (rcode == 0) {
 		session->demand_mode = flag;
 	}
 
-	rcode = cf_pair_parse(cs, "min_transmit_interval", FR_ITEM_POINTER(PW_TYPE_INTEGER, &number), NULL, T_INVALID);
+	rcode = cf_pair_parse(NULL, cs, "min_transmit_interval", FR_ITEM_POINTER(FR_TYPE_UINT32, &number), NULL, T_INVALID);
 	if (rcode == 0) {
 		if (number < 100) number = 100;
 		if (number > 10000) number = 10000;
 
 		session->desired_min_tx_interval = number * 1000;
 	}
-	rcode = cf_pair_parse(cs, "min_receive_interval", FR_ITEM_POINTER(PW_TYPE_INTEGER, &number), NULL, T_INVALID);
+	rcode = cf_pair_parse(NULL, cs, "min_receive_interval", FR_ITEM_POINTER(FR_TYPE_UINT32, &number), NULL, T_INVALID);
 	if (rcode == 0) {
 		if (number < 100) number = 100;
 		if (number > 10000) number = 10000;
 
 		session->required_min_rx_interval = number * 1000;
 	}
-	rcode = cf_pair_parse(cs, "max_timeouts", FR_ITEM_POINTER(PW_TYPE_INTEGER, &number), NULL, T_INVALID);
+	rcode = cf_pair_parse(NULL, cs, "max_timeouts", FR_ITEM_POINTER(FR_TYPE_UINT32, &number), NULL, T_INVALID);
 	if (rcode == 0) {
 		if (number == 0) number = 1;
 		if (number > 10) number = 10;
@@ -569,8 +578,8 @@ static bfd_state_t *bfd_new_session(bfd_socket_t *sock, int sockfd,
 	/*
 	 *	Check for threaded / non-threaded operation.
 	 */
-	if (el) {
-		session->el = el;
+	if (event_list) {
+		session->el = event_list;
 
 		bfd_start_control(session);
 
@@ -658,7 +667,7 @@ static int bfd_verify_md5(bfd_state_t *session, bfd_packet_t *bfd)
 	memcpy(digest, md5->digest, sizeof(digest));
 
 	bfd_calc_md5(session, bfd);
-	rcode = fr_radius_digest_cmp(digest, md5->digest, sizeof(digest));
+	rcode = fr_digest_cmp(digest, md5->digest, sizeof(digest));
 
 	memcpy(md5->digest, digest, sizeof(md5->digest)); /* pedantic */
 
@@ -727,7 +736,7 @@ static int bfd_verify_sha1(bfd_state_t *session, bfd_packet_t *bfd)
 	memcpy(digest, sha1->digest, sizeof(digest));
 
 	bfd_calc_sha1(session, bfd);
-	rcode = fr_radius_digest_cmp(digest, sha1->digest, sizeof(digest));
+	rcode = fr_digest_cmp(digest, sha1->digest, sizeof(digest));
 
 	memcpy(sha1->digest, digest, sizeof(sha1->digest)); /* pedantic */
 
@@ -850,7 +859,7 @@ static void bfd_sign(bfd_state_t *session, bfd_packet_t *bfd)
 /*
  *	Send a packet.
  */
-static void bfd_send_packet(void *ctx, UNUSED struct timeval *now)
+static void bfd_send_packet(UNUSED fr_event_list_t *eel, UNUSED struct timeval *now, void *ctx)
 {
 	bfd_state_t *session = ctx;
 	bfd_packet_t bfd;
@@ -885,7 +894,7 @@ static int bfd_start_packets(bfd_state_t *session)
 	/*
 	 *	Reset the timers.
 	 */
-	fr_event_delete(session->el, &session->ev_packet);
+	fr_event_timer_delete(session->el, &session->ev_packet);
 
 	gettimeofday(&session->last_sent, NULL);
 	now = session->last_sent;
@@ -920,8 +929,8 @@ static int bfd_start_packets(bfd_state_t *session)
 		now.tv_usec -= USEC;
 	}
 
-	if (fr_event_insert(session->el, bfd_send_packet, session, &now,
-			    &session->ev_packet) < 0) {
+	if (fr_event_timer_insert(session, session->el, &session->ev_packet,
+				  &now, bfd_send_packet, session) < 0) {
 		rad_assert("Failed to insert event" == NULL);
 	}
 
@@ -933,7 +942,7 @@ static void bfd_set_timeout(bfd_state_t *session, struct timeval *when)
 {
 	struct timeval now = *when;
 
-	fr_event_delete(session->el, &session->ev_timeout);
+	fr_event_timer_delete(session->el, &session->ev_timeout);
 
 	if (session->detection_time >= USEC) {
 		now.tv_sec += session->detection_time / USEC;
@@ -961,8 +970,8 @@ static void bfd_set_timeout(bfd_state_t *session, struct timeval *when)
 		}
 	}
 
-	if (fr_event_insert(session->el, bfd_detection_timeout, session, &now,
-			     &session->ev_timeout) < 0) {
+	if (fr_event_timer_insert(session, session->el, &session->ev_timeout,
+				  &now, bfd_detection_timeout, session) < 0) {
 		rad_assert("Failed to insert event" == NULL);
 	}
 }
@@ -994,8 +1003,8 @@ static int bfd_start_control(bfd_state_t *session)
 
 static int bfd_stop_control(bfd_state_t *session)
 {
-	fr_event_delete(session->el, &session->ev_timeout);
-	fr_event_delete(session->el, &session->ev_packet);
+	fr_event_timer_delete(session->el, &session->ev_timeout);
+	fr_event_timer_delete(session->el, &session->ev_packet);
 	return 1;
 }
 
@@ -1080,7 +1089,7 @@ static void bfd_set_desired_min_tx_interval(bfd_state_t *session,
 }
 
 
-static void bfd_detection_timeout(void *ctx, struct timeval *now)
+static void bfd_detection_timeout(UNUSED fr_event_list_t *eel, struct timeval *now, void *ctx)
 {
 	bfd_state_t *session = ctx;
 
@@ -1342,7 +1351,7 @@ static int bfd_process(bfd_state_t *session, bfd_packet_t *bfd)
 		bfd_start_control(session);
 	}
 
-	if (session->server) {
+	if (session->server_cs) {
 		REQUEST *request;
 		RADIUS_PACKET *packet, *reply;
 
@@ -1365,13 +1374,16 @@ static int bfd_process(bfd_state_t *session, bfd_packet_t *bfd)
 		 */
 
 		if (rad_debug_lvl) {
+			request->log.dst = talloc_zero(request, log_dst_t);
+			request->log.dst->func = vradlog_request;
+			request->log.dst->uctx = &default_log;
+
 			request->log.lvl = RAD_REQUEST_LVL_DEBUG2;
-			request->log.func = vradlog_request;
 		}
 		request->component = NULL;
 		request->module = NULL;
 
-		DEBUG2("server %s {", request->server);
+		DEBUG2("server %s {", cf_section_name2(request->server_cs));
 		unlang_interpret(request, session->unlang, RLM_MODULE_NOTFOUND);
 		DEBUG("}");
 
@@ -1435,6 +1447,11 @@ static int bfd_socket_recv(rad_listen_t *listener)
 		return 0;
 	}
 
+	if (bfd.length > sizeof(bfd)) {
+		DEBUG("BFD packet has wrong length (%d > %zd)", bfd.length, sizeof(bfd));
+		return 0;
+	}
+
 	if (bfd.auth_present) {
 		if (bfd.length < 26) {
 			DEBUG("BFD packet has wrong length (%d < 26)",
@@ -1490,7 +1507,7 @@ static int bfd_socket_recv(rad_listen_t *listener)
 		return 0;
 	}
 
-	if (!el) {
+	if (!event_list) {
 		uint8_t *p = (uint8_t *) &bfd;
 		size_t total = bfd.length;
 
@@ -1534,15 +1551,15 @@ static int bfd_parse_ip_port(CONF_SECTION *cs, fr_ipaddr_t *ipaddr, uint16_t *po
 	 *	Try IPv4 first
 	 */
 	memset(ipaddr, 0, sizeof(*ipaddr));
-	ipaddr->ipaddr.ip4addr.s_addr = htonl(INADDR_NONE);
-	rcode = cf_pair_parse(cs, "ipaddr", FR_ITEM_POINTER(PW_TYPE_IPV4_ADDR, ipaddr), NULL, T_INVALID);
+	ipaddr->addr.v4.s_addr = htonl(INADDR_NONE);
+	rcode = cf_pair_parse(NULL, cs, "ipaddr", FR_ITEM_POINTER(FR_TYPE_IPV4_ADDR, ipaddr), NULL, T_INVALID);
 	if (rcode < 0) return -1;
 
 	if (rcode == 0) { /* successfully parsed IPv4 */
 		ipaddr->af = AF_INET;
 
 	} else {	/* maybe IPv6? */
-		rcode = cf_pair_parse(cs, "ipv6addr", FR_ITEM_POINTER(PW_TYPE_IPV6_ADDR, ipaddr), NULL, T_INVALID);
+		rcode = cf_pair_parse(NULL, cs, "ipv6addr", FR_ITEM_POINTER(FR_TYPE_IPV6_ADDR, ipaddr), NULL, T_INVALID);
 		if (rcode < 0) return -1;
 
 		if (rcode == 1) {
@@ -1553,7 +1570,7 @@ static int bfd_parse_ip_port(CONF_SECTION *cs, fr_ipaddr_t *ipaddr, uint16_t *po
 		ipaddr->af = AF_INET6;
 	}
 
-	rcode = cf_pair_parse(cs, "port", FR_ITEM_POINTER(PW_TYPE_SHORT, port), "0", T_INVALID);
+	rcode = cf_pair_parse(NULL, cs, "port", FR_ITEM_POINTER(FR_TYPE_UINT16, port), "0", T_INVALID);
 	if (rcode < 0) return -1;
 
 	return 0;
@@ -1569,9 +1586,9 @@ static int bfd_init_sessions(CONF_SECTION *cs, bfd_socket_t *sock, int sockfd)
 	uint16_t port;
 	fr_ipaddr_t ipaddr;
 
-	for (ci=cf_item_find_next(cs, NULL);
+	for (ci=cf_item_next(cs, NULL);
 	     ci != NULL;
-	     ci=cf_item_find_next(cs, ci)) {
+	     ci=cf_item_next(cs, ci)) {
 		bfd_state_t *session, my_session;
 
 	       if (!cf_item_is_section(ci)) continue;
@@ -1624,8 +1641,7 @@ static int bfd_socket_decode(UNUSED rad_listen_t *listener, UNUSED REQUEST *requ
 
 static int bfd_session_cmp(const void *one, const void *two)
 {
-	const bfd_state_t *a = one;
-	const bfd_state_t *b = two;
+	const bfd_state_t *a = one, *b = two;
 
 	return fr_ipaddr_cmp(&a->remote_ipaddr, &b->remote_ipaddr);
 }
@@ -1647,7 +1663,6 @@ static int bfd_socket_parse(CONF_SECTION *cs, rad_listen_t *this)
 	char const *auth_type_str = NULL;
 	uint16_t listen_port;
 	fr_ipaddr_t ipaddr;
-	CONF_SECTION *server;
 
 	rad_assert(sock != NULL);
 
@@ -1658,17 +1673,24 @@ static int bfd_socket_parse(CONF_SECTION *cs, rad_listen_t *this)
 	sock->my_ipaddr = ipaddr;
 	sock->my_port = listen_port;
 
-	cf_pair_parse(cs, "interface", FR_ITEM_POINTER(PW_TYPE_STRING, &sock->interface), NULL, T_INVALID);
+	if (cf_pair_parse(sock, cs, "interface", FR_ITEM_POINTER(FR_TYPE_STRING, &sock->interface), NULL, T_INVALID) < 0) return -1;
 
-	cf_pair_parse(cs, "min_receive_interval", FR_ITEM_POINTER(PW_TYPE_INTEGER, &sock->min_rx_interval), "1000", T_BARE_WORD);
-	cf_pair_parse(cs, "max_timeouts", FR_ITEM_POINTER(PW_TYPE_INTEGER, &sock->max_timeouts), "3", T_BARE_WORD);
-	cf_pair_parse(cs, "demand", FR_ITEM_POINTER(PW_TYPE_BOOLEAN, &sock->demand), "no", T_DOUBLE_QUOTED_STRING);
-	cf_pair_parse(cs, "auth_type", FR_ITEM_POINTER(PW_TYPE_STRING, &auth_type_str), NULL, T_INVALID);
+	if (cf_pair_parse(sock, cs, "min_receive_interval", FR_ITEM_POINTER(FR_TYPE_UINT32,
+			  &sock->min_rx_interval), "1000", T_BARE_WORD) < 0) return -1;
+	if (cf_pair_parse(sock, cs, "max_timeouts", FR_ITEM_POINTER(FR_TYPE_UINT32,
+			  &sock->max_timeouts), "3", T_BARE_WORD) < 0) return -1;
+	if (cf_pair_parse(sock, cs, "demand", FR_ITEM_POINTER(FR_TYPE_BOOL, &sock->demand),
+			  "no", T_DOUBLE_QUOTED_STRING) < 0) return -1;
+	if (cf_pair_parse(NULL, cs, "auth_type", FR_ITEM_POINTER(FR_TYPE_STRING, &auth_type_str),
+			  NULL, T_INVALID) < 0) return -1;
 
 	if (!this->server) {
-		cf_pair_parse(cs, "server", FR_ITEM_POINTER(PW_TYPE_STRING, &sock->server), NULL, T_INVALID);
+		char const *server;
+		if (cf_pair_parse(sock, cs, "server", FR_ITEM_POINTER(FR_TYPE_STRING, &server),
+				  NULL, T_INVALID) < 0) return -1;
+		sock->server_cs = virtual_server_find(server);
 	} else {
-		sock->server = this->server;
+		sock->server_cs = this->server_cs;
 	}
 
 	if (sock->min_tx_interval < 100) sock->min_tx_interval = 100;
@@ -1683,12 +1705,12 @@ static int bfd_socket_parse(CONF_SECTION *cs, rad_listen_t *this)
 	sock->auth_type = fr_str2int(auth_types, auth_type_str, BFD_AUTH_INVALID);
 	if (sock->auth_type == BFD_AUTH_INVALID) {
 		ERROR("Unknown auth_type '%s'", auth_type_str);
-		exit(1);
+		return -1;
 	}
 
 	if (sock->auth_type == BFD_AUTH_SIMPLE) {
 		ERROR("'simple' authentication is insecure and is not supported");
-		exit(1);
+		return -1;
 	}
 
 	if (sock->auth_type != BFD_AUTH_RESERVED) {
@@ -1696,28 +1718,27 @@ static int bfd_socket_parse(CONF_SECTION *cs, rad_listen_t *this)
 
 		if (sock->secret_len == 0) {
 			ERROR("Cannot have empty secret");
-			exit(1);
+			return -1;
 		}
 
 		if (((sock->auth_type == BFD_AUTH_KEYED_MD5) ||
 		     (sock->auth_type == BFD_AUTH_MET_KEYED_MD5)) &&
 		    (sock->secret_len > 16)) {
 			ERROR("Secret must be no more than 16 bytes when using MD5");
-			exit(1);
+			return -1;
 		}
 	}
 
 	sock->session_tree = rbtree_create(sock, bfd_session_cmp, bfd_session_free, 0);
 	if (!sock->session_tree) {
 		ERROR("Failed creating session tree!");
-		exit(1);
+		return -1;
 	}
 
 	/*
 	 *	Find the sibling "bfd" section of the "listen" section.
 	 */
-	server = cf_item_parent(cf_section_to_item(cs));
-	sock->unlang = cf_section_sub_find(server, "bfd");
+	sock->unlang = cf_section_find(cf_item_to_section(cf_parent(cs)), "bfd", NULL);
 
 	return 0;
 }
@@ -1725,12 +1746,12 @@ static int bfd_socket_parse(CONF_SECTION *cs, rad_listen_t *this)
 static int bfd_socket_open(CONF_SECTION *cs, rad_listen_t *this)
 {
 	int rcode;
-	int port;
+	uint16_t port;
 	bfd_socket_t *sock = this->data;
 
 	port = sock->my_port;
 
-	this->fd = fr_socket_server_base(IPPROTO_UDP, &sock->my_ipaddr, &port, "bfd-control", true);
+	this->fd = fr_socket_server_udp(&sock->my_ipaddr, &port, "bfd-control", true);
 	if (this->fd < 0) {
 		char buffer[256];
 
@@ -1741,7 +1762,7 @@ static int bfd_socket_open(CONF_SECTION *cs, rad_listen_t *this)
 	}
 
 	rad_suid_up();
-	rcode = fr_socket_server_bind(this->fd, &sock->my_ipaddr, &port, sock->interface);
+	rcode = fr_socket_bind(this->fd, &sock->my_ipaddr, &port, sock->interface);
 	rad_suid_down();
 	sock->my_port = port;
 
@@ -1758,7 +1779,7 @@ static int bfd_socket_open(CONF_SECTION *cs, rad_listen_t *this)
 	 *	Bootstrap the initial set of connections.
 	 */
 	if (bfd_init_sessions(cs, sock, this->fd) < 0) {
-		exit(1);
+		return -1;
 	}
 
 	return 0;
@@ -1775,7 +1796,7 @@ static int bfd_socket_print(const rad_listen_t *this, char *buffer, size_t bufsi
 	FORWARD;
 
 	if ((sock->my_ipaddr.af == AF_INET) &&
-	    (sock->my_ipaddr.ipaddr.ip4addr.s_addr == htonl(INADDR_ANY))) {
+	    (sock->my_ipaddr.addr.v4.s_addr == htonl(INADDR_ANY))) {
 		strlcpy(buffer, "*", bufsize);
 	} else {
 		fr_inet_ntoh(&sock->my_ipaddr, buffer, bufsize);
@@ -1798,9 +1819,9 @@ static int bfd_socket_bootstrap(CONF_SECTION *server_cs, UNUSED CONF_SECTION *li
 {
 	CONF_SECTION *cs;
 
-	cs = cf_section_sub_find(server_cs, "bfd");
+	cs = cf_section_find(server_cs, "bfd", NULL);
 	if (!cs) {
-		cf_log_err_cs(server_cs, "No 'bfd' sub-section found");
+		cf_log_err(server_cs, "No 'bfd' sub-section found");
 		return -1;
 	}
 
@@ -1814,16 +1835,16 @@ static int bfd_socket_compile(CONF_SECTION *server_cs, UNUSED CONF_SECTION *list
 {
 	CONF_SECTION *cs;
 
-	cs = cf_section_sub_find(server_cs, "bfd");
+	cs = cf_section_find(server_cs, "bfd", NULL);
 	if (!cs) {
-		cf_log_err_cs(server_cs, "No 'bfd' sub-section found");
+		cf_log_err(server_cs, "No 'bfd' sub-section found");
 		return -1;
 	}
 
-	cf_log_module(cs, "Loading bfd {...}");
+	cf_log_debug(cs, "Loading bfd {...}");
 
 	if (unlang_compile(cs, MOD_AUTHORIZE) < 0) {
-		cf_log_err_cs(cs, "Failed compiling 'bfd' section");
+		cf_log_err(cs, "Failed compiling 'bfd' section");
 		return -1;
 	}
 

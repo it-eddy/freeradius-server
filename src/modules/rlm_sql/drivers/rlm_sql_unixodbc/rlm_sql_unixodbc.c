@@ -237,7 +237,7 @@ static sql_rcode_t sql_fetch_row(rlm_sql_row_t *out, rlm_sql_handle_t *handle, r
 	handle->row = NULL;
 
 	err_handle = SQLFetch(conn->stmt);
-	if (err_handle == SQL_NO_DATA_FOUND) return RLM_SQL_OK;
+	if (err_handle == SQL_NO_DATA_FOUND) return RLM_SQL_NO_MORE_ROWS;
 
 	if ((state = sql_check_error(err_handle, handle, config))) return state;
 
@@ -315,7 +315,7 @@ static size_t sql_error(TALLOC_CTX *ctx, sql_log_entry_t out[], NDEBUG_UNUSED si
 	if (errnum == 0) return 0;
 
 	out[0].type = L_ERR;
-	out[0].msg = talloc_asprintf(ctx, "%s: %s", state, errbuff);
+	out[0].msg = talloc_typed_asprintf(ctx, "%s: %s", state, errbuff);
 
 	return 1;
 }

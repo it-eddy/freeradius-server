@@ -25,6 +25,8 @@
  */
 RCSIDH(heap_h, "$Id$")
 
+#include <sys/types.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -32,11 +34,11 @@ extern "C" {
 typedef int (*fr_heap_cmp_t)(void const *, void const *);
 
 typedef struct fr_heap_t fr_heap_t;
-fr_heap_t *fr_heap_create(fr_heap_cmp_t cmp, size_t offset);
-void fr_heap_delete(fr_heap_t *hp);
+fr_heap_t *fr_heap_create(fr_heap_cmp_t cmp, ssize_t offset);
 
 int fr_heap_insert(fr_heap_t *hp, void *data);
 int fr_heap_extract(fr_heap_t *hp, void *data);
+void *fr_heap_pop(fr_heap_t *hp) CC_HINT(nonnull);
 void *fr_heap_peek(fr_heap_t *hp);
 void *fr_heap_peek_tail(fr_heap_t *hp);
 size_t fr_heap_num_elements(fr_heap_t *hp);

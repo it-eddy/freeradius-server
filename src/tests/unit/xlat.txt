@@ -1,3 +1,7 @@
+xlat %{Tunnel-Password}
+data %{Tunnel-Password}
+
+
 #
 #  Tests for xlat expansion
 #
@@ -7,12 +11,6 @@ data ERROR offset 2 'Unknown module'
 
 xlat %{test:bar}
 data %{test:bar}
-
-xlat %{1}
-data %{1}
-
-xlat %{33}
-data ERROR offset 2 'Invalid regex reference.  Must be in range 0-32'
 
 xlat %{%{foo}:-%{bar}}
 data ERROR offset 4 'Unknown attribute'
@@ -76,12 +74,6 @@ data %{User-Name[*]}
 
 xlat %{request:User-Name[#]}
 data %{User-Name[#]}
-
-xlat %{coa:User-Name[#]}
-data %{coa:User-Name[#]}
-
-xlat %{coaX:User-Name[#]}
-data ERROR offset 2 'Unknown module'
 
 xlat %{3GPP-SGSN-Address}
 data %{3GPP-SGSN-Address}

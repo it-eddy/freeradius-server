@@ -11,11 +11,8 @@ case "$1" in
 	fi
 
         for file in /etc/freeradius/mods-config/files/pre-proxy \
-          /etc/freeradius/mods-config/preprocess/huntgroups \
-          /etc/freeradius/mods-config/preprocess/hints \
           /etc/freeradius/mods-config/files/accounting \
           /etc/freeradius/experimental.conf \
-          /etc/freeradius/proxy.conf \
           /etc/freeradius/clients.conf
         do
           if dpkg-statoverride --list | grep -qw $file$; then

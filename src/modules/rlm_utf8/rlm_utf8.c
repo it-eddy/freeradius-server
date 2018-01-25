@@ -29,16 +29,16 @@ RCSID("$Id$")
 /*
  *	Reject any non-UTF8 data.
  */
-static rlm_rcode_t CC_HINT(nonnull) mod_utf8_clean(UNUSED void *instance, REQUEST *request)
+static rlm_rcode_t CC_HINT(nonnull) mod_utf8_clean(UNUSED void *instance, UNUSED void *thread, REQUEST *request)
 {
-	size_t i, len;
-	VALUE_PAIR *vp;
-	vp_cursor_t cursor;
+	size_t		i, len;
+	VALUE_PAIR	*vp;
+	fr_cursor_t	cursor;
 
 	for (vp = fr_cursor_init(&cursor, &request->packet->vps);
 	     vp;
 	     vp = fr_cursor_next(&cursor)) {
-		if (vp->da->type != PW_TYPE_STRING) continue;
+		if (vp->vp_type != FR_TYPE_STRING) continue;
 
 		for (i = 0; i < vp->vp_length; i += len) {
 			len = fr_utf8_char(&vp->vp_octets[i], -1);

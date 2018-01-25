@@ -42,11 +42,11 @@ USES_APPLE_DEPRECATED_API	/* OpenSSL API has been deprecated by Apple */
 #endif
 
 static CONF_PARSER submodule_config[] = {
-	{ FR_CONF_OFFSET("tls", PW_TYPE_STRING, rlm_eap_tls_t, tls_conf_name) },
+	{ FR_CONF_OFFSET("tls", FR_TYPE_STRING, rlm_eap_tls_t, tls_conf_name) },
 
-	{ FR_CONF_OFFSET("require_client_cert", PW_TYPE_BOOLEAN, rlm_eap_tls_t, req_client_cert), .dflt = "yes" },
-	{ FR_CONF_OFFSET("include_length", PW_TYPE_BOOLEAN, rlm_eap_tls_t, include_length), .dflt = "yes" },
-	{ FR_CONF_OFFSET("virtual_server", PW_TYPE_STRING, rlm_eap_tls_t, virtual_server) },
+	{ FR_CONF_OFFSET("require_client_cert", FR_TYPE_BOOL, rlm_eap_tls_t, req_client_cert), .dflt = "yes" },
+	{ FR_CONF_OFFSET("include_length", FR_TYPE_BOOL, rlm_eap_tls_t, include_length), .dflt = "yes" },
+	{ FR_CONF_OFFSET("virtual_server", FR_TYPE_STRING, rlm_eap_tls_t, virtual_server) },
 	CONF_PARSER_TERMINATOR
 };
 
@@ -91,10 +91,17 @@ static rlm_rcode_t mod_process(void *type_arg, eap_session_t *eap_session)
 			fake->packet->vps = fr_pair_list_copy(fake->packet, request->packet->vps);
 
 			/* set the virtual server to use */
-			if ((vp = fr_pair_find_by_num(request->control, 0, PW_VIRTUAL_SERVER, TAG_ANY)) != NULL) {
-				fake->server = vp->vp_strvalue;
+			if ((vp = fr_pair_find_by_num(request->control, 0, FR_VIRTUAL_SERVER, TAG_ANY)) != NULL) {
+				fake->server_cs = virtual_server_find(vp->vp_strvalue);
+				if (!fake->server_cs) {
+					REDEBUG2("Virtual server \"%s\" not found", vp->vp_strvalue);
+					talloc_free(fake);
+					eap_tls_fail(eap_session);
+					return RLM_MODULE_INVALID;
+				}
 			} else {
-				fake->server = inst->virtual_server;
+				fake->server_cs = virtual_server_find(inst->virtual_server);
+				rad_assert(fake->server_cs);
 			}
 
 			RDEBUG2("Validating certificate");
@@ -105,7 +112,7 @@ static rlm_rcode_t mod_process(void *type_arg, eap_session_t *eap_session)
 						  TAG_ANY);
 
 			/* reject if virtual server didn't return accept */
-			if (fake->reply->code != PW_CODE_ACCESS_ACCEPT) {
+			if (fake->reply->code != FR_CODE_ACCESS_ACCEPT) {
 				RDEBUG2("Certificate rejected by the virtual server");
 				talloc_free(fake);
 				eap_tls_fail(eap_session);
@@ -168,9 +175,9 @@ static rlm_rcode_t mod_session_init(void *type_arg, eap_session_t *eap_session)
 	 *	EAP-TLS-Require-Client-Cert attribute will override
 	 *	the require_client_cert configuration option.
 	 */
-	vp = fr_pair_find_by_num(eap_session->request->control, 0, PW_EAP_TLS_REQUIRE_CLIENT_CERT, TAG_ANY);
+	vp = fr_pair_find_by_num(eap_session->request->control, 0, FR_EAP_TLS_REQUIRE_CLIENT_CERT, TAG_ANY);
 	if (vp) {
-		client_cert = vp->vp_integer ? true : false;
+		client_cert = vp->vp_uint32 ? true : false;
 	} else {
 		client_cert = inst->req_client_cert;
 	}
@@ -201,7 +208,7 @@ static rlm_rcode_t mod_session_init(void *type_arg, eap_session_t *eap_session)
 /*
  *	Attach the EAP-TLS module.
  */
-static int mod_instantiate(UNUSED rlm_eap_config_t const *config, void *instance, CONF_SECTION *cs)
+static int mod_instantiate(void *instance, CONF_SECTION *cs)
 {
 	rlm_eap_tls_t *inst = talloc_get_type_abort(instance, rlm_eap_tls_t);
 
@@ -223,6 +230,7 @@ rlm_eap_submodule_t rlm_eap_tls = {
 	.name		= "eap_tls",
 	.magic		= RLM_MODULE_INIT,
 
+	.provides	= { FR_EAP_TLS },
 	.inst_size	= sizeof(rlm_eap_tls_t),
 	.config		= submodule_config,
 	.instantiate	= mod_instantiate,	/* Create new submodule instance */

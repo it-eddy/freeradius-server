@@ -130,8 +130,7 @@ static void state_entry_unlink(fr_state_tree_t *state, fr_state_entry_t *entry);
  */
 static int state_entry_cmp(void const *one, void const *two)
 {
-	fr_state_entry_t const *a = one;
-	fr_state_entry_t const *b = two;
+	fr_state_entry_t const *a = one, *b = two;
 
 	return memcmp(a->state, b->state, sizeof(a->state));
 }
@@ -163,7 +162,7 @@ static int _state_tree_free(fr_state_tree_t *state)
 	/*
 	 *	Free the rbtree
 	 */
-	rbtree_free(state->tree);
+	talloc_free(state->tree);
 
 	if (state == global_state) global_state = NULL;
 
@@ -264,9 +263,9 @@ static int _state_entry_free(fr_state_entry_t *entry)
 	 *	by the state context.
 	 */
 	if (entry->ctx) {
-		for (vp = fr_cursor_init(&cursor, &entry->vps);
+		for (vp = fr_pair_cursor_init(&cursor, &entry->vps);
 		     vp;
-		     vp = fr_cursor_next(&cursor)) {
+		     vp = fr_pair_cursor_next(&cursor)) {
 			rad_assert(entry->ctx == talloc_parent(vp));
 		}
 	}
@@ -391,12 +390,12 @@ static fr_state_entry_t *state_entry_create(fr_state_tree_t *state, REQUEST *req
 	entry->cleanup = now + state->timeout;
 
 	/*
-	 *	Some modules like rlm_otp create their own magic
+	 *	Some modules create their own magic
 	 *	state attributes.  If a state value already exists
 	 *	int the reply, we use that in preference to the
 	 *	old state.
 	 */
-	vp = fr_pair_find_by_num(packet->vps, 0, PW_STATE, TAG_ANY);
+	vp = fr_pair_find_by_num(packet->vps, 0, FR_STATE, TAG_ANY);
 	if (vp) {
 		if (DEBUG_ENABLED && (vp->vp_length > sizeof(entry->state))) {
 			WARN("State too long, will be truncated.  Expected <= %zd bytes, got %zu bytes",
@@ -438,7 +437,7 @@ static fr_state_entry_t *state_entry_create(fr_state_tree_t *state, REQUEST *req
 		 */
 		entry->state_comp.server_id = main_config.state_server_id;
 
-		vp = fr_pair_afrom_num(packet, 0, PW_STATE);
+		vp = fr_pair_afrom_num(packet, 0, FR_STATE);
 		fr_pair_value_memcpy(vp, entry->state, sizeof(entry->state));
 		fr_pair_add(&packet->vps, vp);
 	}
@@ -464,7 +463,7 @@ static fr_state_entry_t *state_entry_create(fr_state_tree_t *state, REQUEST *req
 	 *	only succeed in the virtual server that created the state
 	 *	value.
 	 */
-	*((uint32_t *)(&entry->state_comp.server_hash)) ^= fr_hash_string(request->server);
+	*((uint32_t *)(&entry->state_comp.server_hash)) ^= fr_hash_string(cf_section_name2(request->server_cs));
 
 	if (!rbtree_insert(state->tree, entry)) {
 		talloc_free(entry);
@@ -499,7 +498,7 @@ static fr_state_entry_t *state_entry_find(fr_state_tree_t *state, REQUEST *reque
 	VALUE_PAIR *vp;
 	fr_state_entry_t *entry, my_entry;
 
-	vp = fr_pair_find_by_num(packet->vps, 0, PW_STATE, TAG_ANY);
+	vp = fr_pair_find_by_num(packet->vps, 0, FR_STATE, TAG_ANY);
 	if (!vp) return NULL;
 
 	if (vp->vp_length != sizeof(my_entry.state)) return NULL;
@@ -509,13 +508,11 @@ static fr_state_entry_t *state_entry_find(fr_state_tree_t *state, REQUEST *reque
 	/*
 	 *	Make it unique for different virtual servers handling the same request
 	 */
-	my_entry.state_comp.server_hash ^= fr_hash_string(request->server);
+	my_entry.state_comp.server_hash ^= fr_hash_string(cf_section_name2(request->server_cs));
 
 	entry = rbtree_finddata(state->tree, &my_entry);
 
-#ifdef WITH_VERIFY_PTR
 	if (entry) (void) talloc_get_type_abort(entry, fr_state_entry_t);
-#endif
 
 	return entry;
 }
@@ -549,6 +546,8 @@ void fr_state_discard(fr_state_tree_t *state, REQUEST *request, RADIUS_PACKET *o
 	request->state = NULL;
 	TALLOC_FREE(entry);
 
+	RDEBUG3("RADIUS State - discarded");
+
 	return;
 }
 
@@ -569,7 +568,7 @@ void fr_state_to_request(fr_state_tree_t *state, REQUEST *request, RADIUS_PACKET
 	/*
 	 *	No State, don't do anything.
 	 */
-	if (!fr_pair_find_by_num(request->packet->vps, 0, PW_STATE, TAG_ANY)) {
+	if (!fr_pair_find_by_num(request->packet->vps, 0, FR_STATE, TAG_ANY)) {
 		RDEBUG3("No &request:State attribute, can't restore &session-state");
 		if (request->seq_start == 0) request->seq_start = request->number;	/* Need check for fake requests */
 		return;
@@ -596,8 +595,6 @@ void fr_state_to_request(fr_state_tree_t *state, REQUEST *request, RADIUS_PACKET
 	if (request->state) {
 		RDEBUG2("Restored &session-state");
 		rdebug_pair_list(L_DBG_LVL_2, request, request->state, "&session-state:");
-	} else {
-		RDEBUG3("No &session-state attributes to restore");
 	}
 
 	/*
@@ -605,7 +602,9 @@ void fr_state_to_request(fr_state_tree_t *state, REQUEST *request, RADIUS_PACKET
 	 */
 	if (old_ctx) talloc_free(old_ctx);
 
-	VERIFY_REQUEST(request);
+	RDEBUG3("RADIUS State - restored");
+
+	REQUEST_VERIFY(request);
 	return;
 }
 
@@ -624,7 +623,7 @@ bool fr_request_to_state(fr_state_tree_t *state, REQUEST *request, RADIUS_PACKET
 
 	request_data_by_persistance(&data, request, true);
 
-	if (request->state && !data) return true;
+	if (!request->state && !data) return true;
 
 	if (request->state) {
 		RDEBUG2("Saving &session-state");
@@ -655,8 +654,9 @@ bool fr_request_to_state(fr_state_tree_t *state, REQUEST *request, RADIUS_PACKET
 
 	PTHREAD_MUTEX_UNLOCK(&state->mutex);
 
-	rad_assert(request->state == NULL);
-	VERIFY_REQUEST(request);
+	RDEBUG3("RADIUS State - saved");
+	REQUEST_VERIFY(request);
+
 	return true;
 }
 

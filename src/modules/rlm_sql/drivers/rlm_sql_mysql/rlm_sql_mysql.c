@@ -38,12 +38,16 @@ RCSID("$Id$")
 #ifdef HAVE_MYSQL_MYSQL_H
 #  include <mysql/mysql_version.h>
 #  include <mysql/errmsg.h>
-#  include <mysql/mysql.h>
+DIAG_OFF(strict-prototypes)	/* Seen with homebrew mysql client 5.7.13 */
+#  include <mysql.h>
+DIAG_ON(strict-prototypes)
 #  include <mysql/mysqld_error.h>
 #elif defined(HAVE_MYSQL_H)
 #  include <mysql_version.h>
 #  include <errmsg.h>
+DIAG_OFF(strict-prototypes)	/* Seen with homebrew mysql client 5.7.13 */
 #  include <mysql.h>
+DIAG_ON(strict-prototypes)
 #  include <mysqld_error.h>
 #endif
 
@@ -66,7 +70,6 @@ typedef struct rlm_sql_mysql_conn {
 	MYSQL		db;
 	MYSQL		*sock;
 	MYSQL_RES	*result;
-	rlm_sql_row_t	row;
 } rlm_sql_mysql_conn_t;
 
 typedef struct rlm_sql_mysql_config {
@@ -83,22 +86,22 @@ typedef struct rlm_sql_mysql_config {
 } rlm_sql_mysql_t;
 
 static CONF_PARSER tls_config[] = {
-	{ FR_CONF_OFFSET("ca_file", PW_TYPE_FILE_INPUT, rlm_sql_mysql_t, tls_ca_file) },
-	{ FR_CONF_OFFSET("ca_path", PW_TYPE_FILE_INPUT, rlm_sql_mysql_t, tls_ca_path) },
-	{ FR_CONF_OFFSET("certificate_file", PW_TYPE_FILE_INPUT, rlm_sql_mysql_t, tls_certificate_file) },
-	{ FR_CONF_OFFSET("private_key_file", PW_TYPE_FILE_INPUT, rlm_sql_mysql_t, tls_private_key_file) },
+	{ FR_CONF_OFFSET("ca_file", FR_TYPE_FILE_INPUT, rlm_sql_mysql_t, tls_ca_file) },
+	{ FR_CONF_OFFSET("ca_path", FR_TYPE_FILE_INPUT, rlm_sql_mysql_t, tls_ca_path) },
+	{ FR_CONF_OFFSET("certificate_file", FR_TYPE_FILE_INPUT, rlm_sql_mysql_t, tls_certificate_file) },
+	{ FR_CONF_OFFSET("private_key_file", FR_TYPE_FILE_INPUT, rlm_sql_mysql_t, tls_private_key_file) },
 
 	/*
 	 *	MySQL Specific TLS attributes
 	 */
-	{ FR_CONF_OFFSET("cipher", PW_TYPE_STRING, rlm_sql_mysql_t, tls_cipher) },
+	{ FR_CONF_OFFSET("cipher", FR_TYPE_STRING, rlm_sql_mysql_t, tls_cipher) },
 	CONF_PARSER_TERMINATOR
 };
 
 static const CONF_PARSER driver_config[] = {
-	{ FR_CONF_POINTER("tls", PW_TYPE_SUBSECTION, NULL), .subcs = (void const *) tls_config },
+	{ FR_CONF_POINTER("tls", FR_TYPE_SUBSECTION, NULL), .subcs = (void const *) tls_config },
 
-	{ FR_CONF_OFFSET("warnings", PW_TYPE_STRING, rlm_sql_mysql_t, warnings_str), .dflt = "auto" },
+	{ FR_CONF_OFFSET("warnings", FR_TYPE_STRING, rlm_sql_mysql_t, warnings_str), .dflt = "auto" },
 	CONF_PARSER_TERMINATOR
 };
 
@@ -153,7 +156,7 @@ static sql_rcode_t sql_socket_init(rlm_sql_handle_t *handle, rlm_sql_config_t *c
 {
 	rlm_sql_mysql_conn_t *conn;
 	rlm_sql_mysql_t *inst = config->driver;
-	unsigned int connect_timeout = timeout->tv_usec;
+	unsigned int connect_timeout = timeout->tv_sec;
 	unsigned long sql_flags;
 
 	MEM(conn = handle->conn = talloc_zero(handle, rlm_sql_mysql_conn_t));
@@ -357,7 +360,8 @@ static sql_rcode_t sql_store_result(rlm_sql_handle_t *handle, UNUSED rlm_sql_con
 	}
 
 retry_store_result:
-	if (!(conn->result = mysql_store_result(conn->sock))) {
+	conn->result = mysql_store_result(conn->sock);
+	if (!conn->result) {
 		rcode = sql_check_error(conn->sock, 0);
 		if (rcode != RLM_SQL_OK) return rcode;
 #if (MYSQL_VERSION_ID >= 40100)
@@ -366,6 +370,7 @@ retry_store_result:
 			/* there are more results */
 			goto retry_store_result;
 		} else if (ret > 0) return sql_check_error(NULL, ret);
+		/* ret == -1 signals no more results */
 #endif
 	}
 	return RLM_SQL_OK;
@@ -458,9 +463,12 @@ static sql_rcode_t sql_fields(char const **out[], rlm_sql_handle_t *handle, rlm_
 
 static sql_rcode_t sql_fetch_row(rlm_sql_row_t *out, rlm_sql_handle_t *handle, rlm_sql_config_t *config)
 {
-	rlm_sql_mysql_conn_t *conn = handle->conn;
-	sql_rcode_t rcode;
-	int ret;
+	rlm_sql_mysql_conn_t	*conn = handle->conn;
+	sql_rcode_t		rcode;
+	MYSQL_ROW		row;
+	int			ret;
+	unsigned int		num_fields, i;
+	unsigned long		*field_lens;
 
 	*out = NULL;
 
@@ -469,9 +477,11 @@ static sql_rcode_t sql_fetch_row(rlm_sql_row_t *out, rlm_sql_handle_t *handle, r
 	 */
 	if (!conn->result) return RLM_SQL_RECONNECT;
 
+	TALLOC_FREE(handle->row);		/* Clear previous row set */
+
 retry_fetch_row:
-	*out = handle->row = mysql_fetch_row(conn->result);
-	if (!handle->row) {
+	row = mysql_fetch_row(conn->result);
+	if (!row) {
 		rcode = sql_check_error(conn->sock, 0);
 		if (rcode != RLM_SQL_OK) return rcode;
 
@@ -485,8 +495,21 @@ retry_fetch_row:
 				goto retry_fetch_row;
 			}
 		} else if (ret > 0) return sql_check_error(NULL, ret);
+		/* If ret is -1 then there are no more rows */
 #endif
+		return RLM_SQL_NO_MORE_ROWS;
 	}
+
+	num_fields = mysql_num_fields(conn->result);
+	if (!num_fields) return RLM_SQL_NO_MORE_ROWS;
+
+ 	field_lens = mysql_fetch_lengths(conn->result);
+
+	MEM(*out = handle->row = talloc_zero_array(handle, char *, num_fields + 1));
+	for (i = 0; i < num_fields; i++) {
+		MEM(handle->row[i] = talloc_bstrndup(handle->row, row[i], field_lens[i]));
+	}
+
 	return RLM_SQL_OK;
 }
 
@@ -498,6 +521,7 @@ static sql_rcode_t sql_free_result(rlm_sql_handle_t *handle, UNUSED rlm_sql_conf
 		mysql_free_result(conn->result);
 		conn->result = NULL;
 	}
+	TALLOC_FREE(handle->row);
 
 	return RLM_SQL_OK;
 }
@@ -552,7 +576,7 @@ static size_t sql_warnings(TALLOC_CTX *ctx, sql_log_entry_t out[], size_t outlen
 
 	while ((row = mysql_fetch_row(result))) {
 		char *msg = NULL;
-		log_type_t type;
+		fr_log_type_t type;
 
 		/*
 		 *	Translate the MySQL log level into our internal
@@ -562,7 +586,7 @@ static size_t sql_warnings(TALLOC_CTX *ctx, sql_log_entry_t out[], size_t outlen
 		else if (strcasecmp(row[0], "note") == 0) type = L_DBG;
 		else type = L_ERR;
 
-		msg = talloc_asprintf(ctx, "%s: %s", row[1], row[2]);
+		msg = talloc_typed_asprintf(ctx, "%s: %s", row[1], row[2]);
 		out[i].type = type;
 		out[i].msg = msg;
 		if (++i == outlen) break;
@@ -601,7 +625,7 @@ static size_t sql_error(TALLOC_CTX *ctx, sql_log_entry_t out[], size_t outlen,
 	 *	Grab the error now in case it gets cleared on the next operation.
 	 */
 	if (error && (error[0] != '\0')) {
-		error = talloc_asprintf(ctx, "ERROR %u (%s): %s", mysql_errno(conn->sock), error,
+		error = talloc_typed_asprintf(ctx, "ERROR %u (%s): %s", mysql_errno(conn->sock), error,
 					mysql_sqlstate(conn->sock));
 	}
 

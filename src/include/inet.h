@@ -43,11 +43,11 @@ extern "C" {
 typedef struct fr_ipaddr_t {
 	int		af;			//!< Address family.
 	union {
-		struct in_addr	ip4addr;		//!< IPv4 address.
-		struct in6_addr ip6addr;		//!< IPv6 address.
-	} ipaddr;
+		struct in_addr	v4;		//!< IPv4 address.
+		struct in6_addr v6;		//!< IPv6 address.
+	} addr;
 	uint8_t		prefix;	        	//!< Prefix length - Between 0-32 for IPv4 and 0-128 for IPv6.
-	uint32_t	zone_id;		//!< A host may have multiple link-local interfaces
+	uint32_t	scope_id;		//!< A host may have multiple link-local interfaces
 						//!< the scope ID allows the application to specify which of
 						//!< those interfaces the IP applies to.  A special scope_id
 						//!< of zero means that any interface of a given scope can
@@ -87,6 +87,12 @@ extern struct in6_addr fr_inet_link_local6;
 #define FR_IPADDR_PREFIX_STRLEN (FR_IPADDR_STRLEN + 1 + 3)
 
 /*
+ *	Utility functions
+ */
+int	fr_ipaddr_is_inaddr_any(fr_ipaddr_t const *ipaddr);
+int	fr_ipaddr_is_prefix(fr_ipaddr_t const *ipaddr);
+
+/*
  *	IP address masking
  */
 void	fr_ipaddr_mask(fr_ipaddr_t *addr, uint8_t prefix);
@@ -107,9 +113,9 @@ int	fr_inet_pton(fr_ipaddr_t *out, char const *value, ssize_t inlen, int af, boo
 int	fr_inet_pton_port(fr_ipaddr_t *out, uint16_t *port_out, char const *value,
 			  ssize_t inlen, int af, bool resolve, bool mask);
 
-char	*fr_inet_ntop(char out[FR_IPADDR_STRLEN], size_t outlen, fr_ipaddr_t *addr);
+char	*fr_inet_ntop(char out[FR_IPADDR_STRLEN], size_t outlen, fr_ipaddr_t const *addr);
 
-char	*fr_inet_ntop_prefix(char out[FR_IPADDR_PREFIX_STRLEN], size_t outlen, fr_ipaddr_t *addr);
+char	*fr_inet_ntop_prefix(char out[FR_IPADDR_PREFIX_STRLEN], size_t outlen, fr_ipaddr_t const *addr);
 
 char	*fr_inet_ifid_ntop(char *out, size_t outlen, uint8_t const *ifid);
 

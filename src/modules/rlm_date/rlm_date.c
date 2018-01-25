@@ -35,12 +35,12 @@ typedef struct rlm_date_t {
 } rlm_date_t;
 
 static const CONF_PARSER module_config[] = {
-	{ FR_CONF_OFFSET("format", PW_TYPE_STRING, rlm_date_t, fmt), .dflt = "%b %e %Y %H:%M:%S %Z" },
+	{ FR_CONF_OFFSET("format", FR_TYPE_STRING, rlm_date_t, fmt), .dflt = "%b %e %Y %H:%M:%S %Z" },
 	CONF_PARSER_TERMINATOR
 };
 
 DIAG_OFF(format-nonliteral)
-static ssize_t xlat_date_convert(char **out, size_t outlen,
+static ssize_t xlat_date_convert(UNUSED TALLOC_CTX *ctx, char **out, size_t outlen,
 				 void const *mod_inst, UNUSED void const *xlat_inst,
 				 REQUEST *request, char const *fmt)
 {
@@ -49,21 +49,23 @@ static ssize_t xlat_date_convert(char **out, size_t outlen,
 	struct tm tminfo;
 	VALUE_PAIR *vp;
 
+	memset(&tminfo, 0, sizeof(tminfo));
+
 	if ((radius_get_vp(&vp, request, fmt) < 0) || !vp) return 0;
 
-	switch (vp->da->type) {
+	switch (vp->vp_type) {
 	/*
 	 *	These are 'to' types, i.e. we'll convert the integers
 	 *	to a time structure, and then output it in the specified
 	 *	format as a string.
 	 */
-	case PW_TYPE_DATE:
+	case FR_TYPE_DATE:
 		date = vp->vp_date;
 		goto encode;
 
-	case PW_TYPE_INTEGER:
-	case PW_TYPE_INTEGER64:
-		date = (time_t) vp->vp_integer;
+	case FR_TYPE_UINT32:
+	case FR_TYPE_UINT64:
+		date = (time_t) vp->vp_uint32;
 
 	encode:
 		if (localtime_r(&date, &tminfo) == NULL) {
@@ -77,7 +79,7 @@ static ssize_t xlat_date_convert(char **out, size_t outlen,
 	 *	into a time structure, and then output it as an integer
 	 *	unix timestamp.
 	 */
-	case PW_TYPE_STRING:
+	case FR_TYPE_STRING:
 		if (strptime(vp->vp_strvalue, inst->fmt, &tminfo) == NULL) {
 			REDEBUG("Failed to parse time string \"%s\" as format '%s'", vp->vp_strvalue, inst->fmt);
 			goto error;
@@ -99,7 +101,7 @@ error:
 }
 DIAG_ON(format-nonliteral)
 
-static int mod_bootstrap(CONF_SECTION *conf, void *instance)
+static int mod_bootstrap(void *instance, CONF_SECTION *conf)
 {
 	rlm_date_t *inst = instance;
 
@@ -108,7 +110,7 @@ static int mod_bootstrap(CONF_SECTION *conf, void *instance)
 		inst->xlat_name = cf_section_name1(conf);
 	}
 
-	xlat_register(inst, inst->xlat_name, xlat_date_convert, NULL, NULL, 0, XLAT_DEFAULT_BUF_LEN);
+	xlat_register(inst, inst->xlat_name, xlat_date_convert, NULL, NULL, 0, XLAT_DEFAULT_BUF_LEN, true);
 
 	return 0;
 }

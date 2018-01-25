@@ -82,13 +82,13 @@ int radius_compare_vps(UNUSED REQUEST *request, VALUE_PAIR *check, VALUE_PAIR *v
 		char *expr = NULL, *value = NULL;
 		char const *expr_p, *value_p;
 
-		if (check->da->type == PW_TYPE_STRING) {
+		if (check->vp_type == FR_TYPE_STRING) {
 			expr_p = check->vp_strvalue;
 		} else {
 			expr_p = expr = fr_pair_value_asprint(check, check, '\0');
 		}
 
-		if (vp->da->type == PW_TYPE_STRING) {
+		if (vp->vp_type == FR_TYPE_STRING) {
 			value_p = vp->vp_strvalue;
 		} else {
 			value_p = value = fr_pair_value_asprint(vp, vp, '\0');
@@ -116,7 +116,7 @@ int radius_compare_vps(UNUSED REQUEST *request, VALUE_PAIR *check, VALUE_PAIR *v
 
 		slen = regex_exec(preg, value_p, talloc_array_length(value_p) - 1, rxmatch, &nmatch);
 		if (slen < 0) {
-			RERROR("%s", fr_strerror());
+			RPERROR("Invalid regex");
 
 			goto regex_error;
 		}
@@ -147,7 +147,7 @@ int radius_compare_vps(UNUSED REQUEST *request, VALUE_PAIR *check, VALUE_PAIR *v
 	 *	a string
 	 *
 	 */
-	if (vp->da->type != check->da->type) return -1;
+	if (vp->vp_type != check->vp_type) return -1;
 
 	/*
 	 *	Tagged attributes are equal if and only if both the
@@ -161,78 +161,79 @@ int radius_compare_vps(UNUSED REQUEST *request, VALUE_PAIR *check, VALUE_PAIR *v
 	/*
 	 *	Not a regular expression, compare the types.
 	 */
-	switch (check->da->type) {
+	switch (check->vp_type) {
 #ifdef WITH_ASCEND_BINARY
 		/*
 		 *	Ascend binary attributes can be treated
 		 *	as opaque objects, I guess...
 		 */
-		case PW_TYPE_ABINARY:
+		case FR_TYPE_ABINARY:
 #endif
-		case PW_TYPE_OCTETS:
+		case FR_TYPE_OCTETS:
 			if (vp->vp_length != check->vp_length) {
 				ret = 1; /* NOT equal */
 				break;
 			}
-			ret = memcmp(vp->vp_strvalue, check->vp_strvalue,
-				     vp->vp_length);
+			ret = memcmp(vp->vp_strvalue, check->vp_strvalue, vp->vp_length);
 			break;
 
-		case PW_TYPE_STRING:
+		case FR_TYPE_STRING:
 			ret = strcmp(vp->vp_strvalue,
 				     check->vp_strvalue);
 			break;
 
-		case PW_TYPE_BYTE:
-			ret = vp->vp_byte - check->vp_byte;
+		case FR_TYPE_UINT8:
+			ret = vp->vp_uint8 - check->vp_uint8;
 			break;
-		case PW_TYPE_SHORT:
-			ret = vp->vp_short - check->vp_short;
+		case FR_TYPE_UINT16:
+			ret = vp->vp_uint16 - check->vp_uint16;
 			break;
-		case PW_TYPE_INTEGER:
-			ret = vp->vp_integer - check->vp_integer;
+		case FR_TYPE_UINT32:
+			ret = vp->vp_uint32 - check->vp_uint32;
 			break;
 
-		case PW_TYPE_INTEGER64:
+		case FR_TYPE_UINT64:
 			/*
 			 *	Don't want integer overflow!
 			 */
-			if (vp->vp_integer64 < check->vp_integer64) {
+			if (vp->vp_uint64 < check->vp_uint64) {
 				ret = -1;
-			} else if (vp->vp_integer64 > check->vp_integer64) {
+			} else if (vp->vp_uint64 > check->vp_uint64) {
 				ret = +1;
 			} else {
 				ret = 0;
 			}
 			break;
 
-		case PW_TYPE_SIGNED:
-			if (vp->vp_signed < check->vp_signed) {
+		case FR_TYPE_INT32:
+			if (vp->vp_int32 < check->vp_int32) {
 				ret = -1;
-			} else if (vp->vp_signed > check->vp_signed) {
+			} else if (vp->vp_int32 > check->vp_int32) {
 				ret = +1;
 			} else {
 				ret = 0;
 			}
 			break;
 
-		case PW_TYPE_DATE:
+		case FR_TYPE_DATE:
 			ret = vp->vp_date - check->vp_date;
 			break;
 
-		case PW_TYPE_IPV4_ADDR:
-			ret = ntohl(vp->vp_ipaddr) - ntohl(check->vp_ipaddr);
+		case FR_TYPE_IPV4_ADDR:
+			ret = ntohl(vp->vp_ipv4addr) - ntohl(check->vp_ipv4addr);
 			break;
 
-		case PW_TYPE_IPV6_ADDR:
-			ret = memcmp(&vp->vp_ipv6addr, &check->vp_ipv6addr, sizeof(vp->vp_ipv6addr));
+		case FR_TYPE_IPV6_ADDR:
+			ret = memcmp(vp->vp_ip.addr.v6.s6_addr, check->vp_ip.addr.v6.s6_addr,
+				     sizeof(vp->vp_ip.addr.v6.s6_addr));
 			break;
 
-		case PW_TYPE_IPV6_PREFIX:
-			ret = memcmp(vp->vp_ipv6prefix, check->vp_ipv6prefix, sizeof(vp->vp_ipv6prefix));
+		case FR_TYPE_IPV4_PREFIX:
+		case FR_TYPE_IPV6_PREFIX:
+			ret = memcmp(&vp->vp_ip, &check->vp_ip, sizeof(vp->vp_ip));
 			break;
 
-		case PW_TYPE_IFID:
+		case FR_TYPE_IFID:
 			ret = memcmp(vp->vp_ifid, check->vp_ifid, sizeof(vp->vp_ifid));
 			break;
 
@@ -365,7 +366,7 @@ int paircompare_register_byname(char const *name, fr_dict_attr_t const *from,
 		}
 	} else if (from) {
 		if (fr_dict_attr_add(NULL, fr_dict_root(fr_dict_internal), name, -1, from->type, flags) < 0) {
-			fr_strerror_printf("Failed creating attribute '%s': %s", name, fr_strerror());
+			fr_strerror_printf_push("Failed creating attribute '%s'", name);
 			return -1;
 		}
 
@@ -479,14 +480,14 @@ void paircompare_unregister_instance(void *instance)
 int paircompare(REQUEST *request, VALUE_PAIR *req_list, VALUE_PAIR *check,
 		VALUE_PAIR **rep_list)
 {
-	vp_cursor_t cursor;
-	VALUE_PAIR *check_item;
-	VALUE_PAIR *auth_item;
-	fr_dict_attr_t const *from;
+	fr_cursor_t		cursor;
+	VALUE_PAIR		*check_item;
+	VALUE_PAIR		*auth_item;
+	fr_dict_attr_t const	*from;
 
-	int result = 0;
-	int compare;
-	bool first_only;
+	int			result = 0;
+	int			compare;
+	bool			first_only;
 
 	for (check_item = fr_cursor_init(&cursor, &check);
 	     check_item;
@@ -506,12 +507,12 @@ int paircompare(REQUEST *request, VALUE_PAIR *req_list, VALUE_PAIR *check,
 		 *	Attributes we skip during comparison.
 		 *	These are "server" check items.
 		 */
-		case PW_CRYPT_PASSWORD:
-		case PW_AUTH_TYPE:
-		case PW_AUTZ_TYPE:
-		case PW_ACCT_TYPE:
-		case PW_SESSION_TYPE:
-		case PW_STRIP_USER_NAME:
+		case FR_CRYPT_PASSWORD:
+		case FR_AUTH_TYPE:
+		case FR_AUTZ_TYPE:
+		case FR_ACCT_TYPE:
+		case FR_SESSION_TYPE:
+		case FR_STRIP_USER_NAME:
 			continue;
 
 		/*
@@ -523,13 +524,13 @@ int paircompare(REQUEST *request, VALUE_PAIR *req_list, VALUE_PAIR *check,
 		 *
 		 *	This hack makes CHAP-Password work..
 		 */
-		case PW_USER_PASSWORD:
+		case FR_USER_PASSWORD:
 			if (check_item->op == T_OP_CMP_EQ) {
 				WARN("Found User-Password == \"...\"");
 				WARN("Are you sure you don't mean Cleartext-Password?");
 				WARN("See \"man rlm_pap\" for more information");
 			}
-			if (fr_pair_find_by_num(req_list, 0, PW_USER_PASSWORD, TAG_ANY) == NULL) {
+			if (fr_pair_find_by_num(req_list, 0, FR_USER_PASSWORD, TAG_ANY) == NULL) {
 				continue;
 			}
 			break;
@@ -578,7 +579,7 @@ int paircompare(REQUEST *request, VALUE_PAIR *req_list, VALUE_PAIR *check,
 		 *	We've got to xlat the string before doing
 		 *	the comparison.
 		 */
-		radius_xlat_do(request, check_item);
+		xlat_eval_do(request, check_item);
 
 		/*
 		 *	OK it is present now compare them.
@@ -652,7 +653,7 @@ int paircompare(REQUEST *request, VALUE_PAIR *req_list, VALUE_PAIR *check,
  *	- -1 On xlat failure.
  *	- -2 On parse failure.
  */
-int radius_xlat_do(REQUEST *request, VALUE_PAIR *vp)
+int xlat_eval_do(REQUEST *request, VALUE_PAIR *vp)
 {
 	ssize_t slen;
 
@@ -661,7 +662,7 @@ int radius_xlat_do(REQUEST *request, VALUE_PAIR *vp)
 
 	vp->type = VT_DATA;
 
-	slen = radius_axlat(&expanded, request, vp->xlat, NULL, NULL);
+	slen = xlat_aeval(request, &expanded, request, vp->xlat, NULL, NULL);
 	talloc_const_free(vp->xlat);
 	vp->xlat = NULL;
 	if (slen < 0) {
@@ -736,16 +737,16 @@ void debug_pair(VALUE_PAIR *vp)
  * @param[in] vp to print.
  * @param[in] prefix (optional).
  */
-void rdebug_pair(log_lvl_t level, REQUEST *request, VALUE_PAIR *vp, char const *prefix)
+void rdebug_pair(fr_log_lvl_t level, REQUEST *request, VALUE_PAIR *vp, char const *prefix)
 {
 	char *value;
 
-	if (!vp || !request || !request->log.func) return;
+	if (!vp || !request || !request->log.dst) return;
 	if (!radlog_debug_enabled(L_DBG, level, request)) return;
 
 
 	value = fr_pair_asprint(request, vp, '"');
-	RDEBUGX(level, "%s%s", prefix ? prefix : "&",  value);
+	RDEBUGX(level, "%s%s", prefix ? prefix : "&", value);
 	talloc_free(value);
 }
 
@@ -756,12 +757,12 @@ void rdebug_pair(log_lvl_t level, REQUEST *request, VALUE_PAIR *vp, char const *
  * @param[in] vp to print.
  * @param[in] prefix (optional).
  */
-void rdebug_pair_list(log_lvl_t level, REQUEST *request, VALUE_PAIR *vp, char const *prefix)
+void rdebug_pair_list(fr_log_lvl_t level, REQUEST *request, VALUE_PAIR *vp, char const *prefix)
 {
-	vp_cursor_t cursor;
+	fr_cursor_t cursor;
 	char *value;
 
-	if (!vp || !request || !request->log.func) return;
+	if (!vp || !request || !request->log.dst) return;
 
 	if (!radlog_debug_enabled(L_DBG, level, request)) return;
 
@@ -769,10 +770,10 @@ void rdebug_pair_list(log_lvl_t level, REQUEST *request, VALUE_PAIR *vp, char co
 	for (vp = fr_cursor_init(&cursor, &vp);
 	     vp;
 	     vp = fr_cursor_next(&cursor)) {
-		VERIFY_VP(vp);
+		VP_VERIFY(vp);
 
 		value = fr_pair_asprint(request, vp, '"');
-		RDEBUGX(level, "%s%s", prefix ? prefix : "&",  value);
+		RDEBUGX(level, "%s%s", prefix ? prefix : "&", value);
 		talloc_free(value);
 	}
 	REXDENT();
@@ -785,12 +786,12 @@ void rdebug_pair_list(log_lvl_t level, REQUEST *request, VALUE_PAIR *vp, char co
  * @param[in] vp to print.
  * @param[in] prefix (optional).
  */
-void rdebug_proto_pair_list(log_lvl_t level, REQUEST *request, VALUE_PAIR *vp, char const *prefix)
+void rdebug_proto_pair_list(fr_log_lvl_t level, REQUEST *request, VALUE_PAIR *vp, char const *prefix)
 {
-	vp_cursor_t cursor;
+	fr_cursor_t cursor;
 	char *value;
 
-	if (!vp || !request || !request->log.func) return;
+	if (!vp || !request || !request->log.dst) return;
 
 	if (!radlog_debug_enabled(L_DBG, level, request)) return;
 
@@ -798,11 +799,11 @@ void rdebug_proto_pair_list(log_lvl_t level, REQUEST *request, VALUE_PAIR *vp, c
 	for (vp = fr_cursor_init(&cursor, &vp);
 	     vp;
 	     vp = fr_cursor_next(&cursor)) {
-		VERIFY_VP(vp);
+		VP_VERIFY(vp);
 		if (vp->da->flags.internal) continue;
 
 		value = fr_pair_asprint(request, vp, '"');
-		RDEBUGX(level, "%s%s", prefix ? prefix : "",  value);
+		RDEBUGX(level, "%s%s", prefix ? prefix : "", value);
 		talloc_free(value);
 	}
 	REXDENT();
@@ -821,15 +822,15 @@ void rdebug_proto_pair_list(log_lvl_t level, REQUEST *request, VALUE_PAIR *vp, c
 int radius_get_vp(VALUE_PAIR **out, REQUEST *request, char const *name)
 {
 	int rcode;
-	vp_tmpl_t vpt;
+	vp_tmpl_t *vpt;
 
 	*out = NULL;
 
-	if (tmpl_from_attr_str(&vpt, name, REQUEST_CURRENT, PAIR_LIST_REQUEST, false, false) <= 0) {
-		return -4;
-	}
+	if (tmpl_afrom_attr_str(request, &vpt, name,
+				REQUEST_CURRENT, PAIR_LIST_REQUEST, false, false) <= 0) return -4;
 
-	rcode = tmpl_find_vp(out, request, &vpt);
+	rcode = tmpl_find_vp(out, request, vpt);
+	talloc_free(vpt);
 
 	return rcode;
 }
@@ -848,15 +849,15 @@ int radius_get_vp(VALUE_PAIR **out, REQUEST *request, char const *name)
 int radius_copy_vp(TALLOC_CTX *ctx, VALUE_PAIR **out, REQUEST *request, char const *name)
 {
 	int rcode;
-	vp_tmpl_t vpt;
+	vp_tmpl_t *vpt;
 
 	*out = NULL;
 
-	if (tmpl_from_attr_str(&vpt, name, REQUEST_CURRENT, PAIR_LIST_REQUEST, false, false) <= 0) {
-		return -4;
-	}
+	if (tmpl_afrom_attr_str(request, &vpt, name,
+				REQUEST_CURRENT, PAIR_LIST_REQUEST, false, false) <= 0) return -4;
 
-	rcode = tmpl_copy_vps(ctx, out, request, &vpt);
+	rcode = tmpl_copy_vps(ctx, out, request, vpt);
+	talloc_free(vpt);
 
 	return rcode;
 }

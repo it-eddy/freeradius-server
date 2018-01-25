@@ -68,7 +68,7 @@ static int _mod_conn_free(rlm_couchbase_handle_t *chandle)
  */
 void *mod_conn_create(TALLOC_CTX *ctx, void *instance, struct timeval const *timeout)
 {
-	rlm_couchbase_t *inst = instance;           /* module instance pointer */
+	rlm_couchbase_t const *inst = instance;           /* module instance pointer */
 	rlm_couchbase_handle_t *chandle = NULL;     /* connection handle pointer */
 	cookie_t *cookie = NULL;                    /* couchbase cookie */
 	lcb_t cb_inst;                              /* couchbase connection instance */
@@ -157,11 +157,11 @@ int mod_build_attribute_element_map(CONF_SECTION *conf, void *instance)
 	const char *attribute, *element;    /* attribute and element names */
 
 	/* find update section */
-	cs = cf_section_sub_find(conf, "update");
+	cs = cf_section_find(conf, "update", NULL);
 
 	/* backwards compatibility */
 	if (!cs) {
-		cs = cf_section_sub_find(conf, "map");
+		cs = cf_section_find(conf, "map", NULL);
 		WARN("found deprecated 'map' section - please change to 'update'");
 	}
 
@@ -176,7 +176,7 @@ int mod_build_attribute_element_map(CONF_SECTION *conf, void *instance)
 	inst->map = json_object_new_object();
 
 	/* parse update section */
-	for (ci = cf_item_find_next(cs, NULL); ci != NULL; ci = cf_item_find_next(cs, ci)) {
+	for (ci = cf_item_next(cs, NULL); ci != NULL; ci = cf_item_next(cs, ci)) {
 		/* validate item */
 		if (!cf_item_is_pair(ci)) {
 			ERROR("failed to parse invalid item in 'update' section");
@@ -275,7 +275,7 @@ int mod_attribute_to_element(const char *name, json_object *map, void *buf)
  * }
  * @endcode
  *
- * @param  json    The JSON object representation of the user documnent.
+ * @param  json    The JSON object representation of the user document.
  * @param  section The pair section ("config" or "reply").
  * @param  request The request to which the generated pairs should be added.
  */
@@ -336,8 +336,7 @@ void *mod_json_object_to_value_pairs(json_object *json, const char *section, REQ
 						fr_str2int(fr_tokens_table, json_object_get_string(jop), 0));
 					/* check pair */
 					if (!vp) {
-						RERROR("could not build value pair for '%s' attribute (%s)",
-						       attribute, fr_strerror());
+						RPERROR("could not build value pair for '%s'", attribute);
 						/* return */
 						return NULL;
 					}
@@ -388,17 +387,17 @@ json_object *mod_value_pair_to_json_object(REQUEST *request, VALUE_PAIR *vp)
 	if (!vp->da->flags.has_tag) {
 		unsigned int i;
 
-		switch (vp->da->type) {
-		case PW_TYPE_INTEGER:
-			i = vp->vp_integer;
+		switch (vp->vp_type) {
+		case FR_TYPE_UINT32:
+			i = vp->vp_uint32;
 			goto print_int;
 
-		case PW_TYPE_SHORT:
-			i = vp->vp_short;
+		case FR_TYPE_UINT16:
+			i = vp->vp_uint16;
 			goto print_int;
 
-		case PW_TYPE_BYTE:
-			i = vp->vp_byte;
+		case FR_TYPE_UINT8:
+			i = vp->vp_uint8;
 
 		print_int:
 			/* skip if we have flags */
@@ -415,24 +414,24 @@ json_object *mod_value_pair_to_json_object(REQUEST *request, VALUE_PAIR *vp)
 			return json_object_new_int(i);
 #endif
 
-		case PW_TYPE_SIGNED:
+		case FR_TYPE_INT32:
 #ifdef HAVE_JSON_OBJECT_NEW_INT64
 			/* debug */
 			RDEBUG3("creating new int64 for signed 32 bit integer '%s'", vp->da->name);
 			/* return as 64 bit int - json-c represents all ints as 64 bits internally */
-			return json_object_new_int64(vp->vp_signed);
+			return json_object_new_int64(vp->vp_int32);
 #else
 			RDEBUG3("creating new int for signed 32 bit integer '%s'", vp->da->name);
 			/* return as signed int */
-			return json_object_new_int(vp->vp_signed);
+			return json_object_new_int(vp->vp_int32);
 #endif
 
-		case PW_TYPE_INTEGER64:
+		case FR_TYPE_UINT64:
 #ifdef HAVE_JSON_OBJECT_NEW_INT64
 			/* debug */
 			RDEBUG3("creating new int64 for 64 bit integer '%s'", vp->da->name);
 			/* return as 64 bit int - because it is a 64 bit int */
-			return json_object_new_int64(vp->vp_integer64);
+			return json_object_new_int64(vp->vp_uint64);
 #else
 			/* warning */
 			RWARN("skipping 64 bit integer attribute '%s' - please upgrade json-c to 0.10+", vp->da->name);
@@ -446,8 +445,8 @@ json_object *mod_value_pair_to_json_object(REQUEST *request, VALUE_PAIR *vp)
 	}
 
 	/* keep going if not set above */
-	switch (vp->da->type) {
-	case PW_TYPE_STRING:
+	switch (vp->vp_type) {
+	case FR_TYPE_STRING:
 		/* debug */
 		RDEBUG3("assigning string '%s' as string", vp->da->name);
 		/* return string value */
@@ -497,7 +496,7 @@ int mod_ensure_start_timestamp(json_object *json, VALUE_PAIR *vps)
 	}
 
 	/* get current event timestamp */
-	if ((vp = fr_pair_find_by_num(vps, 0, PW_EVENT_TIMESTAMP, TAG_ANY)) != NULL) {
+	if ((vp = fr_pair_find_by_num(vps, 0, FR_EVENT_TIMESTAMP, TAG_ANY)) != NULL) {
 		/* get seconds value from attribute */
 		ts = vp->vp_date;
 	} else {
@@ -511,9 +510,9 @@ int mod_ensure_start_timestamp(json_object *json, VALUE_PAIR *vps)
 	memset(value, 0, sizeof(value));
 
 	/* get elapsed session time */
-	if ((vp = fr_pair_find_by_num(vps, 0, PW_ACCT_SESSION_TIME, TAG_ANY)) != NULL) {
+	if ((vp = fr_pair_find_by_num(vps, 0, FR_ACCT_SESSION_TIME, TAG_ANY)) != NULL) {
 		/* calculate diff */
-		ts = (ts - vp->vp_integer);
+		ts = (ts - vp->vp_uint32);
 		/* calculate start time */
 		size_t length = strftime(value, sizeof(value), "%b %e %Y %H:%M:%S %Z", localtime_r(&ts, &tm));
 		/* check length */
@@ -589,7 +588,7 @@ int mod_load_client_documents(rlm_couchbase_t *inst, CONF_SECTION *tmpl, CONF_SE
 	RADCLIENT *c;                                            /* freeradius client */
 
 	/* get handle */
-	handle = fr_connection_get(inst->pool, NULL);
+	handle = fr_pool_connection_get(inst->pool, NULL);
 
 	/* check handle */
 	if (!handle) return -1;
@@ -722,8 +721,8 @@ int mod_load_client_documents(rlm_couchbase_t *inst, CONF_SECTION *tmpl, CONF_SE
 		DEBUG3("cookie->jobj == %s", json_object_to_json_string(cookie->jobj));
 
 		/* allocate conf section */
-		client = tmpl ? cf_section_dup(NULL, tmpl, "client", vkey, true) :
-				cf_section_alloc(NULL, "client", vkey);
+		client = tmpl ? cf_section_dup(NULL, NULL, tmpl, "client", vkey, true) :
+				cf_section_alloc(NULL, NULL, "client", vkey);
 
 		if (client_map_section(client, map, _get_client_value, cookie->jobj) < 0) {
 			/* free config setion */
@@ -737,7 +736,7 @@ int mod_load_client_documents(rlm_couchbase_t *inst, CONF_SECTION *tmpl, CONF_SE
 		/*
 		 * @todo These should be parented from something.
 		 */
-		c = client_afrom_cs(NULL, client, false, false);
+		c = client_afrom_cs(NULL, client, false);
 		if (!c) {
 			ERROR("failed to allocate client");
 			/* free config setion */
@@ -788,7 +787,7 @@ int mod_load_client_documents(rlm_couchbase_t *inst, CONF_SECTION *tmpl, CONF_SE
 	}
 
 	/* release handle */
-	if (handle) fr_connection_release(inst->pool, NULL, handle);
+	if (handle) fr_pool_connection_release(inst->pool, NULL, handle);
 
 	/* return */
 	return retval;

@@ -61,8 +61,8 @@ typedef struct rlm_sql_sqlite {
 } rlm_sql_sqlite_t;
 
 static const CONF_PARSER driver_config[] = {
-	{ FR_CONF_OFFSET("filename", PW_TYPE_FILE_OUTPUT | PW_TYPE_REQUIRED, rlm_sql_sqlite_t, filename) },
-	{ FR_CONF_OFFSET("busy_timeout", PW_TYPE_INTEGER, rlm_sql_sqlite_t, busy_timeout), .dflt = "200" },
+	{ FR_CONF_OFFSET("filename", FR_TYPE_FILE_OUTPUT | FR_TYPE_REQUIRED, rlm_sql_sqlite_t, filename) },
+	{ FR_CONF_OFFSET("busy_timeout", FR_TYPE_UINT32, rlm_sql_sqlite_t, busy_timeout), .dflt = "200" },
 	CONF_PARSER_TERMINATOR
 };
 
@@ -234,7 +234,7 @@ static int sql_loadfile(TALLOC_CTX *ctx, sqlite3 *db, char const *filename)
 	ssize_t		len;
 	int		statement_cnt = 0;
 	char		*buffer;
-	char		*p, *q, *s;
+	char		*p, *q;
 	int		cl;
 	FILE		*f;
 	struct stat	finfo;
@@ -273,7 +273,7 @@ static int sql_loadfile(TALLOC_CTX *ctx, sqlite3 *db, char const *filename)
 	}
 
 	MEM(buffer = talloc_array(ctx, char, finfo.st_size + 1));
-	len = fread(buffer, sizeof(char), finfo.st_size + 1, f);
+	len = fread(buffer, sizeof(char), finfo.st_size, f);
 	if (len > finfo.st_size) {
 		talloc_free(buffer);
 		goto too_big;
@@ -322,20 +322,30 @@ static int sql_loadfile(TALLOC_CTX *ctx, sqlite3 *db, char const *filename)
 	/*
 	 *	Statement delimiter is ;\n
 	 */
-	s = p = buffer;
+	p = buffer;
 	while ((q = strchr(p, ';'))) {
-		if (q[1] != '\n') {
+		uint32_t statement_len;
+
+		if ((q[1] != '\n') && (q[1] != '\0')) {
 			p = q + 1;
 			statement_cnt++;
 			continue;
 		}
 
-		*q = '\0';
+#ifndef NDEBUG
+		if ((q - p) > (1 << 20)) {
+			ERROR("Failed preparing statement %i: too long!", statement_cnt);
+			talloc_free(buffer);
+			return -1;
+		}
+#endif
+
+		statement_len = q - p;
 
 #ifdef HAVE_SQLITE3_PREPARE_V2
-		status = sqlite3_prepare_v2(db, s, len, &statement, &z_tail);
+		status = sqlite3_prepare_v2(db, p, statement_len, &statement, &z_tail);
 #else
-		status = sqlite3_prepare(db, s, len, &statement, &z_tail);
+		status = sqlite3_prepare(db, p, statement_len, &statement, &z_tail);
 #endif
 
 		if (sql_check_error(db, status) != RLM_SQL_OK) {
@@ -360,7 +370,7 @@ static int sql_loadfile(TALLOC_CTX *ctx, sqlite3 *db, char const *filename)
 		}
 
 		statement_cnt++;
-		p = s = q + 1;
+		p = q + 1;
 	}
 
 	talloc_free(buffer);
@@ -541,9 +551,9 @@ static sql_rcode_t sql_fetch_row(rlm_sql_row_t *out, rlm_sql_handle_t *handle, r
 	if (sql_check_error(conn->db, status) != RLM_SQL_OK) return RLM_SQL_ERROR;
 
 	/*
-	 *	No more rows to process (were done)
+	 *	No more rows to process (we're done)
 	 */
-	if (status == SQLITE_DONE) return RLM_SQL_OK;
+	if (status == SQLITE_DONE) return RLM_SQL_NO_MORE_ROWS;
 
 	/*
 	 *	We only need to do this once per result set, because
@@ -622,7 +632,7 @@ static sql_rcode_t sql_free_result(rlm_sql_handle_t *handle, UNUSED rlm_sql_conf
 	 *	It's just the last error that occurred processing the
 	 *	statement.
 	 */
-	return 0;
+	return RLM_SQL_OK;
 }
 
 /** Retrieves any errors associated with the connection handle

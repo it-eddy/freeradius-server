@@ -44,7 +44,7 @@ typedef struct rlm_logintime_t {
 } rlm_logintime_t;
 
 static const CONF_PARSER module_config[] = {
-  { FR_CONF_OFFSET("minimum_timeout", PW_TYPE_INTEGER, rlm_logintime_t, min_time), .dflt = "60" },
+  { FR_CONF_OFFSET("minimum_timeout", FR_TYPE_UINT32, rlm_logintime_t, min_time), .dflt = "60" },
 	CONF_PARSER_TERMINATOR
 };
 
@@ -125,13 +125,13 @@ static int time_of_day(UNUSED void *instance, REQUEST *request,
 /*
  *      Check if account has expired, and if user may login now.
  */
-static rlm_rcode_t CC_HINT(nonnull) mod_authorize(void *instance, REQUEST *request)
+static rlm_rcode_t CC_HINT(nonnull) mod_authorize(void *instance, UNUSED void *thread, REQUEST *request)
 {
-	rlm_logintime_t *inst = instance;
+	rlm_logintime_t const *inst = instance;
 	VALUE_PAIR *ends, *timeout;
 	int left;
 
-	ends = fr_pair_find_by_num(request->control, 0, PW_LOGIN_TIME, TAG_ANY);
+	ends = fr_pair_find_by_num(request->control, 0, FR_LOGIN_TIME, TAG_ANY);
 	if (!ends) {
 		return RLM_MODULE_NOOP;
 	}
@@ -175,14 +175,14 @@ static rlm_rcode_t CC_HINT(nonnull) mod_authorize(void *instance, REQUEST *reque
 	 */
 	RDEBUG("Login within allowed time-slot, %d seconds left in this session", left);
 
-	timeout = fr_pair_find_by_num(request->reply->vps, 0, PW_SESSION_TIMEOUT, TAG_ANY);
+	timeout = fr_pair_find_by_num(request->reply->vps, 0, FR_SESSION_TIMEOUT, TAG_ANY);
 	if (timeout) {	/* just update... */
-		if (timeout->vp_integer > (unsigned int) left) {
-			timeout->vp_integer = left;
+		if (timeout->vp_uint32 > (unsigned int) left) {
+			timeout->vp_uint32 = left;
 		}
 	} else {
-		timeout = radius_pair_create(request->reply, &request->reply->vps, PW_SESSION_TIMEOUT, 0);
-		timeout->vp_integer = left;
+		timeout = radius_pair_create(request->reply, &request->reply->vps, FR_SESSION_TIMEOUT, 0);
+		timeout->vp_uint32 = left;
 	}
 
 	RDEBUG("reply:Session-Timeout set to %d", left);
@@ -201,20 +201,20 @@ static rlm_rcode_t CC_HINT(nonnull) mod_authorize(void *instance, REQUEST *reque
  *	that must be referenced in later calls, store a handle to it
  *	in *instance otherwise put a null pointer there.
  */
-static int mod_instantiate(CONF_SECTION *conf, void *instance)
+static int mod_instantiate(void *instance, CONF_SECTION *conf)
 {
 	rlm_logintime_t *inst = instance;
 
 	if (inst->min_time == 0) {
-		cf_log_err_cs(conf, "Invalid value '0' for minimum_timeout");
+		cf_log_err(conf, "Invalid value '0' for minimum_timeout");
 		return -1;
 	}
 
 	/*
 	 * Register a Current-Time comparison function
 	 */
-	paircompare_register(fr_dict_attr_by_num(NULL, 0, PW_CURRENT_TIME), NULL, true, timecmp, inst);
-	paircompare_register(fr_dict_attr_by_num(NULL, 0, PW_TIME_OF_DAY), NULL, true, time_of_day, inst);
+	paircompare_register(fr_dict_attr_by_num(NULL, 0, FR_CURRENT_TIME), NULL, true, timecmp, inst);
+	paircompare_register(fr_dict_attr_by_num(NULL, 0, FR_TIME_OF_DAY), NULL, true, time_of_day, inst);
 
 	return 0;
 }

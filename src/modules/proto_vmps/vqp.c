@@ -70,6 +70,17 @@ RCSID("$Id$")
 #define VQP_VERSION (1)
 #define VQP_MAX_ATTRIBUTES (12)
 
+static size_t const fr_vqp_attr_sizes[FR_TYPE_MAX + 1][2] = {
+	[FR_TYPE_INVALID]	= {~0, 0},	//!< Ensure array starts at 0 (umm?)
+
+	[FR_TYPE_STRING]	= {0, ~0},
+	[FR_TYPE_OCTETS]	= {0, ~0},
+
+	[FR_TYPE_IPV4_ADDR]	= {4, 4},
+	[FR_TYPE_ETHERNET]	= {6, 6},
+
+	[FR_TYPE_MAX]		= {~0, 0}	//!< Ensure array covers all types.
+};
 
 static ssize_t vqp_recv_header(int sockfd)
 {
@@ -88,7 +99,7 @@ static ssize_t vqp_recv_header(int sockfd)
 	 *	Too little data is available, discard the packet.
 	 */
 	if (data_len < VQP_HDR_LEN) {
-		udp_recv_discard(sockfd);
+		(void) udp_recv_discard(sockfd);
 		return 0;
 	}
 
@@ -100,7 +111,7 @@ static ssize_t vqp_recv_header(int sockfd)
 	    (header[1] < 1) ||
 	    (header[1] > 4) ||
 	    (header[3] > VQP_MAX_ATTRIBUTES)) {
-		udp_recv_discard(sockfd);
+		(void) udp_recv_discard(sockfd);
 		return 0;
 	}
 
@@ -111,12 +122,68 @@ static ssize_t vqp_recv_header(int sockfd)
 	return (12 * (4 + 4 + MAX_VMPS_LEN));
 }
 
+bool fr_vqp_ok(uint8_t const *packet, size_t *packet_len)
+{
+	uint8_t	const	*ptr;
+	ssize_t		data_len;
+	int		attrlen;
+
+	if (*packet_len == VQP_HDR_LEN) return true;
+
+	/*
+	 *	Skip the header.
+	 */
+	ptr = packet + VQP_HDR_LEN;
+	data_len = *packet_len - VQP_HDR_LEN;
+
+	while (data_len > 0) {
+		if (data_len < 7) {
+			fr_strerror_printf("Packet contains malformed attribute");
+			false;
+		}
+
+		/*
+		 *	Attributes are 4 bytes
+		 *	0x00000c01 ... 0x00000c08
+		 */
+		if ((ptr[0] != 0) || (ptr[1] != 0) ||
+		    (ptr[2] != 0x0c) || (ptr[3] < 1) || (ptr[3] > 8)) {
+			fr_strerror_printf("Packet contains invalid attribute");
+			return false;
+		}
+
+		/*
+		 *	Length is 2 bytes
+		 *
+		 *	We support short lengths, as there's no reason
+		 *	for bigger lengths to exist... admins won't be
+		 *	typing in a 32K vlan name.
+		 *
+		 *	It's OK for ethernet frames to be longer.
+		 */
+		if ((ptr[3] != 5) &&
+		    ((ptr[4] != 0) || (ptr[5] > MAX_VMPS_LEN))) {
+			fr_strerror_printf("Packet contains attribute with invalid length %02x %02x", ptr[4], ptr[5]);
+			return false;
+		}
+
+		attrlen = (ptr[4] << 8) | ptr[5];
+		ptr += 6 + attrlen;
+		data_len -= (6 + attrlen);
+	}
+
+	/*
+	 *	UDP reads may return too much data, so we truncate it.
+	 */
+	*packet_len = ptr - packet;
+
+	return true;
+}
+
 RADIUS_PACKET *vqp_recv(TALLOC_CTX *ctx, int sockfd)
 {
-	uint8_t		*ptr;
 	ssize_t		data_len;
 	uint32_t	id;
-	int		attrlen;
 	RADIUS_PACKET	*packet;
 
 	data_len = vqp_recv_header(sockfd);
@@ -165,53 +232,9 @@ RADIUS_PACKET *vqp_recv(TALLOC_CTX *ctx, int sockfd)
 	memcpy(&id, packet->data + 4, 4);
 	packet->id = ntohl(id);
 
-	if (packet->data_len == VQP_HDR_LEN) {
-		return packet;
-	}
-
-	/*
-	 *	Skip the header.
-	 */
-	ptr = packet->data + VQP_HDR_LEN;
-	data_len = packet->data_len - VQP_HDR_LEN;
-
-	while (data_len > 0) {
-		if (data_len < 7) {
-			fr_strerror_printf("Packet contains malformed attribute");
-			fr_radius_free(&packet);
-			return NULL;
-		}
-
-		/*
-		 *	Attributes are 4 bytes
-		 *	0x00000c01 ... 0x00000c08
-		 */
-		if ((ptr[0] != 0) || (ptr[1] != 0) ||
-		    (ptr[2] != 0x0c) || (ptr[3] < 1) || (ptr[3] > 8)) {
-			fr_strerror_printf("Packet contains invalid attribute");
-			fr_radius_free(&packet);
-			return NULL;
-		}
-
-		/*
-		 *	Length is 2 bytes
-		 *
-		 *	We support short lengths, as there's no reason
-		 *	for bigger lengths to exist... admins won't be
-		 *	typing in a 32K vlan name.
-		 *
-		 *	It's OK for ethernet frames to be longer.
-		 */
-		if ((ptr[3] != 5) &&
-		    ((ptr[4] != 0) || (ptr[5] > MAX_VMPS_LEN))) {
-			fr_strerror_printf("Packet contains attribute with invalid length %02x %02x", ptr[4], ptr[5]);
-			fr_radius_free(&packet);
-			return NULL;
-		}
-
-		attrlen = (ptr[4] << 8) | ptr[5];
-		ptr += 6 + attrlen;
-		data_len -= (6 + attrlen);
+	if (!fr_vqp_ok(packet->data, &packet->data_len)) {
+		fr_radius_free(&packet);
+		return NULL;
 	}
 
 	return packet;
@@ -242,42 +265,46 @@ int vqp_send(RADIUS_PACKET *packet)
 
 int vqp_decode(RADIUS_PACKET *packet)
 {
-	uint8_t *ptr, *end;
-	int attr, attr_len;
-	vp_cursor_t cursor;
-	VALUE_PAIR *vp;
+	uint8_t		*ptr, *end;
+	int		attr;
+	size_t		attr_len;
+	vp_cursor_t	cursor;
+	VALUE_PAIR	*vp;
 
 	if (!packet || !packet->data) return -1;
 
 	if (packet->data_len < VQP_HDR_LEN) return -1;
 
-	fr_cursor_init(&cursor, &packet->vps);
-	vp = fr_pair_afrom_num(packet, 0, PW_VQP_PACKET_TYPE);
+	fr_pair_cursor_init(&cursor, &packet->vps);
+	vp = fr_pair_afrom_num(packet, 0, FR_VQP_PACKET_TYPE);
 	if (!vp) {
 		fr_strerror_printf("No memory");
 		return -1;
 	}
-	vp->vp_integer = packet->data[1];
+	vp->vp_uint32 = packet->data[1];
+	vp->vp_tainted = true;
 	debug_pair(vp);
-	fr_cursor_append(&cursor, vp);
+	fr_pair_cursor_append(&cursor, vp);
 
-	vp = fr_pair_afrom_num(packet, 0, PW_VQP_ERROR_CODE);
+	vp = fr_pair_afrom_num(packet, 0, FR_VQP_ERROR_CODE);
 	if (!vp) {
 		fr_strerror_printf("No memory");
 		return -1;
 	}
-	vp->vp_integer = packet->data[2];
+	vp->vp_uint32 = packet->data[2];
+	vp->vp_tainted = true;
 	debug_pair(vp);
-	fr_cursor_append(&cursor, vp);
+	fr_pair_cursor_append(&cursor, vp);
 
-	vp = fr_pair_afrom_num(packet, 0, PW_VQP_SEQUENCE_NUMBER);
+	vp = fr_pair_afrom_num(packet, 0, FR_VQP_SEQUENCE_NUMBER);
 	if (!vp) {
 		fr_strerror_printf("No memory");
 		return -1;
 	}
-	vp->vp_integer = packet->id; /* already set by vqp_recv */
+	vp->vp_uint32 = packet->id; /* already set by vqp_recv */
+	vp->vp_tainted = true;
 	debug_pair(vp);
-	fr_cursor_append(&cursor, vp);
+	fr_pair_cursor_append(&cursor, vp);
 
 	ptr = packet->data + VQP_HDR_LEN;
 	end = packet->data + packet->data_len;
@@ -298,24 +325,23 @@ int vqp_decode(RADIUS_PACKET *packet)
 		attr |= 0x2000;
 		vp = fr_pair_afrom_num(packet, 0, attr);
 		if (!vp) {
-			fr_pair_list_free(&packet->vps);
-
 			fr_strerror_printf("No memory");
+
+		error:
+			fr_pair_list_free(&packet->vps);
 			return -1;
 		}
 
-		switch (vp->da->type) {
-		case PW_TYPE_ETHERNET:
-			if (attr_len != 6) goto unknown;
+		switch (vp->vp_type) {
+		case FR_TYPE_ETHERNET:
+			if (attr_len != fr_vqp_attr_sizes[vp->vp_type][0]) goto unknown;
 
 			memcpy(&vp->vp_ether, ptr, 6);
-			vp->vp_length = 6;
 			break;
 
-		case PW_TYPE_IPV4_ADDR:
-			if (attr_len == 4) {
-				memcpy(&vp->vp_ipaddr, ptr, 4);
-				vp->vp_length = 4;
+		case FR_TYPE_IPV4_ADDR:
+			if (attr_len == fr_vqp_attr_sizes[vp->vp_type][0]) {
+				memcpy(&vp->vp_ipv4addr, ptr, 4);
 				break;
 			}
 
@@ -325,22 +351,34 @@ int vqp_decode(RADIUS_PACKET *packet)
 			 *	unknown attr.
 			 */
 		unknown:
-			vp->da = fr_dict_unknown_afrom_fields(vp, fr_dict_root(fr_dict_internal), vp->da->vendor,
-							      vp->da->attr);
+			fr_pair_to_unknown(vp);
 			/* FALL-THROUGH */
 
 		default:
-		case PW_TYPE_OCTETS:
+		case FR_TYPE_OCTETS:
+			if (attr_len > (size_t)(end - ptr)) {
+				fr_strerror_printf("Attribute length exceeds received data");
+				goto error;
+			}
+			if (attr_len == 0) break;
+
 			fr_pair_value_memcpy(vp, ptr, attr_len);
 			break;
 
-		case PW_TYPE_STRING:
+		case FR_TYPE_STRING:
+			if (attr_len > (size_t)(end - ptr)) {
+				fr_strerror_printf("Attribute length exceeds received data");
+				goto error;
+			}
+			if (attr_len == 0) break;
+
 			fr_pair_value_bstrncpy(vp, ptr, attr_len);
 			break;
 		}
 		ptr += attr_len;
+		vp->vp_tainted = true;
 		debug_pair(vp);
-		fr_cursor_append(&cursor, vp);
+		fr_pair_cursor_append(&cursor, vp);
 	}
 
 	/*
@@ -384,13 +422,13 @@ int vqp_encode(RADIUS_PACKET *packet, RADIUS_PACKET *original)
 
 	code = packet->code;
 	if (!code) {
-		vp = fr_pair_find_by_num(packet->vps, 0, PW_VQP_PACKET_TYPE, TAG_ANY);
+		vp = fr_pair_find_by_num(packet->vps, 0, FR_VQP_PACKET_TYPE, TAG_ANY);
 		if (!vp) {
 			fr_strerror_printf("Failed to find VQP-Packet-Type in response packet");
 			return -1;
 		}
 
-		code = vp->vp_integer;
+		code = vp->vp_uint32;
 		if ((code < 1) || (code > 4)) {
 			fr_strerror_printf("Invalid value %d for VQP-Packet-Type", code);
 			return -1;
@@ -399,7 +437,7 @@ int vqp_encode(RADIUS_PACKET *packet, RADIUS_PACKET *original)
 
 	length = VQP_HDR_LEN;
 
-	vp = fr_pair_find_by_num(packet->vps, 0, PW_VQP_ERROR_CODE, TAG_ANY);
+	vp = fr_pair_find_by_num(packet->vps, 0, FR_VQP_ERROR_CODE, TAG_ANY);
 	if (vp) {
 		packet->data = talloc_array(packet, uint8_t, length);
 		if (!packet->data) {
@@ -413,7 +451,7 @@ int vqp_encode(RADIUS_PACKET *packet, RADIUS_PACKET *original)
 		out[0] = VQP_VERSION;
 		out[1] = code;
 
-		out[2] = vp->vp_integer & 0xff;
+		out[2] = vp->vp_uint32 & 0xff;
 		return 0;
 	}
 
@@ -443,7 +481,7 @@ int vqp_encode(RADIUS_PACKET *packet, RADIUS_PACKET *original)
 		}
 
 		length += 6;	/* header */
-		length += vps[i]->vp_length;
+		length += fr_vqp_attr_sizes[vps[i]->vp_type][0];
 	}
 
 	packet->data = talloc_array(packet, uint8_t, length);
@@ -489,12 +527,32 @@ int vqp_encode(RADIUS_PACKET *packet, RADIUS_PACKET *original)
 	 *	Encode the VP's.
 	 */
 	for (i = 0; i < VQP_MAX_ATTRIBUTES; i++) {
+		size_t len;
+
 		if (!vps[i]) break;
 		if (out >= (packet->data + packet->data_len)) break;
 
 		vp = vps[i];
 
 		debug_pair(vp);
+
+		switch (vp->vp_type) {
+		case FR_TYPE_IPV4_ADDR:
+			len = fr_vqp_attr_sizes[vp->vp_type][0];
+			break;
+
+		case FR_TYPE_ETHERNET:
+			len = fr_vqp_attr_sizes[vp->vp_type][0];
+			break;
+
+		case FR_TYPE_OCTETS:
+		case FR_TYPE_STRING:
+			len = vp->vp_length;
+			break;
+
+		default:
+			return -1;
+		}
 
 		/*
 		 *	Type.  Note that we look at only the lower 8
@@ -508,29 +566,32 @@ int vqp_encode(RADIUS_PACKET *packet, RADIUS_PACKET *original)
 
 		/* Length */
 		out[4] = 0;
-		out[5] = vp->vp_length & 0xff;
+		out[5] = len & 0xff;
 
 		out += 6;
 
 		/* Data */
-		switch (vp->da->type) {
-		case PW_TYPE_IPV4_ADDR:
-			memcpy(out, &vp->vp_ipaddr, 4);
+		switch (vp->vp_type) {
+		case FR_TYPE_IPV4_ADDR:
+			memcpy(out, &vp->vp_ipv4addr, len);
+			out += len;
 			break;
 
-		case PW_TYPE_ETHERNET:
-			memcpy(out, vp->vp_ether, vp->vp_length);
+		case FR_TYPE_ETHERNET:
+			memcpy(out, vp->vp_ether, len);
+			out += len;
 			break;
 
-		case PW_TYPE_OCTETS:
-		case PW_TYPE_STRING:
-			memcpy(out, vp->vp_octets, vp->vp_length);
+		case FR_TYPE_OCTETS:
+		case FR_TYPE_STRING:
+			memcpy(out, vp->vp_octets, len);
+			out += len;
 			break;
 
 		default:
 			return -1;
 		}
-		out += vp->vp_length;
+
 	}
 
 	return 0;

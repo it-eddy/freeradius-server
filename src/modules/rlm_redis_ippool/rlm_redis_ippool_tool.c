@@ -26,6 +26,7 @@
  */
 RCSID("$Id$")
 #include <freeradius-devel/libradius.h>
+#include <freeradius-devel/cf_parse.h>
 #include <freeradius-devel/rad_assert.h>
 
 #include "redis.h"
@@ -401,11 +402,11 @@ static bool ipaddr_next(fr_ipaddr_t *ipaddr, fr_ipaddr_t const *end, uint8_t pre
 	{
 		uint128_t ip_curr, ip_end;
 
-		rad_assert((prefix > 0) && (prefix <= 128));
+		if (!fr_cond_assert((prefix > 0) && (prefix <= 128))) return false;
 
 		/* Don't be tempted to cast */
-		memcpy(&ip_curr, ipaddr->ipaddr.ip6addr.s6_addr, sizeof(ip_curr));
-		memcpy(&ip_end, end->ipaddr.ip6addr.s6_addr, sizeof(ip_curr));
+		memcpy(&ip_curr, ipaddr->addr.v6.s6_addr, sizeof(ip_curr));
+		memcpy(&ip_end, end->addr.v6.s6_addr, sizeof(ip_curr));
 
 		ip_curr = ntohlll(ip_curr);
 		ip_end = ntohlll(ip_end);
@@ -416,7 +417,7 @@ static bool ipaddr_next(fr_ipaddr_t *ipaddr, fr_ipaddr_t const *end, uint8_t pre
 		/* Increment the prefix */
 		ip_curr = uint128_add(ip_curr, uint128_lshift(uint128_new(0, 1), (128 - prefix)));
 		ip_curr = htonlll(ip_curr);
-		memcpy(&ipaddr->ipaddr.ip6addr.s6_addr, &ip_curr, sizeof(ipaddr->ipaddr.ip6addr.s6_addr));
+		memcpy(&ipaddr->addr.v6.s6_addr, &ip_curr, sizeof(ipaddr->addr.v6.s6_addr));
 		return true;
 	}
 
@@ -424,17 +425,17 @@ static bool ipaddr_next(fr_ipaddr_t *ipaddr, fr_ipaddr_t const *end, uint8_t pre
 	{
 		uint32_t ip_curr, ip_end;
 
-		rad_assert((prefix > 0) && (prefix <= 32));
+		if (!fr_cond_assert((prefix > 0) && (prefix <= 32))) return false;
 
-		ip_curr = ntohl(ipaddr->ipaddr.ip4addr.s_addr);
-		ip_end = ntohl(end->ipaddr.ip4addr.s_addr);
+		ip_curr = ntohl(ipaddr->addr.v4.s_addr);
+		ip_end = ntohl(end->addr.v4.s_addr);
 
 		/* We're done */
 		if (ip_curr == ip_end) return false;
 
 		/* Increment the prefix */
 		ip_curr += 1 << (32 - prefix);
-		ipaddr->ipaddr.ip4addr.s_addr = htonl(ip_curr);
+		ipaddr->addr.v4.s_addr = htonl(ip_curr);
 		return true;
 	}
 	}
@@ -461,6 +462,8 @@ static int driver_do_lease(void *out, void *instance, ippool_tool_operation_t co
 	REQUEST				*request = request_alloc(inst);
 	redisReply			**replies = NULL;
 
+	unsigned int			pipelined = 0;
+
 	while (more) {
 		size_t	reply_cnt = 0;
 
@@ -470,8 +473,6 @@ static int driver_do_lease(void *out, void *instance, ippool_tool_operation_t co
 							 op->pool, op->pool_len, false);
 		     s_ret == REDIS_RCODE_TRY_AGAIN;
 		     s_ret = fr_redis_cluster_state_next(&state, &conn, inst->cluster, request, status, &replies[0])) {
-		     	int	pipelined = 0;
-
 			status = REDIS_RCODE_SUCCESS;
 
 			/*
@@ -492,8 +493,8 @@ static int driver_do_lease(void *out, void *instance, ippool_tool_operation_t co
 			if (!replies) replies = talloc_zero_array(inst, redisReply *, pipelined);
 			if (!replies) return 0;
 
-			reply_cnt = fr_redis_pipeline_result(&status, replies,
-							     talloc_array_length(replies), conn, pipelined);
+			reply_cnt = fr_redis_pipeline_result(&pipelined, &status, replies,
+							     talloc_array_length(replies), conn);
 			for (i = 0; (size_t)i < reply_cnt; i++) fr_redis_reply_print(L_DBG_LVL_3,
 										     replies[i], request, i);
 		}
@@ -833,20 +834,16 @@ static int8_t pool_cmp(void const *a, void const *b)
 {
 	size_t len_a;
 	size_t len_b;
-
 	int ret;
 
 	len_a = talloc_array_length((uint8_t const *)a);
 	len_b = talloc_array_length((uint8_t const *)b);
 
-	if (len_a > len_b) return 1;
-	if (len_a < len_b) return -1;
+	ret = (len_a > len_b) - (len_a < len_b);
+	if (ret != 0) return ret;
 
 	ret = memcmp(a, b, len_a);
-	if (ret > 0) return 1;
-	if (ret < 0) return -1;
-
-	return 0;
+	return (ret > 0) - (ret < 0);
 }
 
 /** Return the pools available across the cluster
@@ -861,7 +858,8 @@ static int8_t pool_cmp(void const *a, void const *b)
 static ssize_t driver_get_pools(TALLOC_CTX *ctx, uint8_t **out[], void *instance)
 {
 	fr_socket_addr_t	*master;
-	size_t			ret, i, k, used = 0;
+	size_t			k;
+	ssize_t			ret, i, used = 0;
 	fr_redis_conn_t		*conn = NULL;
 	redis_driver_conf_t	*inst = talloc_get_type_abort(instance, redis_driver_conf_t);
 	uint8_t			key[IPPOOL_MAX_POOL_KEY_SIZE];
@@ -891,7 +889,7 @@ static ssize_t driver_get_pools(TALLOC_CTX *ctx, uint8_t **out[], void *instance
 	 *	Iterate over the masters, getting the pools on each
 	 */
 	for (i = 0; i < ret; i++) {
-		fr_connection_pool_t	*pool;
+		fr_pool_t	*pool;
 		redisReply		*reply;
 		char const		*p;
 		size_t			len;
@@ -906,7 +904,7 @@ static ssize_t driver_get_pools(TALLOC_CTX *ctx, uint8_t **out[], void *instance
 			return -1;
 		}
 
-		conn = fr_connection_get(pool, request);
+		conn = fr_pool_connection_get(pool, request);
 		if (!conn) goto error;
 		do {
 			/*
@@ -916,15 +914,15 @@ static ssize_t driver_get_pools(TALLOC_CTX *ctx, uint8_t **out[], void *instance
 			reply = redisCommand(conn->handle, "SCAN %s MATCH %b COUNT 20", cursor, key, key_p - key);
 			if (!reply) {
 				ERROR("Failed reading reply");
-				fr_connection_release(pool, request, conn);
+				fr_pool_connection_release(pool, request, conn);
 				goto error;
 			}
 			fr_redis_reply_print(L_DBG_LVL_3, reply, request, 0);
 			if (fr_redis_command_status(conn, reply) != REDIS_RCODE_SUCCESS) {
-				ERROR("Error retrieving keys %s: %s", cursor, fr_strerror());
+				PERROR("Error retrieving keys %s", cursor);
 
 			reply_error:
-				fr_connection_release(pool, request, conn);
+				fr_pool_connection_release(pool, request, conn);
 				fr_redis_reply_free(reply);
 				goto error;
 			}
@@ -996,7 +994,7 @@ static ssize_t driver_get_pools(TALLOC_CTX *ctx, uint8_t **out[], void *instance
 			fr_redis_reply_free(reply);
 		} while (!((cursor[0] == '0') && (cursor[1] == '\0')));	/* Cursor value of 0 means no more results */
 
-		fr_connection_release(pool, request, conn);
+		fr_pool_connection_release(pool, request, conn);
 	}
 
 	if (used == 0) {
@@ -1054,13 +1052,15 @@ static int driver_get_stats(ippool_tool_stats_t *out, void *instance, uint8_t co
 	int				s_ret = REDIS_RCODE_SUCCESS;
 	REQUEST				*request = request_alloc(inst);
 	redisReply			**replies = NULL, *reply;
-	unsigned int			pipelined = 8;		/* Update if additional commands added */
+	unsigned int			pipelined = 0;		/* Update if additional commands added */
 
 	size_t				reply_cnt = 0, i = 0;
 
+#define STATS_COMMANDS_TOTAL 8
+
 	IPPOOL_BUILD_KEY(key, key_p, key_prefix, key_prefix_len);
 
-	replies = talloc_zero_array(inst, redisReply *, pipelined);
+	MEM(replies = talloc_zero_array(inst, redisReply *, STATS_COMMANDS_TOTAL));
 
 	gettimeofday(&now, NULL);
 
@@ -1084,8 +1084,9 @@ static int driver_get_stats(ippool_tool_stats_t *out, void *instance, uint8_t co
 		redisAppendCommand(conn->handle, "EXEC");
 		if (!replies) return -1;
 
-		reply_cnt = fr_redis_pipeline_result(&status, replies,
-						     talloc_array_length(replies), conn, pipelined);
+		pipelined = STATS_COMMANDS_TOTAL;
+		reply_cnt = fr_redis_pipeline_result(&pipelined, &status, replies,
+						     talloc_array_length(replies), conn);
 		for (i = 0; (size_t)i < reply_cnt; i++) fr_redis_reply_print(L_DBG_LVL_3,
 									     replies[i], request, i);
 	}
@@ -1097,12 +1098,12 @@ static int driver_get_stats(ippool_tool_stats_t *out, void *instance, uint8_t co
 		return -1;
 	}
 
-	if (reply_cnt != pipelined) {
+	if (reply_cnt != STATS_COMMANDS_TOTAL) {
 		ERROR("Failed retrieving pool stats: Expected %i replies, got %zu", pipelined, reply_cnt);
 		goto error;
 	}
 
-	reply = replies[pipelined - 1];
+	reply = replies[reply_cnt - 1];
 
 	if (reply->type != REDIS_REPLY_ARRAY) {
 		ERROR("Failed retrieving pool stats: Expected array got %s",
@@ -1110,8 +1111,8 @@ static int driver_get_stats(ippool_tool_stats_t *out, void *instance, uint8_t co
 		goto error;
 	}
 
-	if (reply->elements != (pipelined - 2)) {
-		ERROR("Failed retrieving pool stats: Expected %i results, got %zu", pipelined - 2, reply->elements);
+	if (reply->elements != (reply_cnt - 2)) {
+		ERROR("Failed retrieving pool stats: Expected %zu results, got %zu", reply_cnt - 2, reply->elements);
 		goto error;
 	}
 
@@ -1144,10 +1145,12 @@ static int driver_init(TALLOC_CTX *ctx, CONF_SECTION *conf, void **instance)
 
 	*instance = NULL;
 
+	if (cf_section_rules_push(conf, redis_config) < 0) return -1;
+
 	this = talloc_zero(ctx, redis_driver_conf_t);
 	if (!this) return -1;
 
-	ret = cf_section_parse(conf, &this->conf, redis_config);
+	ret = cf_section_parse(this, &this->conf, conf);
 	if (ret < 0) {
 		talloc_free(this);
 		return -1;
@@ -1204,12 +1207,12 @@ static int parse_ip_range(fr_ipaddr_t *start_out, fr_ipaddr_t *end_out, char con
 		}
 
 		if (fr_inet_pton(&start, start_buff, -1, AF_UNSPEC, false, true) < 0) {
-			ERROR("Failed parsing \"%s\" as start address: %s", start_buff, fr_strerror());
+			PERROR("Failed parsing \"%s\" as start address", start_buff);
 			return -1;
 		}
 
 		if (fr_inet_pton(&end, end_buff, -1, AF_UNSPEC, false, true) < 0) {
-			ERROR("Failed parsing \"%s\" end address: %s", end_buff, fr_strerror());
+			PERROR("Failed parsing \"%s\" end address", end_buff);
 			return -1;
 		}
 
@@ -1226,8 +1229,8 @@ static int parse_ip_range(fr_ipaddr_t *start_out, fr_ipaddr_t *end_out, char con
 		if (start.af == AF_INET6) {
 			uint128_t start_int, end_int;
 
-			memcpy(&start_int, start.ipaddr.ip6addr.s6_addr, sizeof(start_int));
-			memcpy(&end_int, end.ipaddr.ip6addr.s6_addr, sizeof(end_int));
+			memcpy(&start_int, start.addr.v6.s6_addr, sizeof(start_int));
+			memcpy(&end_int, end.addr.v6.s6_addr, sizeof(end_int));
 			if (uint128_gt(ntohlll(start_int), ntohlll(end_int))) {
 				ERROR("End address must be greater than or equal to start address");
 				return -1;
@@ -1236,8 +1239,8 @@ static int parse_ip_range(fr_ipaddr_t *start_out, fr_ipaddr_t *end_out, char con
 		 *	IPv4 addresses
 		 */
 		} else {
-			if (ntohl((uint32_t)(start.ipaddr.ip4addr.s_addr)) >
-			    ntohl((uint32_t)(end.ipaddr.ip4addr.s_addr))) {
+			if (ntohl((uint32_t)(start.addr.v4.s_addr)) >
+			    ntohl((uint32_t)(end.addr.v4.s_addr))) {
 			 	ERROR("End address must be greater than or equal to start address");
 			 	return -1;
 			}
@@ -1305,7 +1308,7 @@ static int parse_ip_range(fr_ipaddr_t *start_out, fr_ipaddr_t *end_out, char con
 		if (!rad_cond_assert((prefix > 0) && (prefix <= 128))) return -1;
 
 		/* Don't be tempted to cast */
-		memcpy(&ip, start.ipaddr.ip6addr.s6_addr, sizeof(ip));
+		memcpy(&ip, start.addr.v6.s6_addr, sizeof(ip));
 		ip = ntohlll(ip);
 
 		/* Generate a mask that covers the prefix bits, and sets them high */
@@ -1314,21 +1317,21 @@ static int parse_ip_range(fr_ipaddr_t *start_out, fr_ipaddr_t *end_out, char con
 
 		/* Decrement by one */
 		if (ex_broadcast) ip = uint128_sub(ip, uint128_new(0, 1));
-		memcpy(&end.ipaddr.ip6addr.s6_addr, &ip, sizeof(end.ipaddr.ip6addr.s6_addr));
+		memcpy(&end.addr.v6.s6_addr, &ip, sizeof(end.addr.v6.s6_addr));
 	} else {
 		uint32_t ip;
 
 		/* cond assert to satisfy clang scan */
 		if (!rad_cond_assert((prefix > 0) && (prefix <= 32))) return -1;
 
-		ip = ntohl(start.ipaddr.ip4addr.s_addr);
+		ip = ntohl(start.addr.v4.s_addr);
 
 		/* Generate a mask that covers the prefix bits and sets them high */
 		ip |= uint32_gen_mask(prefix - start.prefix) << (32 - prefix);
 
 		/* Decrement by one */
 		if (ex_broadcast) ip--;
-		end.ipaddr.ip4addr.s_addr = htonl(ip);
+		end.addr.v4.s_addr = htonl(ip);
 	}
 
 	*start_out = start;
@@ -1359,8 +1362,8 @@ int main(int argc, char *argv[])
 	name = argv[0];
 
 	conf = talloc_zero(NULL, ippool_tool_t);
-	conf->cs = cf_section_alloc(NULL, "main", NULL);
-	if (!conf->cs) exit(1);
+	conf->cs = cf_section_alloc(NULL, NULL, "main", NULL);
+	if (!conf->cs) exit(EXIT_FAILURE);
 
 	trigger_exec_init(conf->cs);
 
@@ -1447,7 +1450,7 @@ do { \
 		break;
 
 	case 'f':
-		if (cf_file_read(conf->cs, optarg) < 0) exit(1);
+		if (cf_file_read(conf->cs, optarg) < 0) exit(EXIT_FAILURE);
 		break;
 
 	default:
@@ -1469,42 +1472,51 @@ do { \
 	cp = cf_pair_alloc(conf->cs, "server", argv[0], T_OP_EQ, T_BARE_WORD, T_DOUBLE_QUOTED_STRING);
 	if (!cp) {
 		ERROR("Failed creating server pair");
-		exit(1);
+		exit(EXIT_FAILURE);
 	}
 	cf_pair_add(conf->cs, cp);
 
 	/*
 	 *	Unescape sequences in the pool name
 	 */
-	if (argv[1]) {
-		uint8_t *arg;
-		size_t len;
+	if (argv[1] && (argv[1][0] != '\0')) {
+		uint8_t	*arg;
+		size_t	len;
 
-		arg = talloc_array(conf, uint8_t, strlen(argv[1]));
-		len = fr_value_str_unescape(arg, argv[1], talloc_array_length(arg), '"');
+		/*
+		 *	Be forgiving about zero length strings...
+		 */
+		len = strlen(argv[1]);
+		MEM(arg = talloc_array(conf, uint8_t, len));
+		len = value_str_unescape(arg, argv[1], len, '"');
+		rad_assert(len);
+
 		MEM(pool_arg = talloc_realloc(conf, arg, uint8_t, len));
 	}
 
-	if (argc >= 3) {
-		uint8_t *arg;
-		size_t len;
+	if (argc >= 3 && (argv[2][0] != '\0')) {
+		uint8_t	*arg;
+		size_t	len;
 
-		arg = talloc_array(conf, uint8_t, strlen(argv[2]));
-		len = fr_value_str_unescape(arg, argv[2], talloc_array_length(arg), '"');
+		len = strlen(argv[2]);
+		MEM(arg = talloc_array(conf, uint8_t, len));
+		len = value_str_unescape(arg, argv[2], len, '"');
+		rad_assert(len);
+
 		MEM(range_arg = talloc_realloc(conf, arg, uint8_t, len));
 	}
 
 	if (!do_import && !do_export && !list_pools && !print_stats && (p == ops)) {
 		ERROR("Nothing to do!");
-		exit(1);
+		exit(EXIT_FAILURE);
 	}
 
 	/*
 	 *	Set some alternative default pool settings
 	 */
-	pool_cs = cf_section_sub_find(conf->cs, "pool");
+	pool_cs = cf_section_find(conf->cs, "pool", NULL);
 	if (!pool_cs) {
-		pool_cs = cf_section_alloc(conf->cs, "pool", NULL);
+		pool_cs = cf_section_alloc(conf->cs, conf->cs, "pool", NULL);
 		cf_section_add(conf->cs, pool_cs);
 	}
 	cp = cf_pair_find(pool_cs, "start");
@@ -1525,7 +1537,7 @@ do { \
 
 	if (driver_init(conf, conf->cs, &conf->driver) < 0) {
 		ERROR("Driver initialisation failed");
-		exit(1);
+		exit(EXIT_FAILURE);
 	}
 
 	if (do_import) {
@@ -1548,7 +1560,7 @@ do { \
 			pools[0] = pool_arg;
 		} else {
 			slen = driver_get_pools(conf, &pools, conf->driver);
-			if (slen < 0) exit(1);
+			if (slen < 0) exit(EXIT_FAILURE);
 		}
 
 		for (i = 0; i < (size_t)slen; i++) {
@@ -1556,7 +1568,7 @@ do { \
 			uint64_t acum = 0;
 
 			if (driver_get_stats(&stats, conf->driver,
-					     pools[i], talloc_array_length(pools[i])) < 0) exit(1);
+					     pools[i], talloc_array_length(pools[i])) < 0) exit(EXIT_FAILURE);
 
 			pool_str = fr_asprint(conf, (char *)pools[i], talloc_array_length(pools[i]), '"');
 			INFO("pool             : %s", pool_str);
@@ -1588,7 +1600,7 @@ do { \
 		uint8_t 	**pools;
 
 		slen = driver_get_pools(conf, &pools, conf->driver);
-		if (slen < 0) exit(1);
+		if (slen < 0) exit(EXIT_FAILURE);
 		if (slen > 0) {
 			for (i = 0; i < (size_t)slen; i++) {
 				char *pool_str;
@@ -1628,7 +1640,7 @@ do { \
 		uint64_t count = 0;
 
 		if (driver_add_lease(&count, conf->driver, p) < 0) {
-			exit(1);
+			exit(EXIT_FAILURE);
 		}
 		INFO("Added %" PRIu64 " address(es)/prefix(es)", count);
 	}
@@ -1639,7 +1651,7 @@ do { \
 		uint64_t count = 0;
 
 		if (driver_remove_lease(&count, conf->driver, p) < 0) {
-			exit(1);
+			exit(EXIT_FAILURE);
 		}
 		INFO("Removed %" PRIu64 " address(es)/prefix(es)", count);
 	}
@@ -1650,7 +1662,7 @@ do { \
 		uint64_t count = 0;
 
 		if (driver_release_lease(&count, conf->driver, p) < 0) {
-			exit(1);
+			exit(EXIT_FAILURE);
 		}
 		INFO("Released %" PRIu64 " address(es)/prefix(es)", count);
 	}
@@ -1662,8 +1674,9 @@ do { \
 		size_t len, i;
 
 		if (driver_show_lease(&leases, conf->driver, p) < 0) {
-			exit(1);
+			exit(EXIT_FAILURE);
 		}
+		rad_assert(leases);
 
 		len = talloc_array_length(leases);
 		INFO("Retrieved information for %zu address(es)/prefix(es)", len - 1);
@@ -1677,9 +1690,7 @@ do { \
 			char	*range = NULL;
 			bool	is_active;
 
-#ifndef NDEBUG
 			leases[i] = talloc_get_type_abort(leases[i], ippool_tool_lease_t);
-#endif
 
 			gettimeofday(&now, NULL);
 			is_active = now.tv_sec <= leases[i]->next_event;
@@ -1728,7 +1739,7 @@ do { \
 		uint64_t count = 0;
 
 		if (driver_modify_lease(&count, conf->driver, p) < 0) {
-			exit(1);
+			exit(EXIT_FAILURE);
 		}
 		INFO("Modified %" PRIu64 " address(es)/prefix(es)", count);
 	}
@@ -1739,6 +1750,8 @@ do { \
 	}
 
 	talloc_free(conf);
+
+	trigger_exec_free();
 
 	return 0;
 }

@@ -37,7 +37,7 @@ typedef void (*pthread_destructor_t)(void*);
  *	These should ONLY be called where __Thread_local is a pointer to heap
  *	allocated memory that needs to be freed on thread exit.
  *
- *	For other types like ints __Thread_local should be used directly
+ *	For other types like ints _Thread_local should be used directly
  *	without the macros.
  */
 #ifndef HAVE_PTHREAD_H
@@ -48,7 +48,7 @@ static inline int __fr_thread_local_destructor_##_n(pthread_destructor_t *ctx)\
 	func(_n);\
 	return 0;\
 }\
-static inline _t __fr_thread_local_init_##_n(pthread_destructor_t func)\
+static inline _t __fr_thread_local_set_destructor_##_n(pthread_destructor_t func, void *value)\
 {\
 	static pthread_destructor_t *ctx;\
 	if (!ctx) {\
@@ -56,35 +56,51 @@ static inline _t __fr_thread_local_init_##_n(pthread_destructor_t func)\
 		talloc_set_destructor(ctx, __fr_thread_local_destructor_##_n);\
 		*ctx = func;\
 	}\
+	_n = value;\
 	return _n;\
 }
-#  define fr_thread_local_init(_n, _f) __fr_thread_local_init_##_n(_f)
-#  define fr_thread_local_set(_n, _v) ((int)!((_n = _v) || 1))
-#  define fr_thread_local_get(_n) _n
+#  define fr_thread_local_set_destructor(_n, _f, _v) __fr_thread_local_set_destructor_##_n(_f, _v)
 #else
 #  include <pthread.h>
+/** Pre-initialise resources required for a thread local destructor
+ *
+ * @note If destructors are not required, just use __Thread_local.
+ *
+ * @param _t	Type of variable e.g. 'char *'.  Must be a pointer type.
+ * @param _n	Name of variable e.g. 'my_tls'.
+ */
 #  define fr_thread_local_setup(_t, _n) static _Thread_local _t _n;\
 static pthread_key_t __fr_thread_local_key_##_n;\
 static pthread_once_t __fr_thread_local_once_##_n = PTHREAD_ONCE_INIT;\
 static pthread_destructor_t __fr_thread_local_destructor_##_n = NULL;\
-static void __fr_thread_local_destroy_##_n(UNUSED void *unused)\
+static void __fr_thread_local_destroy_##_n(void *value)\
 {\
-	__fr_thread_local_destructor_##_n(_n);\
+	__fr_thread_local_destructor_##_n(value);\
 }\
 static void __fr_thread_local_key_init_##_n(void)\
 {\
 	(void) pthread_key_create(&__fr_thread_local_key_##_n, __fr_thread_local_destroy_##_n);\
-	(void) pthread_setspecific(__fr_thread_local_key_##_n, &(_n));\
 }\
-static _t __fr_thread_local_init_##_n(pthread_destructor_t func)\
+static _t __fr_thread_local_set_destructor_##_n(pthread_destructor_t func, void *value)\
 {\
 	__fr_thread_local_destructor_##_n = func;\
 	if (_n) return _n; \
+	if (!value) return _n; \
 	(void) pthread_once(&__fr_thread_local_once_##_n, __fr_thread_local_key_init_##_n);\
+	(void) pthread_setspecific(__fr_thread_local_key_##_n, value);\
+	_n = value;\
 	return _n;\
 }
-#  define fr_thread_local_init(_n, _f)	__fr_thread_local_init_##_n(_f)
-#  define fr_thread_local_set(_n, _v) ((int)!((_n = _v) || 1))
-#  define fr_thread_local_get(_n) _n
+/** Set a destructor for thread local storage to free the memory on thread exit
+ *
+ * @note Pointers to thread local storage seem to become unusable as threads are
+ *	destroyed.  So we need to store the address of the memory to free, not
+ *	the address of the thread local variable.
+ *
+ * @param _n	Name of variable e.g. 'my_tls'.
+ * @param _f	Destructor, called when the thread exits to clean up any data.
+ * @param _v	Memory to free.
+ */
+#  define fr_thread_local_set_destructor(_n, _f, _v) __fr_thread_local_set_destructor_##_n(_f, _v)
 #endif
 #endif /* _FR_THREADS_H */

@@ -46,7 +46,7 @@ RCSID("$Id$")
  *	- -648	Password expired
  *
  */
-int do_auth_wbclient_pap(rlm_winbind_t *inst, REQUEST *request)
+int do_auth_wbclient_pap(rlm_winbind_t const *inst, REQUEST *request)
 {
 	int rcode = -1;
 	struct wbcContext *wb_ctx;
@@ -96,7 +96,7 @@ int do_auth_wbclient_pap(rlm_winbind_t *inst, REQUEST *request)
 	 * Build the wbcAuthUserParams structure with what we know
 	 */
 	authparams.level = WBC_AUTH_USER_LEVEL_PLAIN;
-	authparams.password.plaintext = request->password->data.strvalue;
+	authparams.password.plaintext = request->password->data.vb_strvalue;
 
 	/*
 	 * Parameters documented as part of the MSV1_0_SUBAUTH_LOGON structure
@@ -109,18 +109,18 @@ int do_auth_wbclient_pap(rlm_winbind_t *inst, REQUEST *request)
 	/*
 	 * Send auth request across to winbind
 	 */
-	wb_ctx = fr_connection_get(inst->wb_pool, request);
+	wb_ctx = fr_pool_connection_get(inst->wb_pool, request);
 	if (wb_ctx == NULL) {
 		RERROR("Unable to get winbind connection from pool");
 		goto done;
 	}
 
-	RDEBUG2("sending authentication request user='%s' domain='%s'", authparams.account_name,
+	RDEBUG2("Sending authentication request user='%s' domain='%s'", authparams.account_name,
 									authparams.domain_name);
 
 	err = wbcCtxAuthenticateUserEx(wb_ctx, &authparams, &info, &error);
 
-	fr_connection_release(inst->wb_pool, request, wb_ctx);
+	fr_pool_connection_release(inst->wb_pool, request, wb_ctx);
 
 
 	/*
@@ -132,14 +132,17 @@ int do_auth_wbclient_pap(rlm_winbind_t *inst, REQUEST *request)
 		rcode = 0;
 		RDEBUG2("Authenticated successfully");
 		break;
+
 	case WBC_ERR_WINBIND_NOT_AVAILABLE:
-		RERROR("Unable to contact winbind!");
+		RERROR("Unable to contact winbindd");
 		RDEBUG2("Check that winbind is running and that FreeRADIUS has");
-		RDEBUG2("permission to connect to the winbind privileged socket.");
+		RDEBUG2("permission to connect to the winbind privileged socket");
 		break;
+
 	case WBC_ERR_DOMAIN_NOT_FOUND:
 		REDEBUG2("Domain not found");
 		break;
+
 	case WBC_ERR_AUTH_ERROR:
 		if (!error) {
 			REDEBUG2("Authentication failed");
@@ -163,6 +166,7 @@ int do_auth_wbclient_pap(rlm_winbind_t *inst, REQUEST *request)
 			REDEBUG2("Unknown authentication failure [0x%X]", error->nt_status);
 		}
 		break;
+
 	default:
 		/*
 		 * Only errors left are
@@ -171,9 +175,9 @@ int do_auth_wbclient_pap(rlm_winbind_t *inst, REQUEST *request)
 		 * neither of which are particularly likely.
 		 */
 		if (error && error->display_string) {
-			REDEBUG2("libwbclient error: wbcErr %d (%s)", err, error->display_string);
+			REDEBUG2("Failed authenticating user: %s (%s)", error->display_string, wbcErrorString(err));
 		} else {
-			REDEBUG2("libwbclient error: wbcErr %d", err);
+			REDEBUG2("Failed authenticating user: Winbind error (%s)", wbcErrorString(err));
 		}
 		break;
 	}

@@ -26,99 +26,70 @@
  */
 RCSIDH(log_h, "$Id$")
 
+#include <freeradius-devel/fr_log.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-typedef enum log_type {
-	L_AUTH = 2,		//!< Authentication message.
-	L_INFO = 3,		//!< Informational message.
-	L_ERR = 4,		//!< Error message.
-	L_WARN = 5,		//!< Warning.
-	L_PROXY	= 6,		//!< Proxy messages
-	L_ACCT = 7,		//!< Accounting messages
+/** Logging callback to write log messages to a destination
+ *
+ * This allows the logging destination to be customised on a per request basis.
+ *
+ * @note Logging functions must not block waiting on I/O.
+ *
+ * @param[in] type	What type of message this is (error, warn, info, debug).
+ * @param[in] lvl	At what logging level this message should be output.
+ * @param[in] request	The current request.
+ * @param[in] fmt	sprintf style fmt string.
+ * @param[in] ap	Arguments for the fmt string.
+ * @param[in] uctx	Context data for the log function.  Usually an #fr_log_t for vradlog_request.
+ */
+typedef	void (*log_func_t)(fr_log_type_t type, fr_log_lvl_t lvl, REQUEST *request, char const *fmt, va_list ap, void *uctx);
 
-	L_DBG = 16,		//!< Only displayed when debugging is enabled.
-	L_DBG_WARN = 17,	//!< Warning only displayed when debugging is enabled.
-	L_DBG_ERR = 18,		//!< Error only displayed when debugging is enabled.
-	L_DBG_WARN_REQ = 19,	//!< Less severe warning only displayed when debugging is enabled.
-	L_DBG_ERR_REQ = 20	//!< Less severe error only displayed when debugging is enabled.
-} log_type_t;
-
-typedef enum log_lvl {
-	L_DBG_LVL_DISABLE = -1,	//!< Don't print messages.
-	L_DBG_LVL_OFF = 0,	//!< No debug messages.
-	L_DBG_LVL_1,		//!< Highest priority debug messages (-x).
-	L_DBG_LVL_2,		//!< 2nd highest priority debug messages (-xx | -X).
-	L_DBG_LVL_3,		//!< 3rd highest priority debug messages (-xxx | -Xx).
-	L_DBG_LVL_MAX		//!< Lowest priority debug messages (-xxxx | -Xxx).
-} log_lvl_t;
-
-typedef enum log_dst {
-	L_DST_STDOUT = 0,	//!< Log to stdout.
-	L_DST_FILES,		//!< Log to a file on disk.
-	L_DST_SYSLOG,		//!< Log to syslog.
-	L_DST_STDERR,		//!< Log to stderr.
-	L_DST_EXTRA,		//!< Send log messages to a FILE*, via fopencookie()
-	L_DST_NULL,		//!< Discard log messages.
-	L_DST_NUM_DEST
-} log_dst_t;
-
-typedef struct fr_log_t {
-	bool		colourise;	//!< Prefix log messages with VT100 escape codes to change text
-					//!< colour.
-	int		fd;		//!< File descriptor to write messages to.
-	log_dst_t	dst;		//!< Log destination.
-	char const	*file;		//!< Path to log file.
-
-	void		*cookie;	//!< for fopencookie()
-#ifdef HAVE_FOPENCOOKIE
-	ssize_t		(*cookie_write)(void *, char const *, size_t); //!< write function
-#else
-	int		(*cookie_write)(void *, char const *, int); //!< write function
-#endif
-} fr_log_t;
-
-typedef		void (*radlog_func_t)(log_type_t lvl, log_lvl_t priority, REQUEST *, char const *, va_list ap);
+/** A logging destination, consisting of a function and its context
+ *
+ */
+typedef struct log_dst log_dst_t;
+struct log_dst {
+	log_func_t	func;	//!< Function to call to log to this destination.
+	void		*uctx;	//!< Context to pass to the logging function.
+	log_dst_t	*next;	//!< Next logging destination.
+};
 
 extern FR_NAME_NUMBER const syslog_facility_table[];
 extern FR_NAME_NUMBER const syslog_severity_table[];
 extern FR_NAME_NUMBER const log_str2dst[];
-extern fr_log_t default_log;
 
-int	radlog_init(fr_log_t *log, bool daemonize);
+#define debug_enabled(_type, _lvl) ((_type & L_DBG) && (_lvl <= rad_debug_lvl))
 
-int	vradlog(log_type_t lvl, char const *fmt, va_list ap)
-	CC_HINT(format (printf, 2, 0)) CC_HINT(nonnull);
-int	radlog(log_type_t lvl, char const *fmt, ...)
-	CC_HINT(format (printf, 2, 3)) CC_HINT(nonnull (2));
-
-bool	debug_enabled(log_type_t type, log_lvl_t lvl);
-
-bool	rate_limit_enabled(void);
-
-bool	radlog_debug_enabled(log_type_t type, log_lvl_t lvl, REQUEST *request)
+bool	radlog_debug_enabled(fr_log_type_t type, fr_log_lvl_t lvl, REQUEST *request)
 	CC_HINT(nonnull);
 
-void	vradlog_request(log_type_t type, log_lvl_t lvl, REQUEST *request, char const *msg, va_list ap)
+void	vradlog_request(fr_log_type_t type, fr_log_lvl_t lvl, REQUEST *request, char const *msg, va_list ap, void *uctx)
 	CC_HINT(format (printf, 4, 0)) CC_HINT(nonnull (3, 4));
 
-void	radlog_request(log_type_t type, log_lvl_t lvl, REQUEST *request, char const *msg, ...)
+void	radlog_request(fr_log_type_t type, fr_log_lvl_t lvl, REQUEST *request, char const *msg, ...)
 	CC_HINT(format (printf, 4, 5)) CC_HINT(nonnull (3, 4));
 
-void	radlog_request_error(log_type_t type, log_lvl_t lvl, REQUEST *request, char const *msg, ...)
+void	radlog_request_error(fr_log_type_t type, fr_log_lvl_t lvl, REQUEST *request, char const *msg, ...)
 	CC_HINT(format (printf, 4, 5)) CC_HINT(nonnull (3, 4));
 
-void	radlog_request_marker(log_type_t type, log_lvl_t lvl, REQUEST *request,
+void	radlog_request_perror(fr_log_type_t type, fr_log_lvl_t lvl, REQUEST *request, char const *msg, ...)
+	CC_HINT(format (printf, 4, 5)) CC_HINT(nonnull (3));
+
+void	radlog_request_marker(fr_log_type_t type, fr_log_lvl_t lvl, REQUEST *request,
 			      char const *fmt, size_t indent, char const *error)
 	CC_HINT(nonnull);
 
-void	radlog_request_hex(log_type_t type, log_lvl_t lvl, REQUEST *request,
+void	radlog_request_hex(fr_log_type_t type, fr_log_lvl_t lvl, REQUEST *request,
 			   uint8_t const *data, size_t data_len)
 	CC_HINT(nonnull);
 
-void	radlog_hex(log_type_t type, log_lvl_t lvl, uint8_t const *data, size_t data_len)
+void	radlog_hex(fr_log_t const *log, fr_log_type_t type, fr_log_lvl_t lvl, uint8_t const *data, size_t data_len)
 	CC_HINT(nonnull);
+
+void	radlog_fatal(char const *fmt, ...) CC_HINT(format (printf, 1, 2)) CC_HINT(nonnull) NEVER_RETURNS;
 
 /** Prefix for global log messages
  *
@@ -130,9 +101,11 @@ void	radlog_hex(log_type_t type, log_lvl_t lvl, uint8_t const *data, size_t data
 #endif
 
 #ifdef LOG_PREFIX_ARGS
-#  define _RADLOG(_l, _f, ...) radlog(_l, LOG_PREFIX _f, LOG_PREFIX_ARGS, ## __VA_ARGS__)
+#  define _FR_LOG(_l, _f, ...) fr_log(&default_log, _l, LOG_PREFIX _f, LOG_PREFIX_ARGS, ## __VA_ARGS__)
+#  define _FR_LOG_PERROR(_l, _f, ...) fr_log_perror(&default_log, _l, LOG_PREFIX _f, LOG_PREFIX_ARGS, ## __VA_ARGS__)
 #else
-#  define _RADLOG(_l, _f, ...) radlog(_l, LOG_PREFIX _f, ## __VA_ARGS__)
+#  define _FR_LOG(_l, _f, ...) fr_log(&default_log, _l, LOG_PREFIX _f, ## __VA_ARGS__)
+#  define _FR_LOG_PERROR(_l, _f, ...) fr_log_perror(&default_log, _l, LOG_PREFIX _f, ## __VA_ARGS__)
 #endif
 
 /** @name Log global messages
@@ -157,13 +130,14 @@ void	radlog_hex(log_type_t type, log_lvl_t lvl, uint8_t const *data, size_t data
  *
  * @{
  */
-#define AUTH(fmt, ...)		_RADLOG(L_AUTH, fmt, ## __VA_ARGS__)
-#define ACCT(fmt, ...)		_RADLOG(L_ACCT, fmt, ## __VA_ARGS__)
-#define PROXY(fmt, ...)		_RADLOG(L_PROXY, fmt, ## __VA_ARGS__)
+#define AUTH(fmt, ...)		_FR_LOG(L_AUTH, fmt, ## __VA_ARGS__)
+#define ACCT(fmt, ...)		_FR_LOG(L_ACCT, fmt, ## __VA_ARGS__)
+#define PROXY(fmt, ...)		_FR_LOG(L_PROXY, fmt, ## __VA_ARGS__)
 
-#define INFO(fmt, ...)		_RADLOG(L_INFO,  fmt, ## __VA_ARGS__)
-#define WARN(fmt, ...)		_RADLOG(L_WARN, fmt, ## __VA_ARGS__)
-#define ERROR(fmt, ...)		_RADLOG(L_ERR, fmt, ## __VA_ARGS__)
+#define INFO(fmt, ...)		_FR_LOG(L_INFO, fmt, ## __VA_ARGS__)
+#define WARN(fmt, ...)		_FR_LOG(L_WARN, fmt, ## __VA_ARGS__)
+#define ERROR(fmt, ...)		_FR_LOG(L_ERR, fmt, ## __VA_ARGS__)
+#define PERROR(fmt, ...)	_FR_LOG_PERROR(L_ERR, fmt, ## __VA_ARGS__)
 /** @} */
 
 /** @name Log global debug messages (DEBUG*)
@@ -178,21 +152,23 @@ void	radlog_hex(log_type_t type, log_lvl_t lvl, uint8_t const *data, size_t data
  * DEBUG    | LOG_DEBUG               | Regular      | Normal debug output
  *
  * **Debug levels**
- * Level    | Debug arguments         | Macro(s) enabled              | When to use
- * -------- | ----------------------- | ----------------------------- | -----------
- * 1        | ``-x``                  | DEBUG                         | Never - Deprecated
- * 2        | ``-xx`` or ``-X``       | DEBUG, DEBUG2                 | Interactions with external entities. Connection management, control socket, triggers, etc...
- * 3        | ``-xxx`` or ``-Xx``     | DEBUG, DEBUG2, DEBUG3         | Lower priority events. Polling for detail files, cleanups, etc...
- * 4        | ``-xxxx`` or ``-Xxx``   | DEBUG, DEBUG2, DEBUG3, DEBUG4 | Internal server state debugging.
+ * Level    | Debug arguments         | Macro(s) enabled   | When to use
+ * -------- | ----------------------- | ------------------ | -----------
+ * 1        | ``-x``                  | DEBUG              | Never - Deprecated
+ * 2        | ``-xx`` or ``-X``       | DEBUG, DEBUG2      | Interactions with external entities. Connection management, control socket, triggers, etc...
+ * 3        | ``-xxx`` or ``-Xx``     | DEBUG, DEBUG[2-3]  | Lower priority events. Polling for detail files, cleanups, etc...
+ * 4        | ``-xxxx`` or ``-Xxx``   | DEBUG, DEBUG[2-4]  | Internal server state debugging.
+ * 5        | ``-xxxxx`` or ``-Xxxx`` | DEBUG, DEBUG[2-5]  | Low level internal server state debugging.
  *
  * @{
  */
 #define DEBUG_ENABLED		debug_enabled(L_DBG, L_DBG_LVL_1)			//!< True if global debug level 1 messages are enabled
 #define DEBUG_ENABLED2		debug_enabled(L_DBG, L_DBG_LVL_2)			//!< True if global debug level 1-2 messages are enabled
 #define DEBUG_ENABLED3		debug_enabled(L_DBG, L_DBG_LVL_3)			//!< True if global debug level 1-3 messages are enabled
-#define DEBUG_ENABLED4		debug_enabled(L_DBG, L_DBG_LVL_MAX)			//!< True if global debug level 1-4 messages are enabled
+#define DEBUG_ENABLED4		debug_enabled(L_DBG, L_DBG_LVL_4)			//!< True if global debug level 1-3 messages are enabled
+#define DEBUG_ENABLED5		debug_enabled(L_DBG, L_DBG_LVL_MAX)			//!< True if global debug level 1-5 messages are enabled
 
-#define _DEBUG_LOG(_l, _p, _f, ...)	if (rad_debug_lvl >= _p) _RADLOG(_l, _f, ## __VA_ARGS__)
+#define _DEBUG_LOG(_l, _p, _f, ...)	if (rad_debug_lvl >= _p) _FR_LOG(_l, _f, ## __VA_ARGS__)
 #define DEBUG(fmt, ...)		_DEBUG_LOG(L_DBG, L_DBG_LVL_1, fmt, ## __VA_ARGS__)
 #define DEBUG2(fmt, ...)	_DEBUG_LOG(L_DBG, L_DBG_LVL_2, fmt, ## __VA_ARGS__)
 #define DEBUG3(fmt, ...)	_DEBUG_LOG(L_DBG, L_DBG_LVL_3, fmt, ## __VA_ARGS__)
@@ -227,6 +203,7 @@ void	radlog_hex(log_type_t type, log_lvl_t lvl, uint8_t const *data, size_t data
 #define RINFO(fmt, ...)		radlog_request(L_INFO, L_DBG_LVL_OFF, request, fmt, ## __VA_ARGS__)
 #define RWARN(fmt, ...)		radlog_request(L_DBG_WARN, L_DBG_LVL_OFF, request, fmt, ## __VA_ARGS__)
 #define RERROR(fmt, ...)	radlog_request_error(L_DBG_ERR, L_DBG_LVL_OFF, request, fmt, ## __VA_ARGS__)
+#define RPERROR(fmt, ...)	radlog_request_perror(L_DBG_ERR, L_DBG_LVL_OFF, request, fmt, ## __VA_ARGS__)
 /** @} */
 
 /** @name Log request-specific debug (R*DEBUG*)
@@ -247,36 +224,47 @@ void	radlog_hex(log_type_t type, log_lvl_t lvl, uint8_t const *data, size_t data
  * REDEBUG* | LOG_DEBUG               | Red/Bold         | Errors. Reject messages, bad values etc...
  *
  * **Debug levels**
- * Level    | Debug arguments         | Macro(s) enabled                       | When to use
- * -------- | ----------------------- | -------------------------------------- | -----------
- * 1        | ``-x``                  | R*DEBUG                                | Never - Deprecated
- * 2        | ``-xx`` or ``-X``       | R*DEBUG, R*DEBUG2                      | Normal request flow. Operations, Results of queries, or execs, etc...
- * 3        | ``-xxx`` or ``-Xx``     | R*DEBUG, R*DEBUG2, R*DEBUG3            | Internal server state or packet input. State machine changes, extra attribute info, etc...
- * 4        | ``-xxxx`` or ``-Xxx``   | R*DEBUG, R*DEBUG2, R*DEBUG3, R*DEBUG4  | Verbose internal server state messages or packet input. Hex dumps, structure dumps, pointer values.
+ * Level    | Debug arguments         | Macro(s) enabled      | When to use
+ * -------- | ----------------------- | --------------------- | -----------
+ * 1        | ``-x``                  | R*DEBUG               | Never - Deprecated
+ * 2        | ``-xx`` or ``-X``       | R*DEBUG, R*DEBUG2     | Normal request flow. Operations, Results of queries, or execs, etc...
+ * 3        | ``-xxx`` or ``-Xx``     | R*DEBUG, R*DEBUG[2-3] | Internal server state or packet input. State machine changes, extra attribute info, etc...
+ * 4        | ``-xxxx`` or ``-Xxx``   | R*DEBUG, R*DEBUG[2-4] | Verbose internal server state messages or packet input. Hex dumps, structure dumps, pointer values.
+ * 5        | ``-xxxxx`` or ``-Xxxx`` | R*DEBUG, R*DEBUG[2-5] | Low level internal server state messages.
  *
  * @{
  */
 #define RDEBUG_ENABLED		radlog_debug_enabled(L_DBG, L_DBG_LVL_1, request)	//!< True if request debug level 1 messages are enabled
 #define RDEBUG_ENABLED2		radlog_debug_enabled(L_DBG, L_DBG_LVL_2, request)	//!< True if request debug level 1-2 messages are enabled
 #define RDEBUG_ENABLED3		radlog_debug_enabled(L_DBG, L_DBG_LVL_3, request)	//!< True if request debug level 1-3 messages are enabled
-#define RDEBUG_ENABLED4		radlog_debug_enabled(L_DBG, L_DBG_LVL_MAX, request)	//!< True if request debug level 1-4 messages are enabled
+#define RDEBUG_ENABLED4		radlog_debug_enabled(L_DBG, L_DBG_LVL_4, request)	//!< True if request debug level 1-4 messages are enabled
+#define RDEBUG_ENABLED5		radlog_debug_enabled(L_DBG, L_DBG_LVL_MAX, request)	//!< True if request debug level 1-5 messages are enabled
 
-#define RDEBUGX(_l, fmt, ...)	radlog_request(L_DBG, _l, request, fmt, ## __VA_ARGS__)
-#define RDEBUG(fmt, ...)	if (rad_debug_lvl || request->log.lvl) radlog_request(L_DBG, L_DBG_LVL_1, request, fmt, ## __VA_ARGS__)
-#define RDEBUG2(fmt, ...)	if (rad_debug_lvl || request->log.lvl) radlog_request(L_DBG, L_DBG_LVL_2, request, fmt, ## __VA_ARGS__)
-#define RDEBUG3(fmt, ...)	if (rad_debug_lvl || request->log.lvl) radlog_request(L_DBG, L_DBG_LVL_3, request, fmt, ## __VA_ARGS__)
-#define RDEBUG4(fmt, ...)	if (rad_debug_lvl || request->log.lvl) radlog_request(L_DBG, L_DBG_LVL_MAX, request, fmt, ## __VA_ARGS__)
+#define RDEBUGX(_l, fmt, ...)	do { if (rad_debug_lvl || request->log.lvl) radlog_request(L_DBG, _l, request, fmt, ## __VA_ARGS__); } while(0)
+#define RDEBUG(fmt, ...)	do { if (rad_debug_lvl || request->log.lvl) radlog_request(L_DBG, L_DBG_LVL_1, request, fmt, ## __VA_ARGS__); } while(0)
+#define RDEBUG2(fmt, ...)	do { if (rad_debug_lvl || request->log.lvl) radlog_request(L_DBG, L_DBG_LVL_2, request, fmt, ## __VA_ARGS__); } while(0)
+#define RDEBUG3(fmt, ...)	do { if (rad_debug_lvl || request->log.lvl) radlog_request(L_DBG, L_DBG_LVL_3, request, fmt, ## __VA_ARGS__); } while(0)
+#define RDEBUG4(fmt, ...)	do { if (rad_debug_lvl || request->log.lvl) radlog_request(L_DBG, L_DBG_LVL_4, request, fmt, ## __VA_ARGS__); } while(0)
 
-#define RIDEBUG(fmt, ...)	radlog_request(L_INFO, L_DBG_LVL_1, request, fmt, ## __VA_ARGS__)
-#define RIDEBUG2(fmt, ...)	radlog_request(L_INFO, L_DBG_LVL_2, request, fmt, ## __VA_ARGS__)
+#define RIDEBUG(fmt, ...)	do { if (rad_debug_lvl || request->log.lvl) radlog_request(L_DBG_INFO, L_DBG_LVL_1, request, fmt, ## __VA_ARGS__); } while(0)
+#define RIDEBUG2(fmt, ...)	do { if (rad_debug_lvl || request->log.lvl) radlog_request(L_DBG_INFO, L_DBG_LVL_2, request, fmt, ## __VA_ARGS__); } while(0)
+#define RIDEBUG3(fmt, ...)	do { if (rad_debug_lvl || request->log.lvl) radlog_request(L_DBG_INFO, L_DBG_LVL_3, request, fmt, ## __VA_ARGS__); } while(0)
+#define RIDEBUG4(fmt, ...)	do { if (rad_debug_lvl || request->log.lvl) radlog_request(L_DBG_INFO, L_DBG_LVL_4, request, fmt, ## __VA_ARGS__); } while(0)
 
-#define RWDEBUG(fmt, ...)	if (rad_debug_lvl || request->log.lvl) radlog_request(L_DBG_WARN, L_DBG_LVL_1, request, fmt, ## __VA_ARGS__)
-#define RWDEBUG2(fmt, ...)	if (rad_debug_lvl || request->log.lvl) radlog_request(L_DBG_WARN, L_DBG_LVL_2, request, fmt, ## __VA_ARGS__)
+#define RWDEBUG(fmt, ...)	do { if (rad_debug_lvl || request->log.lvl) radlog_request(L_DBG_WARN, L_DBG_LVL_1, request, fmt, ## __VA_ARGS__); } while(0)
+#define RWDEBUG2(fmt, ...)	do { if (rad_debug_lvl || request->log.lvl) radlog_request(L_DBG_WARN, L_DBG_LVL_2, request, fmt, ## __VA_ARGS__); } while(0)
+#define RWDEBUG3(fmt, ...)	do { if (rad_debug_lvl || request->log.lvl) radlog_request(L_DBG_WARN, L_DBG_LVL_3, request, fmt, ## __VA_ARGS__); } while(0)
+#define RWDEBUG4(fmt, ...)	do { if (rad_debug_lvl || request->log.lvl) radlog_request(L_DBG_WARN, L_DBG_LVL_4, request, fmt, ## __VA_ARGS__); } while(0)
 
 #define REDEBUG(fmt, ...)	radlog_request_error(L_DBG_ERR, L_DBG_LVL_1, request, fmt, ## __VA_ARGS__)
 #define REDEBUG2(fmt, ...)	radlog_request_error(L_DBG_ERR, L_DBG_LVL_2, request, fmt, ## __VA_ARGS__)
 #define REDEBUG3(fmt, ...)	radlog_request_error(L_DBG_ERR, L_DBG_LVL_3, request, fmt, ## __VA_ARGS__)
 #define REDEBUG4(fmt, ...)	radlog_request_error(L_DBG_ERR, L_DBG_LVL_MAX, request, fmt, ## __VA_ARGS__)
+
+#define RPEDEBUG(fmt, ...)	radlog_request_perror(L_DBG_ERR, L_DBG_LVL_1, request, fmt, ## __VA_ARGS__)
+#define RPEDEBUG2(fmt, ...)	radlog_request_perror(L_DBG_ERR, L_DBG_LVL_2, request, fmt, ## __VA_ARGS__)
+#define RPEDEBUG3(fmt, ...)	radlog_request_perror(L_DBG_ERR, L_DBG_LVL_3, request, fmt, ## __VA_ARGS__)
+#define RPEDEBUG4(fmt, ...)	radlog_request_perror(L_DBG_ERR, L_DBG_LVL_MAX, request, fmt, ## __VA_ARGS__)
 /** @} */
 
 #ifdef DEBUG_INDENT
@@ -344,13 +332,20 @@ void	radlog_hex(log_type_t type, log_lvl_t lvl, uint8_t const *data, size_t data
  *
  * @warning If a REQUEST * is **NOT** available, or is NULL, this macro must **NOT** be used.
  *
- * @param _l log category, a log_type_t value.
- * @param _p log priority, a log_lvl_t value.
+ * @param _l log category, a fr_log_type_t value.
+ * @param _p log priority, a fr_log_lvl_t value.
  * @param _m string to mark e.g. "my pet kitty".
  * @param _i index e.g. 3 (starts from 0).
  * @param _e error e.g. "kitties are not pets, are nature devouring hell beasts".
  */
+#ifndef DEBUG_INDENT
 #define RMARKER(_l, _p, _m, _i, _e)	radlog_request_marker(_l, _p, request, _m, _i, _e)
+#else
+#define RMARKER(_l, _p, _m, _i, _e) do { \
+		RDEBUG4("== (0) at %s[%u]", __FILE__, __LINE__); \
+		radlog_request_marker(_l, _p, request, _m, _i, _e); \
+	} while (0)
+#endif
 
 /** Output string with error marker, showing where format error occurred
  *
@@ -405,7 +400,8 @@ do {\
  	}\
 } while (0)
 
-#define RATE_LIMIT_ENABLED rate_limit_enabled()		//!< True if rate limiting is enabled.
+#define RATE_LIMIT_ENABLED fr_rate_limit_enabled()		//!< True if rate limiting is enabled.
+
 /** Rate limit messages
  *
  * Rate limit log messages so they're written a maximum of once per second.

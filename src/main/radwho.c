@@ -27,6 +27,7 @@ RCSID("$Id$")
 #include <freeradius-devel/radiusd.h>
 #include <freeradius-devel/sysutmp.h>
 #include <freeradius-devel/radutmp.h>
+#include <freeradius-devel/cf_parse.h>
 
 #include <pwd.h>
 #include <sys/stat.h>
@@ -66,7 +67,7 @@ static struct radutmp_config_t {
 } radutmpconfig;
 
 static const CONF_PARSER module_config[] = {
-  { FR_CONF_POINTER("filename", PW_TYPE_FILE_INPUT, &radutmpconfig.radutmp_fn), .dflt = RADUTMP },
+  { FR_CONF_POINTER("filename", FR_TYPE_FILE_INPUT, &radutmpconfig.radutmp_fn), .dflt = RADUTMP },
   CONF_PARSER_TERMINATOR
 };
 
@@ -289,7 +290,7 @@ int main(int argc, char **argv)
 	}
 
 	if (fr_dict_read(dict, raddb_dir, FR_DICTIONARY_FILE) == -1) {
-		fr_perror("radwho");
+		fr_log_perror(&default_log, L_ERR, "Failed to initialize the dictionaries");
 		return 1;
 	}
 	fr_strerror();	/* Clear the error buffer */
@@ -323,29 +324,30 @@ int main(int argc, char **argv)
 	memset(&main_config, 0, sizeof(main_config));
 
 	/* Read radiusd.conf */
-	maincs = cf_section_alloc(NULL, "main", NULL);
-	if (!maincs) exit(1);
+	maincs = cf_section_alloc(NULL, NULL, "main", NULL);
+	if (!maincs) exit(EXIT_FAILURE);
 
 	snprintf(buffer, sizeof(buffer), "%.200s/radiusd.conf", raddb_dir);
 	if (cf_file_read(maincs, buffer) < 0) {
 		fprintf(stderr, "%s: Error reading or parsing radiusd.conf\n", argv[0]);
 		talloc_free(maincs);
-		exit(1);
+		exit(EXIT_FAILURE);
 	}
 
-	cs = cf_section_sub_find(maincs, "modules");
+	cs = cf_section_find(maincs, "modules", NULL);
 	if (!cs) {
 		fprintf(stderr, "%s: No modules section found in radiusd.conf\n", argv[0]);
-		exit(1);
+		exit(EXIT_FAILURE);
 	}
 	/* Read the radutmp section of radiusd.conf */
-	cs = cf_section_sub_find_name2(cs, "radutmp", NULL);
+	cs = cf_section_find(cs, "radutmp", NULL);
 	if (!cs) {
 		fprintf(stderr, "%s: No configuration information in radutmp section of radiusd.conf\n", argv[0]);
-		exit(1);
+		exit(EXIT_FAILURE);
 	}
 
-	cf_section_parse(cs, NULL, module_config);
+	if (cf_section_rules_push(cs, module_config) < 0) exit(EXIT_FAILURE);
+	cf_section_parse(maincs, NULL, cs);
 
 	/* Assign the correct path for the radutmp file */
 	radutmp_file = radutmpconfig.radutmp_fn;

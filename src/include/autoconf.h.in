@@ -12,6 +12,9 @@
 /* Define to 1 to have OpenSSL version check enabled */
 #undef ENABLE_OPENSSL_VERSION_CHECK
 
+/* Define to ensure each build is the same */
+#undef ENABLE_REPRODUCIBLE_BUILDS
+
 /* Define if your processor stores words with the most significant byte first
    */
 #undef FR_BIG_ENDIAN
@@ -94,6 +97,9 @@
 
 /* Define to 1 if you have the <errno.h> header file. */
 #undef HAVE_ERRNO_H
+
+/* Define to 1 if you have the `EVP_sha3_512' function. */
+#undef HAVE_EVP_SHA3_512
 
 /* define this if we have <execinfo.h> and symbols */
 #undef HAVE_EXECINFO
@@ -196,9 +202,6 @@
 
 /* define if you have IP_PKTINFO (Linux) */
 #undef HAVE_IP_PKTINFO
-
-/* Define to 1 if you have the `kqueue' function. */
-#undef HAVE_KQUEUE
 
 /* Define to 1 if you have the `cap' library (-lcap). */
 #undef HAVE_LIBCAP
@@ -455,6 +458,16 @@
 /* Define to 1 if you have the <syslog.h> header file. */
 #undef HAVE_SYSLOG_H
 
+/* Define to 1 if you have the `systemd' library (-lsystemd). */
+#undef HAVE_SYSTEMD
+
+/* Define to 1 if you have the <systemd/sd-daemon.h> header file. */
+#undef HAVE_SYSTEMD_SD_DAEMON_H
+
+/* Define to 1 if you have watchdog support in the `systemd' library
+   (-lsystemd). */
+#undef HAVE_SYSTEMD_WATCHDOG
+
 /* Define to 1 if you have the <sys/dir.h> header file, and it defines `DIR'.
    */
 #undef HAVE_SYS_DIR_H
@@ -541,6 +554,9 @@
 /* compiler specific 128 bit unsigned integer */
 #undef HAVE___UINT128_T
 
+/* Architecture information for the target platform */
+#undef HOSTINFO
+
 /* define if you have OSFC2 authentication */
 #undef OSFC2
 
@@ -573,6 +589,9 @@
 
 /* Commit HEAD at time of configuring */
 #undef RADIUSD_VERSION_COMMIT
+
+/* Version release number at time of configuring */
+#undef RADIUSD_VERSION_RELEASE
 
 /* Raw version string from VERSION file */
 #undef RADIUSD_VERSION_STRING
@@ -620,19 +639,22 @@
 /* include support for Ascend binary filter attributes */
 #undef WITH_ASCEND_BINARY
 
-/* define if you want DHCP support */
+/* define if you want dhcp */
 #undef WITH_DHCP
 
 /* define if the server was built with -DNDEBUG */
 #undef WITH_NDEBUG
 
-/* define if you want TCP support (For RADSec et al) */
+/* define if you want tacacs */
+#undef WITH_TACACS
+
+/* define if you want tcp */
 #undef WITH_TCP
 
 /* define if you want udpfromto */
 #undef WITH_UDPFROMTO
 
-/* define if you want VMPS support */
+/* define if you want vmps */
 #undef WITH_VMPS
 
 /* Define WORDS_BIGENDIAN to 1 if your processor stores words with the most

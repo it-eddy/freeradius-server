@@ -93,7 +93,7 @@ typedef struct rs_stats_value_tmpl rs_stats_value_tmpl_t;
 #endif
 
 typedef struct rs_counters {
-	uint64_t type[PW_CODE_MAX];
+	uint64_t type[FR_CODE_MAX + 1];
 } rs_counters_t;
 
 /** Stats for a single interval
@@ -153,7 +153,7 @@ typedef struct rs_malformed {
 typedef struct rs_stats {
 	int			intervals;		//!< Number of stats intervals.
 
-	rs_latency_t		exchange[PW_CODE_MAX];  //!< We end up allocating ~16K, but memory is cheap so
+	rs_latency_t		exchange[FR_CODE_MAX + 1];  //!< We end up allocating ~16K, but memory is cheap so
 							//!< what the hell.  This is required because instances of
 							//!< FreeRADIUS delay Access-Rejects, which would artificially
 							//!< increase latency stats for Access-Requests.
@@ -174,7 +174,7 @@ typedef struct rs_capture {
  */
 typedef struct rs_request {
 	uint64_t		id;			//!< Monotonically increasing packet counter.
-	fr_event_t		*event;			//!< Event created when we received the original request.
+	fr_event_timer_t const	*event;			//!< Event created when we received the original request.
 
 	bool			logged;			//!< Whether any messages regarding this request were logged.
 
@@ -260,6 +260,7 @@ struct rs {
 	bool			decode_attrs;		//!< Whether we should decode attributes in the request
 							//!< and response.
 	bool			verify_udp_checksum;	//!< Check UDP checksum in packets.
+	bool			verify_radius_authenticator;	//!< Check RADIUS authenticator in packets.
 
 	char			*radius_secret;		//!< Secret to decode encrypted attributes.
 
@@ -270,7 +271,7 @@ struct rs {
 	int			list_da_num;
 
 	char			*link_attributes;	//!< Names of fr_dict_attr_ts to use for rtx.
-	fr_dict_attr_t const		*link_da[RS_MAX_ATTRS];	//!< fr_dict_attr_ts to link on.
+	fr_dict_attr_t const	*link_da[RS_MAX_ATTRS];	//!< fr_dict_attr_ts to link on.
 	int			link_da_num;		//!< Number of rtx fr_dict_attr_ts.
 
 	char const		*filter_request;	//!< Raw request filter string.
@@ -278,8 +279,8 @@ struct rs {
 
 	VALUE_PAIR 		*filter_request_vps;	//!< Sorted filter vps.
 	VALUE_PAIR 		*filter_response_vps;	//!< Sorted filter vps.
-	PW_CODE			filter_request_code;	//!< Filter request packets by code.
-	PW_CODE			filter_response_code;	//!< Filter response packets by code.
+	FR_CODE			filter_request_code;	//!< Filter request packets by code.
+	FR_CODE			filter_response_code;	//!< Filter response packets by code.
 
 	rs_status_t		event_flags;		//!< Events we log and capture on.
 	rs_packet_logger_t	logger;			//!< Packet logger
@@ -334,7 +335,7 @@ struct rs_stats_tmpl
  *	collectd.c - Registration and processing functions
  */
 rs_stats_tmpl_t *rs_stats_collectd_init_latency(TALLOC_CTX *ctx, rs_stats_tmpl_t **out, rs_t *conf,
-						char const *type, rs_latency_t *stats, PW_CODE code);
+						char const *type, rs_latency_t *stats, FR_CODE code);
 void rs_stats_collectd_do_stats(rs_t *conf, rs_stats_tmpl_t *tmpls, struct timeval *now);
 int rs_stats_collectd_open(rs_t *conf);
 int rs_stats_collectd_close(rs_t *conf);

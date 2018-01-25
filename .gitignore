@@ -17,6 +17,7 @@
 *.substvars
 *-stamp
 *.swp
+*.swo
 *.cache
 *.dist
 *.dylib
@@ -41,11 +42,8 @@ icon.png
 # OS specific cruft
 .DS_Store
 
-# Certificates and signing requests
-*.pem
-*.der
-*.csr
-*.key
+# Archives
+freeradius-server-*tar*
 
 # Autoconf and libtool output
 build

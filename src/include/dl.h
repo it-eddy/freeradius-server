@@ -32,7 +32,7 @@ RCSIDH(dl_h, "$Id$")
 #endif
 
 #include <freeradius-devel/version.h>
-#include <freeradius-devel/conffile.h>
+#include <freeradius-devel/cf_parse.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -42,6 +42,14 @@ extern "C" {
  *
  */
 #define RLM_MODULE_INIT RADIUSD_MAGIC_NUMBER
+
+typedef enum {
+	DL_TYPE_MODULE = 0,	//!< Standard loadable module.
+	DL_TYPE_PROTO,		//!< Protocol module.
+	DL_TYPE_SUBMODULE	//!< Driver (or method in the case of EAP)
+} dl_type_t;
+
+typedef struct dl_module dl_t;
 
 /** Called when a module is first loaded
  *
@@ -82,41 +90,95 @@ typedef void (*module_unload_t)(void);
  */
 typedef int (*module_detach_t)(void *instance);
 
+/** Callback to call when a module is first loaded
+ *
+ * @param[in] module	being loaded.
+ * @param[in] symbol	which, if present, will trigger this callback.
+ * @param[in] user_ctx	passed to dl_init_register.
+ * @return
+ *	- 0 on success.
+ *	- -1 on failure
+ */
+typedef int (*dl_init_t)(dl_t const *module, void *symbol, void *user_ctx);
+
+
+/** Callback when a module is destroyed
+ *
+ * @param[in] module	being loaded.
+ * @param[in] symbol	which, if present, will trigger this callback.
+ * @param[in] user_ctx	passed to dl_init_register
+ */
+typedef void (*dl_free_t)(dl_t const *module, void *symbol, void *user_ctx);
+
 /** Common fields for the interface struct modules export
  *
  */
 #define RAD_MODULE_COMMON \
 	struct { \
-		uint64_t 		magic;		\
-		char const		*name;		\
-		size_t			inst_size;	\
-		CONF_PARSER const	*config;        \
-		module_load_t		load;           \
-		module_unload_t		unload;		\
-		module_detach_t		detach;		\
+		uint64_t 			magic;		\
+		char const			*name;		\
+		size_t				inst_size;	\
+		char const			*inst_type;	\
+		CONF_PARSER const		*config;        \
+		module_load_t			load;           \
+		module_unload_t			unload;		\
+		module_detach_t			detach;		\
 	}
 
 /** Fields common to all types of loadable modules
- *
  */
-typedef struct dl_module_common {
+typedef struct dl_common {
 	RAD_MODULE_COMMON;
-} dl_module_common_t;
+} dl_common_t;
 
 /** Module handle
  *
  * Contains module's dlhandle, and the functions it exports.
  */
-typedef struct dl_module {
-	char const			*name;		//!< Name of the module e.g. sql.
-	dl_module_common_t const	*common;	//!< Symbol exported by the module, containing its public
-							//!< functions, name and behaviour control flags.
-	void				*handle;	//!< Handle returned by dlopen.
-} dl_module_t;
+struct dl_module {
+	char const		*name;		//!< Name of the module e.g. sql.
+	dl_t const		*parent;	//!< of this module.
+	dl_type_t		type;		//!< The type of module.
+	dl_common_t const	*common;	//!< Symbol exported by the module, containing its public
+						//!< functions, name and behaviour control flags.
 
-int			dl_module_instance_data_alloc(void **out, TALLOC_CTX *ctx,
-						      dl_module_t const *module, CONF_SECTION *cs);
-dl_module_t const	*dl_module(CONF_SECTION *conf, char const *name, char const *prefix);
+	CONF_SECTION		*conf;		//!< The module's global configuration (as opposed to the instance,
+						//!< configuration).  May be NULL.
+
+	void			*handle;	//!< Handle returned by dlopen.
+};
+
+/** A module/inst tuple
+ *
+ * Used to pass data back from dl_instance_parse_func
+ */
+typedef struct dl_instance dl_instance_t;
+struct dl_instance {
+	char const		*name;		//!< Instance name.
+	dl_t const		*module;
+	void			*data;		//!< Module instance's parsed configuration.
+	CONF_SECTION		*conf;		//!< Module's instance configuration.
+	dl_instance_t const	*parent;	//!< Parent module's instance (if any).
+};
+
+int			dl_symbol_init_cb_register(char const *symbol, dl_init_t func, void *ctx);
+
+void			dl_symbol_init_cb_unregister(char const *symbol, dl_init_t func);
+
+int			dl_symbol_free_cb_register(char const *symbol, dl_free_t func, void *ctx);
+
+void			dl_symbol_free_cb_unregister(char const *symbol, dl_free_t func);
+
+void			*dl_by_name(char const *name);
+
+dl_t const		*dl_module(CONF_SECTION *conf, dl_t const *parent, char const *name, dl_type_t type);
+
+dl_instance_t const	*dl_instance_find(void *data);
+
+void			*dl_instance_symbol(dl_instance_t const *instance, char const *sym_name);
+
+int			dl_instance(TALLOC_CTX *ctx, dl_instance_t **out,
+				    CONF_SECTION *conf, dl_instance_t const *parent, char const *name, dl_type_t type);
 
 #ifdef __cplusplus
 }

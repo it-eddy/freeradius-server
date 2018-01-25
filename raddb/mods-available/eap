@@ -50,8 +50,21 @@ eap {
 	cisco_accounting_username_bug = no
 
 	#
-	#  Supported EAP-types
+	#  Allowed EAP-types
 	#
+	#  Only EAP types listed below with a 'type = <EAP-Type>' pair will be allowed.
+	#
+	type = md5
+#	type = pwd
+#	type = leap
+	type = gtc
+	type = tls
+	type = ttls
+	type = mschapv2
+	type = peap
+#	type = fast
+#	type = aka
+	type = sim
 
 	#
 	#  We do NOT recommend using EAP-MD5 authentication for wireless
@@ -63,6 +76,11 @@ eap {
 
 	## EAP-PWD (Secure password-based authentication)
 	#
+	#  In v4, the "known good" is taken from the
+	#  &request.control:Cleartext-Password list, as is done by
+	#  other modules.  The "inner-tunnel" virtual server is no
+	#  longer used by EAP-PWD.
+	#
 #	pwd {
 #		group = 19
 
@@ -72,15 +90,6 @@ eap {
 		#  This has the same meaning as for TLS.
 		#
 #		fragment_size = 1020
-
-		#
-		#  The virtual server which determines the "known good" password
-		#  for the user. Note that unlike TLS, only the "authorize"
-		#  section is processed.  EAP-PWD requests can be distinguished
-		#  by having a User-Name, but no User-Password, CHAP-Password,
-		#  EAP-Message, etc.
-		#
-#		virtual_server = "inner-tunnel"
 #	}
 
 	## Cisco LEAP
@@ -95,8 +104,8 @@ eap {
 	#  or the NT-Password attributes. 'System' authentication is impossible
 	#  with LEAP.
 	#
-	leap {
-	}
+#	leap {
+#	}
 
 	## Generic Token Card.
 	#
@@ -283,15 +292,19 @@ eap {
 
 		ca_path = ${cadir}
 
+		# Accept an expired Certificate Revocation List
+		#
+#		allow_expired_crl = no
+
 		#
 		#  If check_cert_issuer is set, the value will be checked
 		#  against the DN of the issuer in the client certificate.  If
 		#  the values do not match, the certificate verification will
 		#  fail, rejecting the user.
 		#
-		#  In 2.1.10 and later, this check can be done more generally by
-		#  checking the value of the TLS-Client-Cert-Issuer attribute.
-		#  This check can be done via any mechanism you choose.
+		#  This check can be done more generally by checking the value
+		#  of the TLS-Client-Cert-Issuer attribute.  This check can be
+		#  done via any mechanism you choose.
 		#
 #		check_cert_issuer = "/C=GB/ST=Berkshire/L=Newbury/O=My Company Ltd"
 
@@ -304,24 +317,48 @@ eap {
 		#  This check is done only if the previous "check_cert_issuer"
 		#  is not set, or if the check succeeds.
 		#
-		#  In 2.1.10 and later, this check can be done more generally by
-		#  checking the value of the TLS-Client-Cert-CN attribute.
-		#  This check can be done via any mechanism you choose.
+		#  This check can be done more generally by checking the value
+		#  of the TLS-Client-Cert-CN attribute.  This check can be done
+		#  via any mechanism you choose.
 		#
 #		check_cert_cn = %{User-Name}
 
 		#
-		# Set this option to specify the allowed TLS cipher suites.
-		# The format is listed in "man 1 ciphers".
+		#  Set this option to specify the allowed TLS cipher suites.
+		#  The format is listed in "man 1 ciphers".
+		#
+		# For EAP-FAST, use "ALL:!EXPORT:!eNULL:!SSLv2"
 		#
 		cipher_list = "DEFAULT"
+
+		#  If enabled, OpenSSL will use server cipher list
+		#  (possibly defined by cipher_list option above)
+		#  for choosing right cipher suite rather than
+		#  using client-specified list which is OpenSSl default
+		#  behavior. Having it set to 'yes' is best practice
+		#  for TLS.
+		cipher_server_preference = yes
 
 		#
 		#  Work-arounds for OpenSSL nonsense OpenSSL 1.0.1f and 1.0.1g do
 		#  not calculate the EAP keys correctly.  The fix is to upgrade
 		#  OpenSSL, or disable TLS 1.2 here.
 		#
-#		disable_tlsv1_2 = no
+		#  SSLv2 and SSLv3 are permanently disabled due to security
+		#  issues.
+		#
+#		tls_max_version = 1.1
+
+		#
+		#  Prevents versions < tls_min_version from being negotiated.
+		#  In general the higher the tls_min_version the more secure
+		#  the protocol, but the narrower the range of supported TLS
+		#  clients.
+		#
+		#  SSLv2 and SSLv3 are permanently disabled due to security
+		#  issues.
+		#
+#		tls_min_version = 1.0
 
 		#
 		#  Elliptical cryptography configuration
@@ -355,7 +392,10 @@ eap {
 		#
 		#  Note: You must ensure any attributes required for policy
 		#  decisions are cached at the same time as the TLS session
-		#  data.  If using the default tls-cache virtual server and
+		#  data. See sites-available/tls-cache for documentation on
+		#  how TLS cache now works.
+		#
+		#  If using the default tls-cache virtual server and
 		#  cache module config, policy attributes may be stored in the
 		#  &session-state: list.
 		#
@@ -379,14 +419,20 @@ eap {
 
 			#
 			#  Name of the context TLS sessions are created under.
-			#  If no value is provided the context is set to the EAP
-			#  module instance.
+			#
+			#  Qualifies TLS sessions so that they can't be used for
+			#  purposes for which they were not intended.
 			#
 			#  If you wish to share session resumption data between
-			#  multiple EAP modules they all must have the same name
-			#  value set.
+			#  multiple EAP modules/virtual servers they all must have
+			#  the same name value set.
 			#
-#			name = 'shared_session_context'
+			#  To disable - set to a zero length string "".
+			#
+			#  Note: OpenSSL only allows 32 bytes of session ctx, so
+			#        the value provided here is digested with SHA256.
+			#
+#			name = "%{EAP-Type}%{Virtual-Server}"
 
 			#
 			#  The period for which a resumable session remains valid.
@@ -417,7 +463,7 @@ eap {
 			#  secret has been created.  This requires client support.
 			#
 			#  Extended Master Secrets (RFC 7627) are required to
-			#  prevent a MITM attack, where the attacker can resume
+			#  prevent MITM attacks, where the attacker can resume
 			#  a session if it can insert itself into the path between
 			#  the TLS client and TLS server.
 			#
@@ -436,10 +482,13 @@ eap {
 			#
 #			require_perfect_forward_secrecy = no
 
-			#  As of 3.1 OpenSSL's internal cache has been disabled due to
+			#  As of 4.0 OpenSSL's internal cache has been disabled due to
 			#  scoping/threading issues.
 			#
-			#  The following configuration options are deprecated:
+			#  The following configuration options are deprecated.  TLS
+			#  session caching is now handled by the "cache" module.
+			#  That module is more configurable, and has more back-ends
+			#  than the simple configurations below.
 			#
 			#    enable
 			#    persist_dir
@@ -741,40 +790,12 @@ eap {
 		tls = tls-common
 
 		#
-		#  copy_request_to_tunnel has been removed in 3.2.0
+		#  Both copy_request_to_tunnel and use_tunneled_reply have been
+		#  removed in v4.0.
 		#
-		#  Attributes from the outer request may be accessed with:
-		#
-		#	&outer:request:<attribute>
-		#
-		#  The old behaviour may be emulated by adding the following
-		#  to the top of the authorize section of the inner tunnel.
-		#
-		#	update {
-		#		&request: += &reply:[*]
-		#	}
-		#
-
-		#  
-		#  use_tunneled_reply has been removed in 3.2.0	
-		# 
-		#  Attributes that should be provided in the reply should
-		#  be copied to the outer.session-state list.
-		#
-		# 	update outer.session-state {
-		#		...
-		#
-		#	}
-		#
-		#  In the post-auth section of the outer server, these attributes
-		#  can then be copied to the reply list.
-		#
-		#  If you want to copy the entire session-state list to the reply
-		#  the following statement may be used:
-		#
-		#	update {
-		#		&reply: += &session-state:[*]
-		#	}
+		#  See the new policy "copy_request_to_tunnel" in
+		#  sites-available/inner-tunnel, and in policy.d/eap
+		#  for more information.
 		#
 
 		#
@@ -803,6 +824,10 @@ eap {
 		#	EAP-TLS-Require-Client-Cert = Yes
 		#
 		#  in the control items for a request.
+		#
+		#  Note that the majority of supplicants do not support using a
+		#  client certificate with EAP-TTLS, so this option is unlikely
+		#  to be usable for most people.
 		#
 #		require_client_cert = yes
 	}
@@ -878,17 +903,14 @@ eap {
 		default_eap_type = mschapv2
 
 		#
-		#  copy_request_to_tunnel has been removed in 3.2.0
+		#  Both copy_request_to_tunnel and use_tunneled_reply have been
+		#  removed in v4.0.
 		#
-		#  See notes in the ttls section about emulating this behaviour.
+		#  See the new policy "copy_request_to_tunnel" in
+		#  sites-available/inner-tunnel, and in policy.d/eap
+		#  for more information.
 		#
 
-		#
-		#  use_tunneled_reply has been removed in 3.2.0
-		#
-		#  See notes in the ttls section about emulating this behaviour.
-		#
-			
 		#
 		#  When the tunneled session is proxied, the home server may not
 		#  understand EAP-MSCHAP-V2. Set this entry to "no" to proxy the
@@ -927,6 +949,10 @@ eap {
 		#
 		#  in the control items for a request.
 		#
+		#  Note that the majority of supplicants do not support using a
+		#  client certificate with PEAP, so this option is unlikely to
+		#  be usable for most people.
+		#
 #		require_client_cert = yes
 	}
 
@@ -962,5 +988,117 @@ eap {
 		#  generally be the host name of the RADIUS server.  Or, some
 		#  information to uniquely identify it.
 #		identity = "FreeRADIUS"
+	}
+
+	## EAP-FAST
+	#
+	#  Note: To use EAP-FAST you must also configure an inner method in
+	#  mods-enabled/eap_inner.
+	#
+	#  The FAST module implements the EAP-FAST protocol
+	#
+	fast {
+		# Point to the common TLS configuration
+		#
+		tls = tls-common
+
+		#
+		#  If 'cipher_list' is set here, it will over-ride the
+		#  'cipher_list' configuration from the 'tls-common'
+		#  configuration.  The EAP-FAST module has it's own
+		#  over-ride for 'cipher_list' because the
+		#  specifications mandata a different set of ciphers
+		#  than are used by the other EAP methods.
+		#
+		#  cipher_list though must include "ADH" for anonymous provisioning.
+		#  This is not as straight forward as appending "ADH" alongside
+		#  "DEFAULT" as "DEFAULT" contains "!aNULL" so instead it is
+		#  recommended "ALL:!EXPORT:!eNULL:!SSLv2" is used
+		#
+		#  Note - for OpenSSL 1.1.0 and above you may need
+		#  to add ":@SECLEVEL=0"
+		#
+		cipher_list = "ALL:!EXPORT:!eNULL:!SSLv2"
+
+		# PAC lifetime in seconds (default: seven days)
+		#
+		pac_lifetime = 604800
+
+		# Authority ID of the server
+		#
+		# if you are running a cluster of RADIUS servers, you should make
+		# the value chosen here (and for "pac_opaque_key") the same on all
+		# your RADIUS servers.  This value should be unique to your
+		# installation.  We suggest using a domain name.
+		#
+		authority_identity = "1234"
+
+		# PAC Opaque encryption key (must be exactly 32 bytes in size)
+		#
+		# This value MUST be secret, and MUST be generated using
+		# a secure method, such as via 'openssl rand -hex 32'
+		#
+		pac_opaque_key = "0123456789abcdef0123456789ABCDEF"
+
+		# Same as for TTLS, PEAP, etc.
+		#
+		virtual_server = inner-tunnel
+	}
+
+	## EAP-SIM
+	#
+	#  Triplets can be provided using control attributes:
+	#
+	#  - &control:EAP-SIM-KC
+	#  - &control:EAP-SIM-RAND
+	#  - &control:EAP-SIM-SRES
+	#
+	#  Note: Three instances of each attribute must be provided.
+	#
+	#  Alternatively triplets can be generated locally using
+	#  control attributes:
+	#
+	#  - &control:SIM-Ki
+	#  - &control:SIM-OPc
+	#  - &control:SIM-Algo-Version (optional - see defaults below)
+	#
+	#  UMTS Milenage inputs (AMF, SQN) are ignored.
+	#
+	#  &control:SIM-Algo-Version selects the SIM algorithm used,
+	#  it must match the algorithm used by the SIM.
+	#
+	#  Accepted values for SIM-Algo-Versio are:
+	#
+	#  - Comp128v1
+	#  - Comp128v2
+	#  - Comp128v3 (default if no &control:SIM-OPc)
+	#  - Milenage (default if &control:SIM-OPc is available)
+	#
+	#  Note: In general operators will not provide the Ki (subscriber
+	#  key) for their SIM cards, as the Ki is considered highly
+	#  sensitive.
+	#
+	#  Local triplet generation is intended for testing and
+	#  research purposes where programmable or virtual SIM cards
+	#  are in use.
+	#
+	sim {
+		## Send a protected success message
+		#
+		#  If true - indicate to the peer that we'd like to send
+		#  a protected success message.  If the peer agrees and
+		#  authentication succeeds, send a SIM-Notification (Success)
+		#  packet protected with an AT_MAC attribute.
+		#
+		#  After the Notification is ACKed by the peer, we send
+		#  the final EAP-Success packet containing MPPE keys.
+#		send_result_ind = yes
+	}
+
+	## EAP-AKA
+	#
+	#
+	aka {
+
 	}
 }

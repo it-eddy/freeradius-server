@@ -40,8 +40,6 @@
  *
  * @see tmpl_afrom_str
  * @see tmpl_afrom_attr_str
- * @see tmpl_from_attr_str
- * @see tmpl_from_attr_substr
  *
  * In the case of #TMPL_TYPE_ATTR and #TMPL_TYPE_LIST, there are special cursor overlay
  * functions which can be used to iterate over only the #VALUE_PAIR that match a
@@ -58,9 +56,9 @@
  *
  * If you just need the string value of whatever the VPT refers to, the tmpl_*expand
  * functions may be used. These functions evaluate the VPT, execing, and xlat expanding
- * as necessary. In the case of #TMPL_TYPE_ATTR, and #PW_TYPE_STRING or #PW_TYPE_OCTETS
+ * as necessary. In the case of #TMPL_TYPE_ATTR, and #FR_TYPE_STRING or #FR_TYPE_OCTETS
  * #tmpl_expand will return a pointer to the raw #VALUE_PAIR buffer. This can be very
- * useful when using the #PW_TYPE_TMPL type in #CONF_PARSER structs, as it allows the
+ * useful when using the #FR_TYPE_TMPL type in #CONF_PARSER structs, as it allows the
  * user to determine whether they want the module to sanitise the value using presentation
  * format specific #xlat_escape_t function, or to operate on the raw value.
  *
@@ -92,14 +90,6 @@ typedef enum pair_lists {
 					//!< proxying the request.
 	PAIR_LIST_PROXY_REPLY,		//!< Attributes sent in response to the proxied
 					///< request.
-#endif
-#ifdef WITH_COA
-	PAIR_LIST_COA,			//!< Attributes to send in a forked CoA-Request.
-	PAIR_LIST_COA_REPLY,		//!< Attributes sent in response to the forked
-					///< CoA-Request.
-	PAIR_LIST_DM,			//!< Attributes to send in a forked Disconnect-Request.
-	PAIR_LIST_DM_REPLY		//!< Attributes sent in response to the forked
-					//!< Disconnect-Request.
 #endif
 } pair_lists_t;
 
@@ -144,22 +134,6 @@ typedef enum tmpl_type {
 
 extern const FR_NAME_NUMBER tmpl_names[];
 
-/** Describes a #TMPL_TYPE_ATTR, #TMPL_TYPE_ATTR_UNDEFINED or #TMPL_TYPE_LIST
- */
-typedef struct {
-	request_refs_t		request;		//!< Request to search or insert in.
-	pair_lists_t		list;			//!< List to search or insert in.
-
-	fr_dict_attr_t const		*da;			//!< Resolved dictionary attribute.
-	union {
-		uint8_t			da[FR_DICT_ATTR_SIZE];	//!< Unknown dictionary attribute buffer.
-		uint8_t			vendor[FR_DICT_ATTR_SIZE];	//!< Unknown dictionary attribute buffer.
-		char			name[FR_DICT_ATTR_SIZE];	//!< Raw unknown dictionary name.
-	} unknown;
-	int			num;			 //!< For array references.
-	int8_t			tag;			 //!< For tag references.
-} value_pair_tmpl_attr_t;
-
 /** A source or sink of value data.
  *
  * Is used as both the RHS and LHS of a map (both update, and conditional types)
@@ -192,27 +166,30 @@ typedef struct vp_tmpl_t {
 	size_t		len;		//!< Length of the raw string used to create the template.
 	FR_TOKEN	quote;		//!< What type of quoting was around the raw string.
 
-	bool		auto_converted; //!< Attr-26.9.1 --> Cisco-AVPair
-
 #ifdef HAVE_REGEX
 	bool		iflag;		//!< regex - case insensitive (if operand is used in regex comparison)
 	bool		mflag;		//!< regex - multiline flags (controls $ matching)
 #endif
 
 	union {
-		/*
-		 *  Attribute reference. Either an attribute currently in the request
-		 *  or an attribute to create.
-		 */
-		value_pair_tmpl_attr_t attribute;
+		struct {
+			request_refs_t		request;		//!< Request to search or insert in.
+			pair_lists_t		list;			//!< List to search or insert in.
+
+			fr_dict_attr_t const	*da;			//!< Resolved dictionary attribute.
+			union {
+				fr_dict_attr_t		*da;		//!< Unknown dictionary
+									//!< attribute buffer.
+				char			*name;
+			} unknown;
+			int			num;			 //!< For array references.
+			int8_t			tag;			 //!< For tag references.
+		} attribute;
 
 		/*
 		 *  Attribute value. Typically used as the RHS of an update map.
 		 */
-		struct {
-			PW_TYPE			type;			 //!< Type of data.
-			value_data_t		data;			 //!< Value data.
-		} literal;
+		fr_value_box_t	literal;			 //!< Value data.
 
 		xlat_exp_t	*xlat;	 //!< pre-parsed xlat_exp_t
 
@@ -226,30 +203,29 @@ typedef struct vp_tmpl_t {
  *
  * @{
  */
-#define tmpl_request		data.attribute.request
-#define tmpl_list		data.attribute.list
-#define tmpl_da			data.attribute.da
-#define tmpl_unknown		data.attribute.unknown.da
-#define tmpl_unknown_name      	data.attribute.unknown.name
-#define tmpl_num		data.attribute.num
-#define tmpl_tag		data.attribute.tag
+#define tmpl_request			data.attribute.request
+#define tmpl_list			data.attribute.list
+#define tmpl_da				data.attribute.da
+#define tmpl_unknown			data.attribute.unknown.da
+#define tmpl_unknown_name      		data.attribute.unknown.name
+#define tmpl_num			data.attribute.num
+#define tmpl_tag			data.attribute.tag
 /* @} **/
 
 /** @name Field accessors for #TMPL_TYPE_XLAT_STRUCT
  *
  * @{
  */
-#define tmpl_xlat		data.xlat
+#define tmpl_xlat			data.xlat
 /* @} **/
 
 /** @name Field accessors for #TMPL_TYPE_DATA
  *
  * @{
  */
-#define tmpl_data		data.literal
-#define tmpl_data_type		data.literal.type
-#define tmpl_data_length	data.literal.data.length
-#define tmpl_data_value		data.literal.data
+#define tmpl_value			data.literal
+#define tmpl_value_length		data.literal.datum.length
+#define tmpl_value_type			data.literal.type
 /* @} **/
 
 /** @name Field accessors for #TMPL_TYPE_REGEX_STRUCT and #TMPL_TYPE_REGEX
@@ -257,16 +233,16 @@ typedef struct vp_tmpl_t {
  * @{
  */
 #ifdef HAVE_REGEX
-#  define tmpl_preg		data.preg	//!< #TMPL_TYPE_REGEX_STRUCT only.
-#  define tmpl_iflag		iflag
-#  define tmpl_mflag		mflag
+#  define tmpl_preg			data.preg	//!< #TMPL_TYPE_REGEX_STRUCT only.
+#  define tmpl_iflag			iflag
+#  define tmpl_mflag			mflag
 #endif
 /* @} **/
 
 #ifndef WITH_VERIFY_PTR
-#  define VERIFY_TMPL(_x)
+#  define TMPL_VERIFY(_x)
 #else
-#  define VERIFY_TMPL(_x) tmpl_verify(__FILE__,  __LINE__, _x)
+#  define TMPL_VERIFY(_x) tmpl_verify(__FILE__, __LINE__, _x)
 void tmpl_verify(char const *file, int line, vp_tmpl_t const *vpt);
 #endif
 
@@ -307,14 +283,14 @@ void tmpl_verify(char const *file, int line, vp_tmpl_t const *vpt);
 
 /** Determine the correct context and list head
  *
- * Used in conjunction with the fr_cursor functions to determine the correct list
+ * Used in conjunction with the fr_pair_cursor functions to determine the correct list
  * and TALLOC_CTX for inserting VALUE_PAIRs.
  *
  * Example:
  @code{.c}
    TALLOC_CTX *ctx;
    VALUE_PAIR **head;
-   value_data_t value;
+   fr_value_box_t value;
 
    RADIUS_LIST_AND_CTX(ctx, head, request, CURRENT_REQUEST, PAIR_LIST_REQUEST);
    if (!list) return -1; // error
@@ -322,7 +298,7 @@ void tmpl_verify(char const *file, int line, vp_tmpl_t const *vpt);
    value.strvalue = talloc_strdup(NULL, "my new username");
    value.length = talloc_array_length(value.strvalue) - 1;
 
-   if (fr_pair_update_by_num(ctx, head, PW_USERNAME, 0, TAG_ANY, PW_TYPE_STRING, &value) < 0) return -1; // error
+   if (fr_pair_update_by_num(ctx, head, FR_USERNAME, 0, TAG_ANY, FR_TYPE_STRING, &value) < 0) return -1; // error
  @endcode
  *
  * @param _ctx new #VALUE_PAIR s should be allocated in for the specified list.
@@ -346,16 +322,17 @@ do {\
 /** Map ptr type to a boxed type
  *
  */
-#define	PW_TYPE_FROM_PTR(_ptr) \
+#define	FR_TYPE_FROM_PTR(_ptr) \
 	_Generic((_ptr), \
-		 char **: PW_TYPE_STRING, \
-		 char const **: PW_TYPE_STRING, \
-		 uint8_t **: PW_TYPE_OCTETS, \
-		 uint8_t const **: PW_TYPE_OCTETS, \
-		 uint8_t *: PW_TYPE_BYTE, \
-		 uint16_t *: PW_TYPE_SHORT, \
-		 uint32_t *: PW_TYPE_INTEGER, \
-		 uint64_t *: PW_TYPE_INTEGER64)
+		 char **: FR_TYPE_STRING, \
+		 char const **: FR_TYPE_STRING, \
+		 uint8_t **: FR_TYPE_OCTETS, \
+		 uint8_t const **: FR_TYPE_OCTETS, \
+		 uint8_t *: FR_TYPE_UINT8, \
+		 uint16_t *: FR_TYPE_UINT16, \
+		 uint32_t *: FR_TYPE_UINT32, \
+		 uint64_t *: FR_TYPE_UINT64, \
+		 struct timeval *: FR_TYPE_TIMEVAL)
 
 /** Expand a tmpl to a C type, using existing storage to hold variably sized types
  *
@@ -365,7 +342,7 @@ do {\
  */
 #define	tmpl_expand(_out, _buff, _buff_len, _request, _vpt, _escape, _escape_ctx) \
 	_tmpl_to_type((void *)(_out), (uint8_t *)_buff, _buff_len, \
-		      _request, _vpt, _escape, _escape_ctx, PW_TYPE_FROM_PTR(_out))
+		      _request, _vpt, _escape, _escape_ctx, FR_TYPE_FROM_PTR(_out))
 
 /** Expand a tmpl to a C type, allocing a new buffer to hold the string
  *
@@ -374,7 +351,7 @@ do {\
  * @see _tmpl_to_atype
  */
 #define	tmpl_aexpand(_ctx, _out, _request, _vpt, _escape, _escape_ctx) \
-	_tmpl_to_atype(_ctx, (void *)(_out), _request, _vpt, _escape, _escape_ctx, PW_TYPE_FROM_PTR(_out))
+	_tmpl_to_atype(_ctx, (void *)(_out), _request, _vpt, _escape, _escape_ctx, FR_TYPE_FROM_PTR(_out))
 
 
 VALUE_PAIR		**radius_list(REQUEST *request, pair_lists_t list);
@@ -398,17 +375,7 @@ vp_tmpl_t		*tmpl_alloc(TALLOC_CTX *ctx, tmpl_type_t type, char const *name,
 void			tmpl_from_da(vp_tmpl_t *vpt, fr_dict_attr_t const *da, int8_t tag, int num,
 				     request_refs_t request, pair_lists_t list);
 
-int			tmpl_afrom_value_data(TALLOC_CTX *ctx, vp_tmpl_t **out, value_data_t *data,
-					      PW_TYPE type, fr_dict_attr_t const *enumv, bool steal);
-
-ssize_t			tmpl_from_attr_substr(vp_tmpl_t *vpt, char const *name,
-					      request_refs_t request_def, pair_lists_t list_def,
-					      bool allow_unknown, bool allow_undefined);
-
-ssize_t			tmpl_from_attr_str(vp_tmpl_t *vpt, char const *name,
-					   request_refs_t request_def,
-					   pair_lists_t list_def,
-					   bool allow_unknown, bool allow_undefined);
+int			tmpl_afrom_value_box(TALLOC_CTX *ctx, vp_tmpl_t **out, fr_value_box_t *data, bool steal);
 
 ssize_t			tmpl_afrom_attr_substr(TALLOC_CTX *ctx, vp_tmpl_t **out, char const *name,
 					       request_refs_t request_def, pair_lists_t list_def,
@@ -417,40 +384,37 @@ ssize_t			tmpl_afrom_attr_substr(TALLOC_CTX *ctx, vp_tmpl_t **out, char const *n
 ssize_t			tmpl_afrom_attr_str(TALLOC_CTX *ctx, vp_tmpl_t **out, char const *name,
 					    request_refs_t request_def,
 					    pair_lists_t list_def,
-					    bool allow_unknown, bool allow_undefined);
+					    bool allow_unknown, bool allow_undefined) CC_HINT(nonnull (2, 3));
 
 ssize_t			tmpl_afrom_str(TALLOC_CTX *ctx, vp_tmpl_t **out, char const *name, size_t inlen,
 				       FR_TOKEN type, request_refs_t request_def, pair_lists_t list_def, bool do_escape);
 
-int			tmpl_cast_in_place(vp_tmpl_t *vpt, PW_TYPE type, fr_dict_attr_t const *enumv);
+int			tmpl_cast_in_place(vp_tmpl_t *vpt, fr_type_t type, fr_dict_attr_t const *enumv);
 
 void			tmpl_cast_in_place_str(vp_tmpl_t *vpt);
 
 int			tmpl_cast_to_vp(VALUE_PAIR **out, REQUEST *request,
 					vp_tmpl_t const *vpt, fr_dict_attr_t const *cast);
 
-size_t			tmpl_snprint(char *buffer, size_t bufsize, vp_tmpl_t const *vpt,
-				    fr_dict_attr_t const *values);
+size_t			tmpl_snprint(char *buffer, size_t bufsize, vp_tmpl_t const *vpt);
 
 ssize_t			_tmpl_to_type(void *out,
 				      uint8_t *buff, size_t outlen,
 				      REQUEST *request,
 				      vp_tmpl_t const *vpt,
-				      xlat_escape_t escape, void *escape_ctx,
-				      PW_TYPE dst_type)
+				      xlat_escape_t escape, void const *escape_ctx,
+				      fr_type_t dst_type)
 			CC_HINT(nonnull (1, 4, 5));
 
 ssize_t			_tmpl_to_atype(TALLOC_CTX *ctx, void *out,
 		       		       REQUEST *request,
 				       vp_tmpl_t const *vpt,
-				       xlat_escape_t escape, void *escape_ctx,
-				       PW_TYPE dst_type)
+				       xlat_escape_t escape, void const *escape_ctx,
+				       fr_type_t dst_type)
 			CC_HINT(nonnull (2, 3, 4));
 
-VALUE_PAIR		*tmpl_cursor_init(int *err, vp_cursor_t *cursor, REQUEST *request,
+VALUE_PAIR		*tmpl_cursor_init(int *err, fr_cursor_t *cursor, REQUEST *request,
 					  vp_tmpl_t const *vpt);
-
-VALUE_PAIR		*tmpl_cursor_next(vp_cursor_t *cursor, vp_tmpl_t const *vpt);
 
 int			tmpl_copy_vps(TALLOC_CTX *ctx, VALUE_PAIR **out, REQUEST *request,
 				      vp_tmpl_t const *vpt);
@@ -461,7 +425,7 @@ int			tmpl_find_or_add_vp(VALUE_PAIR **out, REQUEST *request, vp_tmpl_t const *v
 
 int			tmpl_define_unknown_attr(vp_tmpl_t *vpt);
 
-int			tmpl_define_undefined_attr(vp_tmpl_t *vpt, PW_TYPE type, fr_dict_attr_flags_t const *flags);
+int			tmpl_define_undefined_attr(vp_tmpl_t *vpt, fr_type_t type, fr_dict_attr_flags_t const *flags);
 
 #ifdef __cplusplus
 }

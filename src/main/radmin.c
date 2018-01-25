@@ -30,6 +30,7 @@ RCSID("$Id$")
 
 #include <pwd.h>
 #include <grp.h>
+#include <fcntl.h>
 
 #ifdef HAVE_GETOPT_H
 #  include <getopt.h>
@@ -41,6 +42,7 @@ RCSID("$Id$")
 
 #ifdef HAVE_LIBREADLINE
 
+# include <stdio.h>
 #if defined(HAVE_READLINE_READLINE_H)
 #  include <readline/readline.h>
 #  define USE_READLINE (1)
@@ -64,17 +66,14 @@ RCSID("$Id$")
 
 #include <freeradius-devel/radiusd.h>
 #include <freeradius-devel/md5.h>
-#include <freeradius-devel/channel.h>
+#include <freeradius-devel/conduit.h>
+#include <freeradius-devel/cf_parse.h>
 
 /*
  *	For configuration file stuff.
  */
 static char const *progname = "radmin";
-static char const *radmin_version = "radmin version " RADIUSD_VERSION_STRING
-#ifdef RADIUSD_VERSION_COMMIT
-" (git #" STRINGIFY(RADIUSD_VERSION_COMMIT) ")"
-#endif
-", built on " __DATE__ " at " __TIME__;
+static char const *radmin_version = RADIUSD_VERSION_STRING_BUILD("radmin");
 
 typedef enum {
 	RADMIN_CONN_NONE = 0,				//!< Don't know, never connected.
@@ -109,10 +108,6 @@ typedef struct radmin_state {
 	fr_event_list_t		*event_list;		//!< Our main event list.
 
 	radmin_conn_t		*active_conn;		//!< Connection to remote entity.
-
-	bool			batch;			//!< Whether we're in batch mode.
-	bool			echo;			//!< Whether we should be echoing commands as they're issued.
-	bool			unbuffered;		//!< Whether we're in unbuffered mode...
 } radmin_state_t;
 
 /** Main radmin state
@@ -121,7 +116,7 @@ typedef struct radmin_state {
 //static radmin_state_t state;
 
 /*
- *	The rest of this is because the conffile.c, etc. assume
+ *	The rest of this is because the conf_file.c, etc. assume
  *	they're running inside of the server.  And we don't (yet)
  *	have a "libfreeradius-server", or "libfreeradius-util".
  */
@@ -130,6 +125,14 @@ main_config_t main_config;
 static bool echo = false;
 static char const *secret = "testing123";
 static bool unbuffered = false;
+static fr_log_t radmin_log = {
+	.dst = L_DST_NULL,
+	.colourise = false,
+	.timestamp = L_TIMESTAMP_ON,
+	.fd = -1,
+	.file = NULL,
+};
+
 
 static void NEVER_RETURNS usage(int status)
 {
@@ -142,6 +145,7 @@ static void NEVER_RETURNS usage(int status)
 	fprintf(output, "  -f socket_file  Open socket_file directly, without reading radius.conf\n");
 	fprintf(output, "  -h              Print usage help information.\n");
 	fprintf(output, "  -i input_file   Read commands from 'input_file'.\n");
+	fprintf(output, "  -l <log_file>   Commands which are executed will be written to this file.\n");
 	fprintf(output, "  -n name         Read raddb/name.conf instead of raddb/radiusd.conf\n");
 	fprintf(output, "  -q              Reduce output verbosity\n");
 	fprintf(output, "  -x              Increase output verbosity\n");
@@ -159,7 +163,7 @@ static int client_socket(char const *server)
 
 	p = strchr(buffer, ':');
 	if (!p) {
-		port = PW_RADMIN_PORT;
+		port = FR_RADMIN_PORT;
 	} else {
 		port = atoi(p + 1);
 		*p = '\0';
@@ -168,14 +172,14 @@ static int client_socket(char const *server)
 	if (fr_inet_hton(&ipaddr, AF_INET, buffer, false) < 0) {
 		fprintf(stderr, "%s: Failed looking up host %s: %s\n",
 			progname, buffer, fr_syserror(errno));
-		exit(1);
+		exit(EXIT_FAILURE);
 	}
 
 	sockfd = fr_socket_client_tcp(NULL, &ipaddr, port, false);
 	if (sockfd < 0) {
 		fprintf(stderr, "%s: Failed opening socket %s: %s\n",
 			progname, server, fr_syserror(errno));
-		exit(1);
+		exit(EXIT_FAILURE);
 	}
 
 	return sockfd;
@@ -184,7 +188,7 @@ static int client_socket(char const *server)
 static ssize_t do_challenge(int sockfd)
 {
 	ssize_t r;
-	fr_channel_type_t channel;
+	fr_conduit_type_t conduit;
 	uint8_t challenge[16];
 
 	challenge[0] = 0x00;
@@ -192,19 +196,19 @@ static ssize_t do_challenge(int sockfd)
 	/*
 	 *	When connecting over a socket, the server challenges us.
 	 */
-	r = fr_channel_read(sockfd, &channel, challenge, sizeof(challenge));
+	r = fr_conduit_read(sockfd, &conduit, challenge, sizeof(challenge));
 	if (r <= 0) return r;
 
-	if ((r != 16) || (channel != FR_CHANNEL_AUTH_CHALLENGE)) {
+	if ((r != 16) || (conduit != FR_CONDUIT_AUTH_CHALLENGE)) {
 		fprintf(stderr, "%s: Failed to read challenge.\n",
 			progname);
-		exit(1);
+		exit(EXIT_FAILURE);
 	}
 
 	fr_hmac_md5(challenge, (uint8_t const *) secret, strlen(secret),
 		    challenge, sizeof(challenge));
 
-	r = fr_channel_write(sockfd, FR_CHANNEL_AUTH_RESPONSE, challenge, sizeof(challenge));
+	r = fr_conduit_write(sockfd, FR_CONDUIT_AUTH_RESPONSE, challenge, sizeof(challenge));
 	if (r <= 0) return r;
 
 	/*
@@ -219,37 +223,37 @@ static ssize_t do_challenge(int sockfd)
 /*
  *	Returns -1 on failure.  0 on connection failed.  +1 on OK.
  */
-static ssize_t flush_channels(int sockfd, char *buffer, size_t bufsize)
+static ssize_t flush_conduits(int sockfd, char *buffer, size_t bufsize)
 {
 	ssize_t r;
 	uint32_t status;
-	fr_channel_type_t channel;
+	fr_conduit_type_t conduit;
 
 	while (true) {
 		uint32_t notify;
 
-		r = fr_channel_read(sockfd, &channel, buffer, bufsize - 1);
+		r = fr_conduit_read(sockfd, &conduit, buffer, bufsize - 1);
 		if (r <= 0) return r;
 
 		buffer[r] = '\0';	/* for C strings */
 
-		switch (channel) {
-		case FR_CHANNEL_STDOUT:
+		switch (conduit) {
+		case FR_CONDUIT_STDOUT:
 			fprintf(stdout, "%s", buffer);
 			break;
 
-		case FR_CHANNEL_STDERR:
+		case FR_CONDUIT_STDERR:
 			fprintf(stderr, "ERROR: %s", buffer);
 			break;
 
-		case FR_CHANNEL_CMD_STATUS:
+		case FR_CONDUIT_CMD_STATUS:
 			if (r < 4) return 1;
 
 			memcpy(&status, buffer, sizeof(status));
 			status = ntohl(status);
 			return status;
 
-		case FR_CHANNEL_NOTIFY:
+		case FR_CONDUIT_NOTIFY:
 			if (r < 4) return -1;
 
 			memcpy(&notify, buffer, sizeof(notify));
@@ -261,7 +265,7 @@ static ssize_t flush_channels(int sockfd, char *buffer, size_t bufsize)
 			break;
 
 		default:
-			fprintf(stderr, "Unexpected response %02x\n", channel);
+			fprintf(stderr, "Unexpected response %02x\n", conduit);
 			return -1;
 		}
 	}
@@ -285,17 +289,17 @@ static ssize_t run_command(int sockfd, char const *command,
 	/*
 	 *	Write the text to the socket.
 	 */
-	r = fr_channel_write(sockfd, FR_CHANNEL_STDIN, command, strlen(command));
+	r = fr_conduit_write(sockfd, FR_CONDUIT_STDIN, command, strlen(command));
 	if (r <= 0) return r;
 
-	return flush_channels(sockfd, buffer, bufsize);
+	return flush_conduits(sockfd, buffer, bufsize);
 }
 
 static int do_connect(int *out, char const *file, char const *server)
 {
 	int sockfd;
 	ssize_t r;
-	fr_channel_type_t channel;
+	fr_conduit_type_t conduit;
 	char buffer[65536];
 
 	uint32_t magic;
@@ -348,7 +352,7 @@ static int do_connect(int *out, char const *file, char const *server)
 	memcpy(buffer, &magic, sizeof(magic));
 	memset(buffer + sizeof(magic), 0, sizeof(magic));
 
-	r = fr_channel_write(sockfd, FR_CHANNEL_INIT_ACK, buffer, 8);
+	r = fr_conduit_write(sockfd, FR_CONDUIT_INIT_ACK, buffer, 8);
 	if (r <= 0) {
 	do_close:
 		fprintf(stderr, "%s: Error in socket: %s\n",
@@ -357,10 +361,10 @@ static int do_connect(int *out, char const *file, char const *server)
 			return -1;
 	}
 
-	r = fr_channel_read(sockfd, &channel, buffer + 8, 8);
+	r = fr_conduit_read(sockfd, &conduit, buffer + 8, 8);
 	if (r <= 0) goto do_close;
 
-	if ((r != 8) || (channel != FR_CHANNEL_INIT_ACK) ||
+	if ((r != 8) || (conduit != FR_CONDUIT_INIT_ACK) ||
 	    (memcmp(buffer, buffer + 8, 8) != 0)) {
 		fprintf(stderr, "%s: Incompatible versions\n", progname);
 		close(sockfd);
@@ -424,11 +428,11 @@ int main(int argc, char **argv)
 		case 'd':
 			if (file) {
 				fprintf(stderr, "%s: -d and -f cannot be used together.\n", progname);
-				exit(1);
+				exit(EXIT_FAILURE);
 			}
 			if (server) {
 				fprintf(stderr, "%s: -d and -s cannot be used together.\n", progname);
-				exit(1);
+				exit(EXIT_FAILURE);
 			}
 			radius_dir = optarg;
 			break;
@@ -442,7 +446,7 @@ int main(int argc, char **argv)
 			if (num_commands >= MAX_COMMANDS) {
 				fprintf(stderr, "%s: Too many '-e'\n",
 					progname);
-				exit(1);
+				exit(EXIT_FAILURE);
 			}
 
 			commands[num_commands] = optarg;
@@ -468,6 +472,10 @@ int main(int argc, char **argv)
 			quiet = true;
 			break;
 
+		case 'l':
+			radmin_log.file = optarg;
+			break;
+
 		case 'n':
 			name = optarg;
 			break;
@@ -488,6 +496,7 @@ int main(int argc, char **argv)
 
 		case 'S':
 			secret = NULL;
+			break;
 
 		case 'x':
 			rad_debug_lvl++;
@@ -500,7 +509,7 @@ int main(int argc, char **argv)
 	 */
 	if (fr_check_lib_magic(RADIUSD_MAGIC_NUMBER) < 0) {
 		fr_perror("radmin");
-		exit(1);
+		exit(EXIT_FAILURE);
 	}
 
 	if (radius_dir) {
@@ -513,7 +522,7 @@ int main(int argc, char **argv)
 		struct passwd	*pwd;
 		struct group	*grp;
 
-		file = NULL;	/* MUST read it from the conffile now */
+		file = NULL;	/* MUST read it from the conf_file now */
 
 		snprintf(buffer, sizeof(buffer), "%s/%s.conf", radius_dir, name);
 
@@ -531,8 +540,8 @@ int main(int argc, char **argv)
 			exit(64);
 		}
 
-		cs = cf_section_alloc(NULL, "main", NULL);
-		if (!cs) exit(1);
+		cs = cf_section_alloc(NULL, NULL, "main", NULL);
+		if (!cs) exit(EXIT_FAILURE);
 
 		if (cf_file_read(cs, buffer) < 0) {
 			fprintf(stderr, "%s: Errors reading or parsing %s\n", progname, buffer);
@@ -544,7 +553,7 @@ int main(int argc, char **argv)
 		gid = getgid();
 
 		subcs = NULL;
-		while ((subcs = cf_subsection_find_next(cs, subcs, "listen")) != NULL) {
+		while ((subcs = cf_section_find_next(cs, subcs, "listen", NULL)) != NULL) {
 			char const *value;
 			CONF_PAIR *cp = cf_pair_find(subcs, "type");
 
@@ -558,11 +567,11 @@ int main(int argc, char **argv)
 			/*
 			 *	Now find the socket name (sigh)
 			 */
-			rcode = cf_pair_parse(subcs, "socket",
-					      FR_ITEM_POINTER(PW_TYPE_STRING, &file), NULL, T_DOUBLE_QUOTED_STRING);
+			rcode = cf_pair_parse(NULL, subcs, "socket",
+					      FR_ITEM_POINTER(FR_TYPE_STRING, &file), NULL, T_DOUBLE_QUOTED_STRING);
 			if (rcode < 0) {
 				fprintf(stderr, "%s: Failed parsing listen section 'socket'\n", progname);
-				exit(1);
+				exit(EXIT_FAILURE);
 			}
 
 			if (!file) {
@@ -578,11 +587,11 @@ int main(int argc, char **argv)
 			/*
 			 *	Check UID and GID.
 			 */
-			rcode = cf_pair_parse(subcs, "uid",
-					      FR_ITEM_POINTER(PW_TYPE_STRING, &uid_name), NULL, T_DOUBLE_QUOTED_STRING);
+			rcode = cf_pair_parse(NULL, subcs, "uid",
+					      FR_ITEM_POINTER(FR_TYPE_STRING, &uid_name), NULL, T_DOUBLE_QUOTED_STRING);
 			if (rcode < 0) {
 				fprintf(stderr, "%s: Failed parsing listen section 'uid'\n", progname);
-				exit(1);
+				exit(EXIT_FAILURE);
 			}
 
 			if (!uid_name) break;
@@ -590,16 +599,16 @@ int main(int argc, char **argv)
 			pwd = getpwnam(uid_name);
 			if (!pwd) {
 				fprintf(stderr, "%s: Failed getting UID for user %s: %s\n", progname, uid_name, strerror(errno));
-				exit(1);
+				exit(EXIT_FAILURE);
 			}
 
 			if (uid != pwd->pw_uid) continue;
 
-			rcode = cf_pair_parse(subcs, "gid",
-					      FR_ITEM_POINTER(PW_TYPE_STRING, &gid_name), NULL, T_DOUBLE_QUOTED_STRING);
+			rcode = cf_pair_parse(NULL, subcs, "gid",
+					      FR_ITEM_POINTER(FR_TYPE_STRING, &gid_name), NULL, T_DOUBLE_QUOTED_STRING);
 			if (rcode < 0) {
 				fprintf(stderr, "%s: Failed parsing listen section 'gid'\n", progname);
-				exit(1);
+				exit(EXIT_FAILURE);
 			}
 
 			if (!gid_name) break;
@@ -608,7 +617,7 @@ int main(int argc, char **argv)
 			if (!grp) {
 				fprintf(stderr, "%s: Failed resolving gid of group %s: %s\n",
 					progname, gid_name, strerror(errno));
-				exit(1);
+				exit(EXIT_FAILURE);
 			}
 
 			if (gid != grp->gr_gid) continue;
@@ -618,7 +627,35 @@ int main(int argc, char **argv)
 
 		if (!file) {
 			fprintf(stderr, "%s: Could not find control socket in %s\n", progname, buffer);
-			exit(1);
+			exit(EXIT_FAILURE);
+		}
+
+		/*
+		 *	Log the commands we've run.
+		 */
+		if (!radmin_log.file) {
+			subcs = cf_section_find(cs, "log", NULL);
+			if (subcs) {
+				CONF_PAIR *cp = cf_pair_find(subcs, "radmin");
+				if (cp) {
+					radmin_log.file = cf_pair_value(cp);
+
+					if (!radmin_log.file) {
+						fprintf(stderr, "%s: Invalid value for 'radmin' log destination", progname);
+						exit(EXIT_FAILURE);
+					}
+				}
+			}
+		}
+
+		if (radmin_log.file) {
+			radmin_log.fd = open(radmin_log.file, O_APPEND | O_CREAT, S_IRUSR | S_IWUSR);
+			if (radmin_log.fd < 0) {
+				fprintf(stderr, "%s: Failed opening %s: %s\n", progname, radmin_log.file, fr_syserror(errno));
+				exit(EXIT_FAILURE);
+			}
+
+			radmin_log.dst = L_DST_FILES;
 		}
 	}
 
@@ -626,14 +663,14 @@ int main(int argc, char **argv)
 		inputfp = fopen(input_file, "r");
 		if (!inputfp) {
 			fprintf(stderr, "%s: Failed opening %s: %s\n", progname, input_file, fr_syserror(errno));
-			exit(1);
+			exit(EXIT_FAILURE);
 		}
 	}
 
 	if (!file && !server) {
 		fprintf(stderr, "%s: Must use one of '-d' or '-f' or '-s'\n",
 			progname);
-		exit(1);
+		exit(EXIT_FAILURE);
 	}
 
 	/*
@@ -655,7 +692,7 @@ int main(int argc, char **argv)
 	 */
 	signal(SIGPIPE, SIG_IGN);
 
-	if (do_connect(&sockfd, file, server) < 0) exit(1);
+	if (do_connect(&sockfd, file, server) < 0) exit(EXIT_FAILURE);
 
 	/*
 	 *	Run commans from the command-line.
@@ -665,13 +702,13 @@ int main(int argc, char **argv)
 
 		for (i = 0; i <= num_commands; i++) {
 			len = run_command(sockfd, commands[i], buffer, sizeof(buffer));
-			if (len < 0) exit(1);
+			if (len < 0) exit(EXIT_FAILURE);
 
-			if (len == FR_CHANNEL_FAIL) exit_status = EXIT_FAILURE;
+			if (len == FR_CONDUIT_FAIL) exit_status = EXIT_FAILURE;
 		}
 
 		if (unbuffered) {
-			while (true) flush_channels(sockfd, buffer, sizeof(buffer));
+			while (true) flush_conduits(sockfd, buffer, sizeof(buffer));
 		}
 
 		exit(exit_status);
@@ -679,7 +716,7 @@ int main(int argc, char **argv)
 
 	if (!quiet) {
 		printf("%s - FreeRADIUS Server administration tool.\n", radmin_version);
-		printf("Copyright (C) 2008-2016 The FreeRADIUS server project and contributors.\n");
+		printf("Copyright (C) 2008-2017 The FreeRADIUS server project and contributors.\n");
 		printf("There is NO warranty; not even for MERCHANTABILITY or FITNESS FOR A\n");
 		printf("PARTICULAR PURPOSE.\n");
 		printf("You may redistribute copies of FreeRADIUS under the terms of the\n");
@@ -722,7 +759,7 @@ int main(int argc, char **argv)
 			if (!p) {
 				fprintf(stderr, "%s: Input line too long\n",
 					progname);
-				exit(1);
+				exit(EXIT_FAILURE);
 			}
 
 			*p = '\0';
@@ -763,7 +800,7 @@ int main(int argc, char **argv)
 		}
 
 		if (strcmp(line, "reconnect") == 0) {
-			if (do_connect(&sockfd, file, server) < 0) exit(1);
+			if (do_connect(&sockfd, file, server) < 0) exit(EXIT_FAILURE);
 			line = NULL;
 			continue;
 		}
@@ -792,25 +829,33 @@ int main(int argc, char **argv)
 		}
 
 		retries = 0;
+
+		/*
+		 *	If required, log commands to a radmin log file.
+		 */
+		if (radmin_log.dst == L_DST_FILES) {
+			fr_log(&radmin_log, L_INFO, "%s", line);
+		}
+
 	retry:
 		len = run_command(sockfd, line, buffer, sizeof(buffer));
 		if (len < 0) {
 			if (!quiet) fprintf(stderr, "... reconnecting ...\n");
 
 			if (do_connect(&sockfd, file, server) < 0) {
-				exit(1);
+				exit(EXIT_FAILURE);
 			}
 
 			retries++;
 			if (retries < 2) goto retry;
 
 			fprintf(stderr, "Failed to connect to server\n");
-			exit(1);
+			exit(EXIT_FAILURE);
 
-		} else if (len == FR_CHANNEL_SUCCESS) {
+		} else if (len == FR_CONDUIT_SUCCESS) {
 			break;
 
-		} else if (len == FR_CHANNEL_FAIL) {
+		} else if (len == FR_CONDUIT_FAIL) {
 			exit_status = EXIT_FAILURE;
 		}
 	}
@@ -818,6 +863,8 @@ int main(int argc, char **argv)
 	fprintf(stdout, "\n");
 
 	if (inputfp != stdin) fclose(inputfp);
+
+	if (radmin_log.dst == L_DST_FILES) close(radmin_log.fd);
 
 	talloc_free(dict);
 

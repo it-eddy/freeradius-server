@@ -5,14 +5,14 @@
 
 #include "config.h"
 #include <wbclient.h>
-#include <freeradius-devel/connection.h>
+#include <freeradius-devel/pool.h>
 
 /*
  *      Structure for the module configuration.
  */
 typedef struct rlm_winbind_t {
 	char const		*name;
-	fr_connection_pool_t    *wb_pool;
+	fr_pool_t    *wb_pool;
 
 	/* main config */
 	vp_tmpl_t		*wb_username;

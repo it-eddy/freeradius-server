@@ -42,10 +42,10 @@ typedef enum {
 
 
 static const CONF_PARSER module_config[] = {
-	{ FR_CONF_OFFSET("timer_expire", PW_TYPE_INTEGER, rlm_securid_t, timer_limit), .dflt = "600" },
-	{ FR_CONF_OFFSET("max_sessions", PW_TYPE_INTEGER, rlm_securid_t, max_sessions), .dflt = "2048" },
-	{ FR_CONF_OFFSET("max_trips_per_session", PW_TYPE_INTEGER, rlm_securid_t, max_trips_per_session) },
-	{ FR_CONF_OFFSET("max_round_trips", PW_TYPE_INTEGER, rlm_securid_t, max_trips_per_session), .dflt = "6" },
+	{ FR_CONF_OFFSET("timer_expire", FR_TYPE_UINT32, rlm_securid_t, timer_limit), .dflt = "600" },
+	{ FR_CONF_OFFSET("max_sessions", FR_TYPE_UINT32, rlm_securid_t, max_sessions), .dflt = "2048" },
+	{ FR_CONF_OFFSET("max_trips_per_session", FR_TYPE_UINT32, rlm_securid_t, max_trips_per_session) },
+	{ FR_CONF_OFFSET("max_round_trips", FR_TYPE_UINT32, rlm_securid_t, max_trips_per_session), .dflt = "6" },
 	CONF_PARSER_TERMINATOR
 };
 
@@ -410,7 +410,7 @@ static int mod_detach(void *instance)
 
 	/* delete session tree */
 	if (inst->session_tree) {
-		rbtree_free(inst->session_tree);
+		talloc_free(inst->session_tree);
 		inst->session_tree = NULL;
 	}
 
@@ -420,7 +420,7 @@ static int mod_detach(void *instance)
 }
 
 
-static int mod_instantiate(UNUSED CONF_SECTION *conf, void *instance)
+static int mod_instantiate(void *instance, UNUSED CONF_SECTION *conf)
 {
 	rlm_securid_t *inst = instance;
 
@@ -442,10 +442,10 @@ static int mod_instantiate(UNUSED CONF_SECTION *conf, void *instance)
 /*
  *	Authenticate the user via one of any well-known password.
  */
-static rlm_rcode_t CC_HINT(nonnull) mod_authenticate(void *instance, REQUEST *request)
+static rlm_rcode_t CC_HINT(nonnull) mod_authenticate(void *instance, UNUSED void *thread, REQUEST *request)
 {
 	int rcode;
-	rlm_securid_t *inst = instance;
+	rlm_securid_t const *inst = instance;
 	char  buffer[FR_MAX_STRING_LEN]="";
 	char const *username=NULL, *password=NULL;
 	VALUE_PAIR *vp;
@@ -467,7 +467,7 @@ static rlm_rcode_t CC_HINT(nonnull) mod_authenticate(void *instance, REQUEST *re
 	/*
 	 *	Clear-text passwords are the only ones we support.
 	 */
-	if (request->password->da->attr != PW_USER_PASSWORD) {
+	if (request->password->da->attr != FR_USER_PASSWORD) {
 		REDEBUG("Attribute \"User-Password\" is required for authentication. Cannot use \"%s\"",
 			request->password->da->name);
 		return RLM_MODULE_INVALID;
@@ -505,14 +505,14 @@ static rlm_rcode_t CC_HINT(nonnull) mod_authenticate(void *instance, REQUEST *re
 		/* reply with Access-challenge message code (11) */
 
 		/* Generate Prompt attribute */
-		vp = fr_pair_afrom_num(request->reply, 0, PW_PROMPT);
+		vp = fr_pair_afrom_num(request->reply, 0, FR_PROMPT);
 
 		rad_assert(vp != NULL);
-		vp->vp_integer = 0; /* no echo */
+		vp->vp_uint32 = 0; /* no echo */
 		fr_pair_add(&request->reply->vps, vp);
 
 		/* Mark the packet as a Acceess-Challenge Packet */
-		request->reply->code = PW_CODE_ACCESS_CHALLENGE;
+		request->reply->code = FR_CODE_ACCESS_CHALLENGE;
 		RDEBUG("Sending Access-Challenge");
 		rcode = RLM_MODULE_HANDLED;
 		break;
@@ -544,7 +544,6 @@ extern rad_module_t rlm_securid;
 rad_module_t rlm_securid = {
 	.magic		= RLM_MODULE_INIT,
 	.name		= "securid",
-	.type		= RLM_TYPE_HUP_SAFE,
 	.inst_size	= sizeof(rlm_securid_t),
 	.config		= module_config,
 	.instantiate	= mod_instantiate,

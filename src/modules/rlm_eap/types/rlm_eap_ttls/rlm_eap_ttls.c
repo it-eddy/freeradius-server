@@ -59,12 +59,12 @@ typedef struct rlm_eap_ttls {
 
 
 static CONF_PARSER submodule_config[] = {
-	{ FR_CONF_OFFSET("tls", PW_TYPE_STRING, rlm_eap_ttls_t, tls_conf_name) },
-	{ FR_CONF_DEPRECATED("copy_request_to_tunnel", PW_TYPE_BOOLEAN, rlm_eap_ttls_t, NULL), .dflt = "no" },
-	{ FR_CONF_DEPRECATED("use_tunneled_reply", PW_TYPE_BOOLEAN, rlm_eap_ttls_t, NULL), .dflt = "no" },
-	{ FR_CONF_OFFSET("virtual_server", PW_TYPE_STRING | PW_TYPE_REQUIRED | PW_TYPE_NOT_EMPTY, rlm_eap_ttls_t, virtual_server) },
-	{ FR_CONF_OFFSET("include_length", PW_TYPE_BOOLEAN, rlm_eap_ttls_t, include_length), .dflt = "yes" },
-	{ FR_CONF_OFFSET("require_client_cert", PW_TYPE_BOOLEAN, rlm_eap_ttls_t, req_client_cert), .dflt = "no" },
+	{ FR_CONF_OFFSET("tls", FR_TYPE_STRING, rlm_eap_ttls_t, tls_conf_name) },
+	{ FR_CONF_DEPRECATED("copy_request_to_tunnel", FR_TYPE_BOOL, rlm_eap_ttls_t, NULL), .dflt = "no" },
+	{ FR_CONF_DEPRECATED("use_tunneled_reply", FR_TYPE_BOOL, rlm_eap_ttls_t, NULL), .dflt = "no" },
+	{ FR_CONF_OFFSET("virtual_server", FR_TYPE_STRING | FR_TYPE_REQUIRED | FR_TYPE_NOT_EMPTY, rlm_eap_ttls_t, virtual_server) },
+	{ FR_CONF_OFFSET("include_length", FR_TYPE_BOOL, rlm_eap_ttls_t, include_length), .dflt = "yes" },
+	{ FR_CONF_OFFSET("require_client_cert", FR_TYPE_BOOL, rlm_eap_ttls_t, req_client_cert), .dflt = "no" },
 	CONF_PARSER_TERMINATOR
 };
 
@@ -174,21 +174,21 @@ static rlm_rcode_t mod_process(void *arg, eap_session_t *eap_session)
 	 */
 	rcode = eap_ttls_process(eap_session, tls_session);
 	switch (rcode) {
-	case PW_CODE_ACCESS_REJECT:
+	case FR_CODE_ACCESS_REJECT:
 		eap_tls_fail(eap_session);
 		return RLM_MODULE_REJECT;
 
 		/*
 		 *	Access-Challenge, continue tunneled conversation.
 		 */
-	case PW_CODE_ACCESS_CHALLENGE:
+	case FR_CODE_ACCESS_CHALLENGE:
 		eap_tls_request(eap_session);
 		return RLM_MODULE_OK;
 
 		/*
 		 *	Success: Automatically return MPPE keys.
 		 */
-	case PW_CODE_ACCESS_ACCEPT:
+	case FR_CODE_ACCESS_ACCEPT:
 		if (eap_tls_success(eap_session) < 0) return 0;
 		return RLM_MODULE_OK;
 
@@ -198,7 +198,7 @@ static rlm_rcode_t mod_process(void *arg, eap_session_t *eap_session)
 	 *	that the request now has a "proxy" packet, and
 	 *	will proxy it, rather than returning an EAP packet.
 	 */
-	case PW_CODE_STATUS_CLIENT:
+	case FR_CODE_STATUS_CLIENT:
 #ifdef WITH_PROXY
 		rad_assert(eap_session->request->proxy != NULL);
 #endif
@@ -231,9 +231,9 @@ static rlm_rcode_t mod_session_init(void *type_arg, eap_session_t *eap_session)
 	 *	EAP-TLS-Require-Client-Cert attribute will override
 	 *	the require_client_cert configuration option.
 	 */
-	vp = fr_pair_find_by_num(eap_session->request->control, 0, PW_EAP_TLS_REQUIRE_CLIENT_CERT, TAG_ANY);
+	vp = fr_pair_find_by_num(eap_session->request->control, 0, FR_EAP_TLS_REQUIRE_CLIENT_CERT, TAG_ANY);
 	if (vp) {
-		client_cert = vp->vp_integer ? true : false;
+		client_cert = vp->vp_uint32 ? true : false;
 	} else {
 		client_cert = inst->req_client_cert;
 	}
@@ -263,11 +263,11 @@ static rlm_rcode_t mod_session_init(void *type_arg, eap_session_t *eap_session)
 /*
  *	Attach the module.
  */
-static int mod_instantiate(UNUSED rlm_eap_config_t const *config, void *instance, CONF_SECTION *cs)
+static int mod_instantiate(void *instance, CONF_SECTION *cs)
 {
 	rlm_eap_ttls_t *inst = talloc_get_type_abort(instance, rlm_eap_ttls_t);
 
-	if (!cf_section_sub_find_name2(main_config.config, "server", inst->virtual_server)) {
+	if (!virtual_server_find(inst->virtual_server)) {
 		cf_log_err_by_name(cs, "virtual_server", "Unknown virtual server '%s'", inst->virtual_server);
 		return -1;
 	}
@@ -294,6 +294,7 @@ rlm_eap_submodule_t rlm_eap_ttls = {
 	.name		= "eap_ttls",
 	.magic		= RLM_MODULE_INIT,
 
+	.provides	= { FR_EAP_TTLS },
 	.inst_size	= sizeof(rlm_eap_ttls_t),
 	.config		= submodule_config,
 	.instantiate	= mod_instantiate,	/* Create new submodule instance */

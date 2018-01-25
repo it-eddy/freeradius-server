@@ -23,6 +23,7 @@
 #include <freeradius-devel/radiusd.h>
 #include <freeradius-devel/protocol.h>
 #include <freeradius-devel/modules.h>
+#include <freeradius-devel/unlang.h>
 #include <freeradius-devel/process.h>
 #include <freeradius-devel/rad_assert.h>
 #include <freeradius-devel/pcap.h>
@@ -53,9 +54,8 @@ static rlm_rcode_t arp_process(REQUEST *request)
 {
 	CONF_SECTION *unlang;
 
-	request->server = request->listener->server;
 	request->server_cs = request->listener->server_cs;
-	unlang = cf_section_sub_find(request->server_cs, "arp");
+	unlang = cf_section_find(request->server_cs, "arp", NULL);
 
 	request->component = "arp";
 
@@ -95,7 +95,7 @@ static int arp_socket_recv(rad_listen_t *listener)
 
 	link_len = fr_link_layer_offset(data, header->caplen, sock->lsock.pcap->link_layer);
 	if (link_len < 0) {
-		ERROR("Failed determining link layer header offset: %s", fr_strerror());
+		PERROR("Failed determining link layer header offset");
 		return 0;
 	}
 
@@ -172,39 +172,34 @@ static const arp_decode_t header_names[] = {
 
 static int arp_socket_decode(UNUSED rad_listen_t *listener, REQUEST *request)
 {
-	int i;
-	arp_over_ether_t const *arp;
-	uint8_t const *p;
+	int			i;
+	uint8_t	const		*p = request->packet->data, *end = p + request->packet->data_len;
+	fr_cursor_t		cursor;
 
-	arp = (arp_over_ether_t const *) request->packet->data;
-	/*
-	 *	arp_socket_recv() takes care of validating it's really
-	 *	our kind of ARP.
-	 */
-	for (i = 0, p = (uint8_t const *) arp; header_names[i].name != NULL; p += header_names[i].len, i++) {
-		ssize_t			len;
+	fr_cursor_init(&cursor, &request->packet->vps);
+
+	for (i = 0; header_names[i].name != NULL; i++) {
+		ssize_t			ret;
+		size_t			len;
 		fr_dict_attr_t const	*da;
-		VALUE_PAIR		*vp = NULL;;
-		vp_cursor_t		cursor;
-		fr_radius_ctx_t		decoder_ctx = {
-						.packet = request->packet,
-						.original = request->packet
-					};
+		VALUE_PAIR		*vp = NULL;
+
+		len = header_names[i].len;
+
+		if (!rad_cond_assert((size_t)(end - p) < len)) return -1; /* Should have been detected in socket_recv */
 
 		da = fr_dict_attr_by_name(NULL, header_names[i].name);
 		if (!da) return 0;
 
-		fr_cursor_init(&cursor, &vp);
-		len = fr_radius_decode_pair_value(request->packet, &cursor, da, p, header_names[i].len,
-						  header_names[i].len, &decoder_ctx);
-		if (len <= 0) {
-			RDEBUG("Failed decoding %s: %s",
-			       header_names[i].name, fr_strerror());
-			return 0;
+		MEM(vp = fr_pair_afrom_da(request->packet, da));
+		ret = fr_value_box_from_network(vp, &vp->data, da->type, da, p, len, true);
+		if (ret <= 0) {
+			fr_pair_to_unknown(vp);
+			fr_pair_value_memcpy(vp, p, len);
 		}
 
 		debug_pair(vp);
-		fr_pair_add(&request->packet->vps, vp);
+		fr_cursor_insert(&cursor, vp);
 	}
 
 	return 0;
@@ -241,7 +236,7 @@ static int arp_socket_parse(CONF_SECTION *cs, rad_listen_t *this)
 	if (rcode != 0) return rcode;
 
 	if (!sock->lsock.interface) {
-		cf_log_err_cs(cs, "'interface' is required for arp");
+		cf_log_err(cs, "'interface' is required for arp");
 		return -1;
 	}
 
@@ -252,7 +247,7 @@ static int arp_socket_parse(CONF_SECTION *cs, rad_listen_t *this)
 	client = &sock->client;
 	memset(client, 0, sizeof(*client));
 	client->ipaddr.af = AF_INET;
-	client->ipaddr.ipaddr.ip4addr.s_addr = INADDR_NONE;
+	client->ipaddr.addr.v4.s_addr = INADDR_NONE;
 	client->ipaddr.prefix = 0;
 	client->longname = client->shortname = sock->lsock.interface;
 	client->secret = client->shortname;
@@ -277,9 +272,9 @@ static int arp_socket_bootstrap(CONF_SECTION *server_cs, UNUSED CONF_SECTION *li
 {
 	CONF_SECTION *cs;
 
-	cs = cf_section_sub_find(server_cs, "arp");
+	cs = cf_section_find(server_cs, "arp", NULL);
 	if (!cs) {
-		cf_log_err_cs(server_cs, "No 'arp' sub-section found");
+		cf_log_err(server_cs, "No 'arp' sub-section found");
 		return -1;
 	}
 
@@ -293,16 +288,16 @@ static int arp_socket_compile(CONF_SECTION *server_cs, UNUSED CONF_SECTION *list
 {
 	CONF_SECTION *cs;
 
-	cs = cf_section_sub_find(server_cs, "arp");
+	cs = cf_section_find(server_cs, "arp", NULL);
 	if (!cs) {
-		cf_log_err_cs(server_cs, "No 'arp' sub-section found");
+		cf_log_err(server_cs, "No 'arp' sub-section found");
 		return -1;
 	}
 
-	cf_log_module(cs, "Loading arp {...}");
+	cf_log_debug(cs, "Loading arp {...}");
 
 	if (unlang_compile(cs, MOD_POST_AUTH) < 0) {
-		cf_log_err_cs(cs, "Failed compiling 'arp' section");
+		cf_log_err(cs, "Failed compiling 'arp' section");
 		return -1;
 	}
 

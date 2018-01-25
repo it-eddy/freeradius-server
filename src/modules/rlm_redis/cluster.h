@@ -31,7 +31,7 @@
 
 RCSIDH(cluster_h, "$Id$")
 
-#include <freeradius-devel/connection.h>
+#include <freeradius-devel/pool.h>
 
 typedef struct fr_redis_cluster fr_redis_cluster_t;
 
@@ -68,7 +68,7 @@ void *fr_redis_cluster_conn_create(TALLOC_CTX *ctx, void *instance, struct timev
  *	connections implement retry delays.
  */
 fr_redis_rcode_t fr_redis_cluster_state_init(fr_redis_cluster_state_t *state, fr_redis_conn_t **conn,
-					     fr_redis_cluster_t *cluster,  REQUEST *request,
+					     fr_redis_cluster_t *cluster, REQUEST *request,
 					     uint8_t const *key, size_t key_len, bool read_only);
 
 fr_redis_rcode_t fr_redis_cluster_state_next(fr_redis_cluster_state_t *state, fr_redis_conn_t **conn,
@@ -79,7 +79,7 @@ fr_redis_rcode_t fr_redis_cluster_state_next(fr_redis_cluster_state_t *state, fr
  *	Useful for running commands over every node, such as PING
  *	or KEYS.
  */
-int fr_redis_cluster_pool_by_node_addr(fr_connection_pool_t **pool, fr_redis_cluster_t *cluster,
+int fr_redis_cluster_pool_by_node_addr(fr_pool_t **pool, fr_redis_cluster_t *cluster,
 				       fr_socket_addr_t *node, bool create);
 ssize_t fr_redis_cluster_node_addr_by_role(TALLOC_CTX *ctx, fr_socket_addr_t *out[],
 					   fr_redis_cluster_t *cluster, bool is_master, bool is_slave);

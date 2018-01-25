@@ -7,15 +7,13 @@ Before configurable module failover, we had this kind of entry in
 ::
 
   #---
-  authorize {
-    preprocess
+  recv Access-Request {
     files
   }
   #---
 
 This entry instructed the ``authorize`` section to first process the
-request through the ``preprocess`` module, and if that returned success,
-to process it through ``files`` module.  If that sequence returned
+request through the ``files`` module.  If that sequence returned
 success, then the ``authorize`` stage itself would then return success.
 Processing was strictly linear and if one module failed, the whole
 section would fail immediately.
@@ -49,7 +47,7 @@ For example:
   }
 
   #  Handle accounting packets
-  accounting {
+  process Accounting-Request {
       detail			# always log to detail, stopping if it fails
       redundant {
         sql1			# try module sql1
@@ -89,7 +87,7 @@ even if the ``detail`` module fails.  The following example shows how:
 
   #--
   #  Handle accounting packets
-  accounting {
+  process Accounting-Request {
       detail {
         fail = 1
       }
@@ -182,7 +180,7 @@ to fail, so long as one of them succeeds.
 
   #--
   #  Handle accounting packets
-  accounting {
+  process Accounting-Request {
       group {
         detail1 {
           fail = 1		# remember ``fail`` with priority 1
@@ -267,7 +265,7 @@ radiusd.conf are functions. There are two kinds of MODCALLABLEs: GROUPs and
 SINGLEs.
 
 A SINGLE is a reference to a module instance that was set up in the modules{}
-section of radiusd.conf, like ``preprocess`` or ``sql1``. When a SINGLE is
+section of radiusd.conf, like ``sql1``. When a SINGLE is
 called, the corresponding function in the rlm is invoked, and whichever
 RLM_MODULE_* it returns becomes the RESULT of the SINGLE.
 
@@ -290,7 +288,7 @@ We can see the exact rules by writing them out the long way:
 
 ::
 
-  authorize {
+  recv Access-Request {
     preprocess {
       notfound = 1
       noop     = 2
@@ -395,7 +393,7 @@ It would look like this:
 
 ::
 
-  authorize {
+  recv Access-Request {
     preprocess
     redundant {
       sql1

@@ -25,8 +25,8 @@
 RCSID("$Id$")
 
 #include <freeradius-devel/radiusd.h>
-#include <freeradius-devel/interpreter.h>
 #include <freeradius-devel/rad_assert.h>
+#include <freeradius-devel/unlang.h>
 
 /** Per-request opaque data, added by modules
  *
@@ -34,12 +34,11 @@ RCSID("$Id$")
 struct request_data_t {
 	request_data_t	*next;			//!< Next opaque request data struct linked to this request.
 
-	void		*unique_ptr;		//!< Key to lookup request data.
+	void const	*unique_ptr;		//!< Key to lookup request data.
 	int		unique_int;		//!< Alternative key to lookup request data.
 	void		*opaque;		//!< Opaque data.
 	bool		free_on_replace;	//!< Whether to talloc_free(opaque) when the request data is removed.
-	bool		free_on_parent;		//!< Whether to talloc_free(opaque) when the parent of the request
-						//!< data is freed.
+	bool		free_on_parent;		//!< Whether to talloc_free(opaque) when the request is freed
 	bool		persist;		//!< Whether this data should be transfered to a session_entry_t
 						//!< after we're done processing this request.
 };
@@ -49,15 +48,7 @@ struct request_data_t {
  */
 static int _request_free(REQUEST *request)
 {
-	rad_assert(!request->in_request_hash);
-#ifdef WITH_PROXY
-	rad_assert(!request->in_proxy_hash);
-#endif
 	rad_assert(!request->ev);
-
-#ifdef WITH_COA
-	rad_assert(request->coa == NULL);
-#endif
 
 #ifndef NDEBUG
 	request->magic = 0x01020304;	/* set the request to be nonsense */
@@ -71,11 +62,13 @@ static int _request_free(REQUEST *request)
 	 *	This is parented separately.
 	 *
 	 *	The reason why it's OK to do this, is if the state attributes
-	 *	need to persist across requests,  they will already have been
+	 *	need to persist across requests, they will already have been
 	 *	moved to a fr_state_entry_t, with the state pointers in the
 	 *	request being set to NULL, before the request is freed.
 	 */
 	if (request->state_ctx) talloc_free(request->state_ctx);
+
+	talloc_free_children(request);
 
 	return 0;
 }
@@ -104,37 +97,31 @@ REQUEST *request_alloc(TALLOC_CTX *ctx)
 	/*
 	 *	These may be changed later by request_pre_handler
 	 */
-	request->log.lvl = rad_debug_lvl;	/* Default to global debug level */
-	request->log.func = vradlog_request;
-	request->log.output = &default_log;
+	request->log.lvl = req_debug_lvl;	/* Default to global debug level */
+	request->log.dst = talloc_zero(request, log_dst_t);
+	request->log.dst->func = vradlog_request;
+	request->log.dst->uctx = &default_log;
 
 	request->module = NULL;
 	request->component = "<core>";
-	request->stack = talloc_zero(request, unlang_stack_t);
+
+	MEM(request->stack = unlang_stack_alloc(request));
+
+	request->runnable_id = -1;
+	request->time_order_id = -1;
 
 	request->state_ctx = talloc_init("session-state");
 
 	return request;
 }
 
-
-/*
- *	Create a new REQUEST, based on an old one.
- *
- *	This function allows modules to inject fake requests
- *	into the server, for tunneled protocols like TTLS & PEAP.
- */
-REQUEST *request_alloc_fake(REQUEST *request)
+static REQUEST *request_init_fake(REQUEST *request, REQUEST *fake)
 {
-	REQUEST *fake;
+	fake->number = request->child_number++;
+	fake->name = talloc_typed_asprintf(fake, "%s.%" PRIu64 , request->name, fake->number);
 
-	fake = request_alloc(request);
-	if (!fake) return NULL;
+	fake->seq_start = 0;	/* children always start with their own sequence */
 
-	fake->number = request->number;
-	fake->seq_start = request->seq_start;
-
-	fake->child_pid = request->child_pid;
 	fake->parent = request;
 	fake->root = request->root;
 	fake->client = request->client;
@@ -146,7 +133,7 @@ REQUEST *request_alloc_fake(REQUEST *request)
 	 *
 	 *	FIXME: Permit different servers for inner && outer sessions?
 	 */
-	fake->server = request->server;
+	fake->server_cs = request->server_cs;
 
 	fake->packet = fr_radius_alloc(fake, true);
 	if (!fake->packet) {
@@ -161,7 +148,6 @@ REQUEST *request_alloc_fake(REQUEST *request)
 	}
 
 	fake->master_state = REQUEST_ACTIVE;
-	fake->child_state = REQUEST_RUNNING;
 
 	/*
 	 *	Fill in the fake request.
@@ -207,39 +193,88 @@ REQUEST *request_alloc_fake(REQUEST *request)
 	return fake;
 }
 
-#ifdef WITH_COA
-REQUEST *request_alloc_coa(REQUEST *request)
+
+/*
+ *	Create a new REQUEST, based on an old one.
+ *
+ *	This function allows modules to inject fake requests
+ *	into the server, for tunneled protocols like TTLS & PEAP.
+ */
+REQUEST *request_alloc_fake(REQUEST *request)
 {
-	if (!request || request->coa) return NULL;
+	REQUEST *fake;
+
+	fake = request_alloc(request);
+	if (!fake) return NULL;
+
+	return request_init_fake(request, fake);
+}
+
+/** Allocate a fake request which is detachable from the parent.
+ * i.e. if the parent goes away, sometimes the child MAY continue to
+ * run.
+ *
+ */
+REQUEST *request_alloc_detachable(REQUEST *request)
+{
+	REQUEST *fake;
+
+	fake = request_alloc(NULL);
+	if (!fake) return NULL;
+
+	if (!request_init_fake(request, fake)) return NULL;
 
 	/*
-	 *	Originate CoA requests only when necessary.
+	 *	Ensure that we use our own version of the logging
+	 *	information, and not the original request one.
 	 */
-	if ((request->packet->code != PW_CODE_ACCESS_REQUEST) &&
-	    (request->packet->code != PW_CODE_ACCOUNTING_REQUEST)) return NULL;
+	fake->log.dst = talloc_zero(fake, log_dst_t);
+	memcpy(fake->log.dst, request->log.dst, sizeof(*fake->log.dst));
 
-	request->coa = request_alloc_fake(request);
-	if (!request->coa) return NULL;
-
-	request->coa->parent = request;
-	request->coa->options = RAD_REQUEST_OPTION_COA;	/* is a CoA packet */
-	request->coa->packet->code = 0; /* unknown, as of yet */
-	request->coa->child_state = REQUEST_RUNNING;
-	request->coa->proxy = request_alloc(request->coa);
-	if (!request->coa->proxy) {
-		TALLOC_FREE(request->coa);
+	/*
+	 *	Associate the child with the parent, using the child's
+	 *	pointer as a unique identifier.  Free it if the parent
+	 *	goes away, but don't persist it across
+	 *	challenge-response boundaries.
+	 */
+	if (request_data_add(request, fake, 0, fake, true, true, false) < 0) {
+		talloc_free(fake);
 		return NULL;
 	}
 
-	request->coa->proxy->packet = fr_radius_alloc(request->coa->proxy, false);
-	if (!request->coa->proxy->packet) {
-		TALLOC_FREE(request->coa);
-		return NULL;
-	}
-
-	return request->coa;
+	return fake;
 }
-#endif
+
+
+/** Detach a detachable request.
+ *
+ *  @note the caller still has to set fake->async->detached
+ */
+int request_detach(REQUEST *fake)
+{
+	REQUEST *request = fake->parent;
+
+	rad_assert(request != NULL);
+	rad_assert(talloc_parent(fake) != request);
+
+	/*
+	 *	Unlink the child from the parent.
+	 */
+	if (!request_data_get(request, fake, 0)) {
+		return -1;
+	}
+
+	fake->parent = NULL;
+
+	while (!request->backlog) {
+		rad_assert(request->parent != NULL);
+		request = request->parent;
+	}
+
+	fake->backlog = request->backlog;
+
+	return 0;
+}
 
 REQUEST *request_alloc_proxy(REQUEST *request)
 {
@@ -297,7 +332,7 @@ static int _request_data_free(request_data_t *this)
  *	- -1 on memory allocation error.
  *	- 0 on success.
  */
-int request_data_add(REQUEST *request, void *unique_ptr, int unique_int, void *opaque,
+int request_data_add(REQUEST *request, void const *unique_ptr, int unique_int, void *opaque,
 		     bool free_on_replace, bool free_on_parent, bool persist)
 {
 	request_data_t *this, **last, *next;
@@ -305,15 +340,16 @@ int request_data_add(REQUEST *request, void *unique_ptr, int unique_int, void *o
 	/*
 	 *	Request must have a state ctx
 	 */
-	rad_assert(!persist || request->state_ctx);
 	rad_assert(request);
-	rad_assert(!persist || (talloc_parent(opaque) == request->state_ctx) || (!talloc_parent(opaque)));
+	rad_assert(!persist || request->state_ctx);
+	rad_assert(!persist ||
+		   (talloc_parent(opaque) == request->state_ctx) ||
+		   (talloc_parent(opaque) == talloc_null_ctx()));
+	rad_assert(!free_on_parent || (talloc_parent(opaque) != request));
 
 	this = next = NULL;
 	for (last = &(request->data); *last != NULL; last = &((*last)->next)) {
-#ifdef WITH_VERIFY_PTR
 		*last = talloc_get_type_abort(*last, request_data_t);
-#endif
 		if (((*last)->unique_ptr == unique_ptr) && ((*last)->unique_int == unique_int)) {
 			this = *last;
 			next = this->next;
@@ -338,7 +374,6 @@ int request_data_add(REQUEST *request, void *unique_ptr, int unique_int, void *o
 
 			break;	/* replace the existing entry */
 		}
-		if (!*last) break;
 	}
 
 	/*
@@ -368,12 +403,6 @@ int request_data_add(REQUEST *request, void *unique_ptr, int unique_int, void *o
 	this->free_on_parent = free_on_parent;
 	this->persist = persist;
 
-	/*
-	 *	Some basic protection against what might be a
-	 *	common pitfall.
-	 */
-	rad_assert(!free_on_parent || (talloc_parent(this) != talloc_parent(opaque)));
-
 	*last = this;
 
 	RDEBUG4("Added request data %p at %p:%i", this->opaque, this->unique_ptr, this->unique_int);
@@ -393,16 +422,14 @@ int request_data_add(REQUEST *request, void *unique_ptr, int unique_int, void *o
  *	- NULL if no opaque data could be found.
  *	- the opaque data. The entry holding the opaque data is removed from the request.
  */
-void *request_data_get(REQUEST *request, void *unique_ptr, int unique_int)
+void *request_data_get(REQUEST *request, void const *unique_ptr, int unique_int)
 {
 	request_data_t **last;
 
 	if (!request) return NULL;
 
 	for (last = &(request->data); *last != NULL; last = &((*last)->next)) {
-#ifdef WITH_VERIFY_PTR
 		*last = talloc_get_type_abort(*last, request_data_t);
-#endif
 		if (((*last)->unique_ptr == unique_ptr) && ((*last)->unique_int == unique_int)) {
 			request_data_t	*this;
 			void		*ptr;
@@ -419,7 +446,6 @@ void *request_data_get(REQUEST *request, void *unique_ptr, int unique_int)
 
 			return ptr;
 		}
-		if (!*last) break;
 	}
 
 	return NULL;		/* wasn't found, too bad... */
@@ -441,9 +467,7 @@ int request_data_by_persistance(request_data_t **out, REQUEST *request, bool per
 	next = &head;
 
 	for (last = &(request->data); *last != NULL; last = &((*last)->next)) {
-#ifdef WITH_VERIFY_PTR
 		*last = talloc_get_type_abort(*last, request_data_t);
-#endif
 		if ((*last)->persist == persist) {
 			request_data_t	*this;
 
@@ -482,13 +506,11 @@ void request_data_restore(REQUEST *request, request_data_t *entry)
 	for (last = &(request->data); *last != NULL; last = &((*last)->next)) if (!(*last)->next) break;
 	*last = entry;
 
-#ifdef WITH_VERIFY_PTR
 	{
 		request_data_t *this;
 
 		for (this = request->data; this; this = this->next) this = talloc_get_type_abort(this, request_data_t);
 	}
-#endif
 }
 
 /** Get opaque data from a request without removing it
@@ -503,7 +525,7 @@ void request_data_restore(REQUEST *request, request_data_t *entry)
  *	- NULL if no opaque data could be found.
  *	- the opaque data.
  */
-void *request_data_reference(REQUEST *request, void *unique_ptr, int unique_int)
+void *request_data_reference(REQUEST *request, void const *unique_ptr, int unique_int)
 {
 	request_data_t **last;
 

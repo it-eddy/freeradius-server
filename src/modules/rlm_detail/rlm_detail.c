@@ -29,16 +29,11 @@ RCSID("$Id$")
 #include <freeradius-devel/radiusd.h>
 #include <freeradius-devel/modules.h>
 #include <freeradius-devel/rad_assert.h>
-#include <freeradius-devel/detail.h>
 #include <freeradius-devel/exfile.h>
 
 #include <ctype.h>
 #include <fcntl.h>
 #include <sys/stat.h>
-
-#ifdef HAVE_FNMATCH_H
-#  include <fnmatch.h>
-#endif
 
 #ifdef HAVE_UNISTD_H
 #  include <unistd.h>
@@ -75,13 +70,13 @@ typedef struct detail_instance {
 } rlm_detail_t;
 
 static const CONF_PARSER module_config[] = {
-	{ FR_CONF_OFFSET("filename", PW_TYPE_FILE_OUTPUT | PW_TYPE_REQUIRED | PW_TYPE_XLAT, rlm_detail_t, filename), .dflt = "%A/%{Client-IP-Address}/detail" },
-	{ FR_CONF_OFFSET("header", PW_TYPE_STRING | PW_TYPE_XLAT, rlm_detail_t, header), .dflt = "%t" },
-	{ FR_CONF_OFFSET("permissions", PW_TYPE_INTEGER, rlm_detail_t, perm), .dflt = "0600" },
-	{ FR_CONF_OFFSET("group", PW_TYPE_STRING, rlm_detail_t, group) },
-	{ FR_CONF_OFFSET("locking", PW_TYPE_BOOLEAN, rlm_detail_t, locking), .dflt = "no" },
-	{ FR_CONF_OFFSET("escape_filenames", PW_TYPE_BOOLEAN, rlm_detail_t, escape), .dflt = "no" },
-	{ FR_CONF_OFFSET("log_packet_header", PW_TYPE_BOOLEAN, rlm_detail_t, log_srcdst), .dflt = "no" },
+	{ FR_CONF_OFFSET("filename", FR_TYPE_FILE_OUTPUT | FR_TYPE_REQUIRED | FR_TYPE_XLAT, rlm_detail_t, filename), .dflt = "%A/%{Packet-Src-IP-Address}/detail" },
+	{ FR_CONF_OFFSET("header", FR_TYPE_STRING | FR_TYPE_XLAT, rlm_detail_t, header), .dflt = "%t" },
+	{ FR_CONF_OFFSET("permissions", FR_TYPE_UINT32, rlm_detail_t, perm), .dflt = "0600" },
+	{ FR_CONF_OFFSET("group", FR_TYPE_STRING, rlm_detail_t, group) },
+	{ FR_CONF_OFFSET("locking", FR_TYPE_BOOL, rlm_detail_t, locking), .dflt = "no" },
+	{ FR_CONF_OFFSET("escape_filenames", FR_TYPE_BOOL, rlm_detail_t, escape), .dflt = "no" },
+	{ FR_CONF_OFFSET("log_packet_header", FR_TYPE_BOOL, rlm_detail_t, log_srcdst), .dflt = "no" },
 	CONF_PARSER_TERMINATOR
 };
 
@@ -92,6 +87,7 @@ static const CONF_PARSER module_config[] = {
 static int mod_detach(void *instance)
 {
 	rlm_detail_t *inst = instance;
+
 	if (inst->ht) fr_hash_table_free(inst->ht);
 	return 0;
 }
@@ -105,16 +101,13 @@ static uint32_t detail_hash(void const *data)
 
 static int detail_cmp(void const *a, void const *b)
 {
-	fr_dict_attr_t const *one = a;
-	fr_dict_attr_t const *two = b;
-
-	return one - two;
+	return (a < b) - (a > b);
 }
 
 /*
  *	(Re-)read radiusd.conf into memory.
  */
-static int mod_instantiate(CONF_SECTION *conf, void *instance)
+static int mod_instantiate(void *instance, CONF_SECTION *conf)
 {
 	rlm_detail_t *inst = instance;
 	CONF_SECTION	*cs;
@@ -133,22 +126,22 @@ static int mod_instantiate(CONF_SECTION *conf, void *instance)
 
 	inst->ef = module_exfile_init(inst, conf, 256, 30, inst->locking, NULL, NULL);
 	if (!inst->ef) {
-		cf_log_err_cs(conf, "Failed creating log file context");
+		cf_log_err(conf, "Failed creating log file context");
 		return -1;
 	}
 
 	/*
 	 *	Suppress certain attributes.
 	 */
-	cs = cf_section_sub_find(conf, "suppress");
+	cs = cf_section_find(conf, "suppress", NULL);
 	if (cs) {
 		CONF_ITEM	*ci;
 
 		inst->ht = fr_hash_table_create(NULL, detail_hash, detail_cmp, NULL);
 
-		for (ci = cf_item_find_next(cs, NULL);
+		for (ci = cf_item_next(cs, NULL);
 		     ci != NULL;
-		     ci = cf_item_find_next(cs, ci)) {
+		     ci = cf_item_next(cs, ci)) {
 			char const	*attr;
 			fr_dict_attr_t const	*da;
 
@@ -159,7 +152,7 @@ static int mod_instantiate(CONF_SECTION *conf, void *instance)
 
 			da = fr_dict_attr_by_name(NULL, attr);
 			if (!da) {
-				cf_log_err_cs(conf, "No such attribute '%s'", attr);
+				cf_log_err(conf, "No such attribute '%s'", attr);
 				return -1;
 			}
 
@@ -217,13 +210,18 @@ static void detail_fr_pair_fprint(TALLOC_CTX *ctx, FILE *out, VALUE_PAIR const *
  * @param[in] packet associated with the request (request, reply, proxy-request, proxy-reply...).
  * @param[in] compat Write out entry in compatibility mode.
  */
-static int detail_write(FILE *out, rlm_detail_t *inst, REQUEST *request, RADIUS_PACKET *packet, bool compat)
+static int detail_write(FILE *out, rlm_detail_t const *inst, REQUEST *request, RADIUS_PACKET *packet, bool compat)
 {
 	VALUE_PAIR *vp;
 	char timestamp[256];
 
-	if (radius_xlat(timestamp, sizeof(timestamp), request, inst->header, NULL, NULL) < 0) {
+	if (xlat_eval(timestamp, sizeof(timestamp), request, inst->header, NULL, NULL) < 0) {
 		return -1;
+	}
+
+	if (!packet->vps) {
+		RWDEBUG("Skipping empty packet");
+		return 0;
 	}
 
 #define WRITE(fmt, ...) do {\
@@ -244,7 +242,13 @@ static int detail_write(FILE *out, rlm_detail_t *inst, REQUEST *request, RADIUS_
 		 *	Numbers, if not.
 		 */
 		if (is_radius_code(packet->code)) {
-			WRITE("\tPacket-Type = %s\n", fr_packet_codes[packet->code]);
+			fr_dict_attr_t const	*da;
+
+			da = fr_dict_attr_by_num(NULL, 0, FR_PACKET_TYPE);
+			rad_assert(da != NULL);
+
+			WRITE("\tPacket-Type = %s\n",
+			      fr_dict_enum_alias_by_value(NULL, da, fr_box_uint32(packet->code)));
 		} else {
 			WRITE("\tPacket-Type = %u\n", packet->code);
 		}
@@ -258,20 +262,19 @@ static int detail_write(FILE *out, rlm_detail_t *inst, REQUEST *request, RADIUS_
 
 		switch (packet->src_ipaddr.af) {
 		case AF_INET:
-			src_vp.da = fr_dict_attr_by_num(NULL, 0, PW_PACKET_SRC_IP_ADDRESS);
-			src_vp.vp_ipaddr = packet->src_ipaddr.ipaddr.ip4addr.s_addr;
+			src_vp.da = fr_dict_attr_by_num(NULL, 0, FR_PACKET_SRC_IP_ADDRESS);
+			fr_value_box_shallow(&src_vp.data, &packet->src_ipaddr, true);
 
-			dst_vp.da = fr_dict_attr_by_num(NULL, 0, PW_PACKET_DST_IP_ADDRESS);
-			dst_vp.vp_ipaddr = packet->dst_ipaddr.ipaddr.ip4addr.s_addr;
+			dst_vp.da = fr_dict_attr_by_num(NULL, 0, FR_PACKET_DST_IP_ADDRESS);
+			fr_value_box_shallow(&dst_vp.data, &packet->dst_ipaddr, true);
 			break;
 
 		case AF_INET6:
-			src_vp.da = fr_dict_attr_by_num(NULL, 0, PW_PACKET_SRC_IPV6_ADDRESS);
-			memcpy(&src_vp.vp_ipv6addr, &packet->src_ipaddr.ipaddr.ip6addr,
-			       sizeof(packet->src_ipaddr.ipaddr.ip6addr));
-			dst_vp.da = fr_dict_attr_by_num(NULL, 0, PW_PACKET_DST_IPV6_ADDRESS);
-			memcpy(&dst_vp.vp_ipv6addr, &packet->dst_ipaddr.ipaddr.ip6addr,
-			       sizeof(packet->dst_ipaddr.ipaddr.ip6addr));
+			src_vp.da = fr_dict_attr_by_num(NULL, 0, FR_PACKET_SRC_IPV6_ADDRESS);
+			fr_value_box_shallow(&src_vp.data, &packet->src_ipaddr, true);
+
+			dst_vp.da = fr_dict_attr_by_num(NULL, 0, FR_PACKET_DST_IPV6_ADDRESS);
+			fr_value_box_shallow(&dst_vp.data, &packet->dst_ipaddr, true);
 			break;
 
 		default:
@@ -281,17 +284,18 @@ static int detail_write(FILE *out, rlm_detail_t *inst, REQUEST *request, RADIUS_
 		detail_fr_pair_fprint(request, out, &src_vp);
 		detail_fr_pair_fprint(request, out, &dst_vp);
 
-		src_vp.da = fr_dict_attr_by_num(NULL, 0, PW_PACKET_SRC_PORT);
-		src_vp.vp_integer = packet->src_port;
-		dst_vp.da = fr_dict_attr_by_num(NULL, 0, PW_PACKET_DST_PORT);
-		dst_vp.vp_integer = packet->dst_port;
+		src_vp.da = fr_dict_attr_by_num(NULL, 0, FR_PACKET_SRC_PORT);
+		fr_value_box_shallow(&src_vp.data, packet->src_port, true);
+
+		dst_vp.da = fr_dict_attr_by_num(NULL, 0, FR_PACKET_DST_PORT);
+		fr_value_box_shallow(&dst_vp.data, packet->dst_port, true);
 
 		detail_fr_pair_fprint(request, out, &src_vp);
 		detail_fr_pair_fprint(request, out, &dst_vp);
 	}
 
 	{
-		vp_cursor_t cursor;
+		fr_cursor_t cursor;
 		/* Write each attribute/value to the log file */
 		for (vp = fr_cursor_init(&cursor, &packet->vps);
 		     vp;
@@ -303,7 +307,7 @@ static int detail_write(FILE *out, rlm_detail_t *inst, REQUEST *request, RADIUS_
 			/*
 			 *	Don't print passwords in old format...
 			 */
-			if (compat && !vp->da->vendor && (vp->da->attr == PW_USER_PASSWORD)) continue;
+			if (compat && !vp->da->vendor && (vp->da->attr == FR_USER_PASSWORD)) continue;
 
 			/*
 			 *	Print all of the attributes, operator should always be '='.
@@ -323,7 +327,7 @@ static int detail_write(FILE *out, rlm_detail_t *inst, REQUEST *request, RADIUS_
 		if (request->proxy) {
 			char proxy_buffer[INET6_ADDRSTRLEN];
 
-			inet_ntop(request->proxy->packet->dst_ipaddr.af, &request->proxy->packet->dst_ipaddr.ipaddr,
+			inet_ntop(request->proxy->packet->dst_ipaddr.af, &request->proxy->packet->dst_ipaddr.addr,
 				  proxy_buffer, sizeof(proxy_buffer));
 			WRITE("\tFreeradius-Proxied-To = %s\n", proxy_buffer);
 		}
@@ -339,9 +343,10 @@ static int detail_write(FILE *out, rlm_detail_t *inst, REQUEST *request, RADIUS_
 /*
  *	Do detail, compatible with old accounting
  */
-static rlm_rcode_t CC_HINT(nonnull) detail_do(void *instance, REQUEST *request, RADIUS_PACKET *packet, bool compat)
+static rlm_rcode_t CC_HINT(nonnull) detail_do(void const *instance, REQUEST *request,
+					      RADIUS_PACKET *packet, bool compat)
 {
-	int		outfd;
+	int		outfd, dupfd;
 	char		buffer[DIRLEN];
 
 	FILE		*outfp;
@@ -351,39 +356,23 @@ static rlm_rcode_t CC_HINT(nonnull) detail_do(void *instance, REQUEST *request, 
 	char		*endptr;
 #endif
 
-	rlm_detail_t *inst = instance;
+	rlm_detail_t const *inst = instance;
 
 	/*
 	 *	Generate the path for the detail file.  Use the same
 	 *	format, but truncate at the last /.  Then feed it
-	 *	through radius_xlat() to expand the variables.
+	 *	through xlat_eval() to expand the variables.
 	 */
-	if (radius_xlat(buffer, sizeof(buffer), request, inst->filename, inst->escape_func, NULL) < 0) {
+	if (xlat_eval(buffer, sizeof(buffer), request, inst->filename, inst->escape_func, NULL) < 0) {
 		return RLM_MODULE_FAIL;
 	}
 
 	RDEBUG2("%s expands to %s", inst->filename, buffer);
 
-#ifdef WITH_ACCOUNTING
-#if defined(HAVE_FNMATCH_H) && defined(FNM_FILE_NAME)
-	/*
-	 *	If we read it from a detail file, and we're about to
-	 *	write it back to the SAME detail file directory, then
-	 *	suppress the write.  This check prevents an infinite
-	 *	loop.
-	 */
-	if ((request->listener->type == RAD_LISTEN_DETAIL) &&
-	    (fnmatch(((listen_detail_t *)request->listener->data)->filename,
-		     buffer, FNM_FILE_NAME | FNM_PERIOD ) == 0)) {
-		RWDEBUG2("Suppressing infinite loop");
-		return RLM_MODULE_NOOP;
-	}
-#endif
-#endif
-
-	outfd = exfile_open(inst->ef, request, buffer, inst->perm, true);
+	outfd = exfile_open(inst->ef, request, buffer, inst->perm);
 	if (outfd < 0) {
-		RERROR("Couldn't open file %s: %s", buffer, fr_strerror());
+		RPERROR("Couldn't open file %s", buffer);
+		/* coverity[missing_unlock] */
 		return RLM_MODULE_FAIL;
 	}
 
@@ -402,14 +391,21 @@ static rlm_rcode_t CC_HINT(nonnull) detail_do(void *instance, REQUEST *request, 
 	}
 
 skip_group:
+	outfp = NULL;
+	dupfd = dup(outfd);
+	if (dupfd < 0) {
+		RERROR("Failed to dup() file descriptor for detail file");
+		goto fail;
+	}
+
 	/*
 	 *	Open the output fp for buffering.
 	 */
-	if ((outfp = fdopen(outfd, "a")) == NULL) {
+	if ((outfp = fdopen(dupfd, "a")) == NULL) {
 		RERROR("Couldn't open file %s: %s", buffer, fr_syserror(errno));
 	fail:
 		if (outfp) fclose(outfp);
-		exfile_unlock(inst->ef, request, outfd);
+		exfile_close(inst->ef, request, outfd);
 		return RLM_MODULE_FAIL;
 	}
 
@@ -419,7 +415,7 @@ skip_group:
 	 *	Flush everything
 	 */
 	fclose(outfp);
-	exfile_unlock(inst->ef, request, outfd); /* do NOT close outfp */
+	exfile_close(inst->ef, request, outfd);
 
 	/*
 	 *	And everything is fine.
@@ -430,24 +426,15 @@ skip_group:
 /*
  *	Accounting - write the detail files.
  */
-static rlm_rcode_t CC_HINT(nonnull) mod_accounting(void *instance, REQUEST *request)
+static rlm_rcode_t CC_HINT(nonnull) mod_accounting(void *instance, UNUSED void *thread, REQUEST *request)
 {
-#ifdef WITH_DETAIL
-	if (request->listener->type == RAD_LISTEN_DETAIL &&
-	    strcmp(((rlm_detail_t *)instance)->filename,
-		   ((listen_detail_t *)request->listener->data)->filename) == 0) {
-		RDEBUG("Suppressing writes to detail file as the request was just read from a detail file");
-		return RLM_MODULE_NOOP;
-	}
-#endif
-
 	return detail_do(instance, request, request->packet, true);
 }
 
 /*
  *	Incoming Access Request - write the detail files.
  */
-static rlm_rcode_t CC_HINT(nonnull) mod_authorize(void *instance, REQUEST *request)
+static rlm_rcode_t CC_HINT(nonnull) mod_authorize(void *instance, UNUSED void *thread, REQUEST *request)
 {
 	return detail_do(instance, request, request->packet, false);
 }
@@ -455,7 +442,7 @@ static rlm_rcode_t CC_HINT(nonnull) mod_authorize(void *instance, REQUEST *reque
 /*
  *	Outgoing Access-Request Reply - write the detail files.
  */
-static rlm_rcode_t CC_HINT(nonnull) mod_post_auth(void *instance, REQUEST *request)
+static rlm_rcode_t CC_HINT(nonnull) mod_post_auth(void *instance, UNUSED void *thread, REQUEST *request)
 {
 	return detail_do(instance, request, request->reply, false);
 }
@@ -464,7 +451,7 @@ static rlm_rcode_t CC_HINT(nonnull) mod_post_auth(void *instance, REQUEST *reque
 /*
  *	Incoming CoA - write the detail files.
  */
-static rlm_rcode_t CC_HINT(nonnull) mod_recv_coa(void *instance, REQUEST *request)
+static rlm_rcode_t CC_HINT(nonnull) mod_recv_coa(void *instance, UNUSED void *thread, REQUEST *request)
 {
 	return detail_do(instance, request, request->packet, false);
 }
@@ -472,7 +459,7 @@ static rlm_rcode_t CC_HINT(nonnull) mod_recv_coa(void *instance, REQUEST *reques
 /*
  *	Outgoing CoA - write the detail files.
  */
-static rlm_rcode_t CC_HINT(nonnull) mod_send_coa(void *instance, REQUEST *request)
+static rlm_rcode_t CC_HINT(nonnull) mod_send_coa(void *instance, UNUSED void *thread, REQUEST *request)
 {
 	return detail_do(instance, request, request->reply, false);
 }
@@ -482,7 +469,7 @@ static rlm_rcode_t CC_HINT(nonnull) mod_send_coa(void *instance, REQUEST *reques
  *	Outgoing Access-Request to home server - write the detail files.
  */
 #ifdef WITH_PROXY
-static rlm_rcode_t CC_HINT(nonnull) mod_pre_proxy(void *instance, REQUEST *request)
+static rlm_rcode_t CC_HINT(nonnull) mod_pre_proxy(void *instance, UNUSED void *thread, REQUEST *request)
 {
 	return detail_do(instance, request, request->proxy->packet, false);
 }
@@ -491,7 +478,7 @@ static rlm_rcode_t CC_HINT(nonnull) mod_pre_proxy(void *instance, REQUEST *reque
 /*
  *	Outgoing Access-Request Reply - write the detail files.
  */
-static rlm_rcode_t CC_HINT(nonnull) mod_post_proxy(void *instance, REQUEST *request)
+static rlm_rcode_t CC_HINT(nonnull) mod_post_proxy(void *instance, void *thread, REQUEST *request)
 {
 	/*
 	 *	No reply: we must be doing Post-Proxy-Type = Fail.
@@ -503,9 +490,9 @@ static rlm_rcode_t CC_HINT(nonnull) mod_post_proxy(void *instance, REQUEST *requ
 	if (!request->proxy->reply) {
 		rlm_rcode_t rcode;
 
-		rcode = mod_accounting(instance, request);
+		rcode = mod_accounting(instance, thread, request);
 		if (rcode == RLM_MODULE_OK) {
-			request->reply->code = PW_CODE_ACCOUNTING_RESPONSE;
+			request->reply->code = FR_CODE_ACCOUNTING_RESPONSE;
 		}
 		return rcode;
 	}
@@ -519,7 +506,6 @@ extern rad_module_t rlm_detail;
 rad_module_t rlm_detail = {
 	.magic		= RLM_MODULE_INIT,
 	.name		= "detail",
-	.type		= RLM_TYPE_HUP_SAFE,
 	.inst_size	= sizeof(rlm_detail_t),
 	.config		= module_config,
 	.instantiate	= mod_instantiate,

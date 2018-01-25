@@ -187,15 +187,15 @@ int eap_tls_compose(eap_session_t *eap_session, eap_tls_status_t status, uint8_t
 	case EAP_TLS_ACK_SEND:
 	case EAP_TLS_START_SEND:
 	case EAP_TLS_RECORD_SEND:
-		eap_round->request->code = PW_EAP_REQUEST;
+		eap_round->request->code = FR_EAP_CODE_REQUEST;
 		break;
 
 	case EAP_TLS_ESTABLISHED:
-		eap_round->request->code = PW_EAP_SUCCESS;
+		eap_round->request->code = FR_EAP_CODE_SUCCESS;
 		break;
 
 	case EAP_TLS_FAIL:
-		eap_round->request->code = PW_EAP_FAILURE;
+		eap_round->request->code = FR_EAP_CODE_FAILURE;
 		break;
 
 	default:
@@ -264,8 +264,22 @@ int eap_tls_success(eap_session_t *eap_session)
 	 */
 	SSL_set_ex_data(tls_session->ssl, FR_TLS_EX_INDEX_REQUEST, request);
 	tls_cache_disable_cb(tls_session->ssl, -1);
-	SSL_set_ex_data(tls_session->ssl, FR_TLS_EX_INDEX_REQUEST, NULL);
+	SSL_set_ex_data(tls_session->ssl, FR_TLS_EX_INDEX_REQUEST, NULL);	//-V575
 #endif
+
+	/*
+	 *	Write the session to the session cache
+	 *
+	 *	We do this here (instead of relying on OpenSSL to call the
+	 *	session caching callback), because we only want to write
+	 *	session data to the cache if all phases were successful.
+	 *
+	 *	If we wrote out the cache data earlier, and the server
+	 *	exited whilst the session was in progress, the supplicant
+	 *	could resume the session (and get access) even if phase2
+	 *	never completed.
+	 */
+	tls_cache_write(request, tls_session);
 
 	/*
 	 *	Build the success packet
@@ -278,7 +292,8 @@ int eap_tls_success(eap_session_t *eap_session)
 	 */
 	if (tls_session->prf_label) {
 		eap_tls_gen_mppe_keys(eap_session->request, tls_session->ssl, tls_session->prf_label);
-	} else {
+
+	} else if (eap_session->type != FR_EAP_FAST) {
 		RWDEBUG("Not adding MPPE keys because there is no PRF label");
 	}
 
@@ -555,6 +570,10 @@ static eap_tls_status_t eap_tls_verify(eap_session_t *eap_session)
 	 *	is too short.  See eap_validate()., in ../../eap.c
 	 */
 	eap_tls_data = (eap_tls_data_t *)this_round->response->type.data;
+	if (!eap_tls_data) {
+		RDEBUG("Invalid EAP-TLS packet; no data");
+		return EAP_TLS_INVALID;
+	}
 
 	/*
 	 *	First output the flags (for debugging)
@@ -588,9 +607,8 @@ static eap_tls_status_t eap_tls_verify(eap_session_t *eap_session)
 	 *
 	 *	Find if this is a reply to the previous request sent
 	 */
-	if ((!eap_tls_data) ||
-	    ((this_round->response->length == EAP_HEADER_LEN + 2) &&
-	     ((eap_tls_data->flags & 0xc0) == 0x00))) {
+	if ((this_round->response->length == EAP_HEADER_LEN + 2) &&
+	    ((eap_tls_data->flags & 0xc0) == 0x00)) {
 		if (!prev_round || (prev_round->request->id != this_round->response->id)) {
 			REDEBUG("Received Invalid TLS ACK");
 			return EAP_TLS_INVALID;
@@ -992,7 +1010,7 @@ eap_tls_status_t eap_tls_process(eap_session_t *eap_session)
 	}
 
  done:
-	SSL_set_ex_data(tls_session->ssl, FR_TLS_EX_INDEX_REQUEST, NULL);
+	SSL_set_ex_data(tls_session->ssl, FR_TLS_EX_INDEX_REQUEST, NULL);	//-V575
 
 	return status;
 }
@@ -1080,15 +1098,13 @@ fr_tls_conf_t *eap_tls_conf_parse(CONF_SECTION *cs, char const *attr)
 	CONF_SECTION		*tls_cs;
 	fr_tls_conf_t		*tls_conf;
 
-	rad_assert(attr != NULL);
-
-	parent = cf_item_parent(cf_section_to_item(cs));
+	parent = cf_item_to_section(cf_parent(cs));
 
 	cp = cf_pair_find(cs, attr);
 	if (cp) {
 		tls_conf_name = cf_pair_value(cp);
 
-		tls_cs = cf_section_sub_find_name2(parent, TLS_CONFIG_SECTION, tls_conf_name);
+		tls_cs = cf_section_find(parent, TLS_CONFIG_SECTION, tls_conf_name);
 		if (!tls_cs) {
 			ERROR("Cannot find tls config \"%s\"", tls_conf_name);
 			return NULL;
@@ -1103,7 +1119,7 @@ fr_tls_conf_t *eap_tls_conf_parse(CONF_SECTION *cs, char const *attr)
 		 *	find the section - that is just a config error.
 		 */
 		INFO("TLS section \"%s\" missing, trying to use legacy configuration", attr);
-		tls_cs = cf_section_sub_find(parent, "tls");
+		tls_cs = cf_section_find(parent, "tls", NULL);
 	}
 
 	if (!tls_cs) return NULL;

@@ -40,14 +40,14 @@ typedef struct rlm_sometimes_t {
 } rlm_sometimes_t;
 
 static const CONF_PARSER module_config[] = {
-	{ FR_CONF_OFFSET("rcode", PW_TYPE_STRING, rlm_sometimes_t, rcode_str), .dflt = "fail" },
-	{ FR_CONF_OFFSET("key", PW_TYPE_TMPL | PW_TYPE_ATTRIBUTE, rlm_sometimes_t, key), .dflt = "&User-Name", .quote = T_BARE_WORD },
-	{ FR_CONF_OFFSET("start", PW_TYPE_INTEGER, rlm_sometimes_t, start), .dflt = "0" },
-	{ FR_CONF_OFFSET("end", PW_TYPE_INTEGER, rlm_sometimes_t, end), .dflt = "127" },
+	{ FR_CONF_OFFSET("rcode", FR_TYPE_STRING, rlm_sometimes_t, rcode_str), .dflt = "fail" },
+	{ FR_CONF_OFFSET("key", FR_TYPE_TMPL | FR_TYPE_ATTRIBUTE, rlm_sometimes_t, key), .dflt = "&User-Name", .quote = T_BARE_WORD },
+	{ FR_CONF_OFFSET("start", FR_TYPE_UINT32, rlm_sometimes_t, start), .dflt = "0" },
+	{ FR_CONF_OFFSET("end", FR_TYPE_UINT32, rlm_sometimes_t, end), .dflt = "127" },
 	CONF_PARSER_TERMINATOR
 };
 
-static int mod_instantiate(CONF_SECTION *conf, void *instance)
+static int mod_instantiate(void *instance, CONF_SECTION *conf)
 {
 	rlm_sometimes_t *inst = instance;
 
@@ -56,7 +56,7 @@ static int mod_instantiate(CONF_SECTION *conf, void *instance)
 	 */
 	inst->rcode = fr_str2int(mod_rcode_table, inst->rcode_str, RLM_MODULE_UNKNOWN);
 	if (inst->rcode == RLM_MODULE_UNKNOWN) {
-		cf_log_err_cs(conf, "Unknown module return code '%s'", inst->rcode_str);
+		cf_log_err(conf, "Unknown module return code '%s'", inst->rcode_str);
 		return -1;
 	}
 
@@ -66,12 +66,12 @@ static int mod_instantiate(CONF_SECTION *conf, void *instance)
 /*
  *	A lie!  It always returns!
  */
-static rlm_rcode_t sometimes_return(void *instance, REQUEST *request, RADIUS_PACKET *packet, RADIUS_PACKET *reply)
+static rlm_rcode_t sometimes_return(void const *instance, REQUEST *request, RADIUS_PACKET *packet, RADIUS_PACKET *reply)
 {
-	uint32_t	hash;
-	uint32_t	value;
-	rlm_sometimes_t *inst = instance;
-	VALUE_PAIR	*vp;
+	uint32_t		hash;
+	uint32_t		value;
+	rlm_sometimes_t const	*inst = instance;
+	VALUE_PAIR		*vp;
 
 	/*
 	 *	Set it to NOOP and the module will always do nothing
@@ -84,7 +84,23 @@ static rlm_rcode_t sometimes_return(void *instance, REQUEST *request, RADIUS_PAC
 	tmpl_find_vp(&vp, request, inst->key);
 	if (!vp) return RLM_MODULE_NOOP;
 
-	hash = fr_hash(&vp->data, vp->vp_length);
+	switch (vp->vp_type) {
+	case FR_TYPE_OCTETS:
+	case FR_TYPE_STRING:
+		hash = fr_hash(vp->data.datum.ptr, vp->vp_length);
+		break;
+
+	case FR_TYPE_ABINARY:
+		hash = fr_hash(vp->vp_filter, vp->vp_length);
+		break;
+
+	case FR_TYPE_STRUCTURAL:
+		return RLM_MODULE_FAIL;
+
+	default:
+		hash = fr_hash(&vp->data.datum, fr_value_box_field_sizes[vp->vp_type]);
+		break;
+	}
 	hash &= 0xff;		/* ensure it's 0..255 */
 	value = hash;
 
@@ -102,20 +118,20 @@ static rlm_rcode_t sometimes_return(void *instance, REQUEST *request, RADIUS_PAC
 	 */
 	if ((inst->rcode == RLM_MODULE_HANDLED) && reply) {
 		switch (packet->code) {
-		case PW_CODE_ACCESS_REQUEST:
-			reply->code = PW_CODE_ACCESS_ACCEPT;
+		case FR_CODE_ACCESS_REQUEST:
+			reply->code = FR_CODE_ACCESS_ACCEPT;
 			break;
 
-		case PW_CODE_ACCOUNTING_REQUEST:
-			reply->code = PW_CODE_ACCOUNTING_RESPONSE;
+		case FR_CODE_ACCOUNTING_REQUEST:
+			reply->code = FR_CODE_ACCOUNTING_RESPONSE;
 			break;
 
-		case PW_CODE_COA_REQUEST:
-			reply->code = PW_CODE_COA_ACK;
+		case FR_CODE_COA_REQUEST:
+			reply->code = FR_CODE_COA_ACK;
 			break;
 
-		case PW_CODE_DISCONNECT_REQUEST:
-			reply->code = PW_CODE_DISCONNECT_ACK;
+		case FR_CODE_DISCONNECT_REQUEST:
+			reply->code = FR_CODE_DISCONNECT_ACK;
 			break;
 
 		default:
@@ -126,25 +142,25 @@ static rlm_rcode_t sometimes_return(void *instance, REQUEST *request, RADIUS_PAC
 	return inst->rcode;
 }
 
-static rlm_rcode_t CC_HINT(nonnull) mod_sometimes_packet(void *instance, REQUEST *request)
+static rlm_rcode_t CC_HINT(nonnull) mod_sometimes_packet(void *instance, UNUSED void *thread, REQUEST *request)
 {
 	return sometimes_return(instance, request, request->packet, request->reply);
 }
 
-static rlm_rcode_t CC_HINT(nonnull) mod_sometimes_reply(void *instance, REQUEST *request)
+static rlm_rcode_t CC_HINT(nonnull) mod_sometimes_reply(void *instance, UNUSED void *thread, REQUEST *request)
 {
 	return sometimes_return(instance, request, request->reply, NULL);
 }
 
 #ifdef WITH_PROXY
-static rlm_rcode_t CC_HINT(nonnull) mod_pre_proxy(void *instance, REQUEST *request)
+static rlm_rcode_t CC_HINT(nonnull) mod_pre_proxy(void *instance, UNUSED void *thread, REQUEST *request)
 {
 	if (!request->proxy) return RLM_MODULE_NOOP;
 
 	return sometimes_return(instance, request, request->proxy->packet, request->proxy->reply);
 }
 
-static rlm_rcode_t CC_HINT(nonnull) mod_post_proxy(void *instance, REQUEST *request)
+static rlm_rcode_t CC_HINT(nonnull) mod_post_proxy(void *instance, UNUSED void *thread, REQUEST *request)
 {
 	if (!request->proxy || !request->proxy->reply) return RLM_MODULE_NOOP;
 
@@ -156,7 +172,6 @@ extern rad_module_t rlm_sometimes;
 rad_module_t rlm_sometimes = {
 	.magic		= RLM_MODULE_INIT,
 	.name		= "sometimes",
-	.type		= RLM_TYPE_HUP_SAFE,   	/* needed for radmin */
 	.inst_size	= sizeof(rlm_sometimes_t),
 	.config		= module_config,
 	.instantiate	= mod_instantiate,

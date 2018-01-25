@@ -40,34 +40,31 @@ redundant {
 	ok
 }
 
-if (&Tmp-Integer-2 != 1) {
+if (!ok) {
 	update reply {
-		Filter-Id += 'Fail 3a'
+		Filter-Id := "did not return OK"
 	}
+	return
+}
+
+if (&Tmp-Integer-2 != 1) {
+	test_fail
 	return
 }
 
 if (&Tmp-Integer-3 != 1) {
-	update reply {
-		Filter-Id += 'Fail 3b'
-	}
+	test_fail
 	return
 }
 
 if (&Tmp-Integer-4 != 1) {
-	update reply {
-		Filter-Id += 'Fail 3c'
-	}
+	test_fail
 	return
 }
 
 if (&Tmp-Integer-5 != 1) {
-	update reply {
-		Filter-Id += 'Fail 3d'
-	}
+	test_fail
 	return
 }
 
-update reply {
-	Filter-Id := "filter"
-}
+success

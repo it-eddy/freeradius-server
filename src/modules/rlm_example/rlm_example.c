@@ -46,17 +46,17 @@ typedef struct rlm_example_t {
  *	A mapping of configuration file names to internal variables.
  */
 static const CONF_PARSER module_config[] = {
-	{ FR_CONF_OFFSET("integer", PW_TYPE_INTEGER, rlm_example_t, value), .dflt = "1" },
-	{ FR_CONF_OFFSET("boolean", PW_TYPE_BOOLEAN, rlm_example_t, boolean), .dflt = "no" },
-	{ FR_CONF_OFFSET("string", PW_TYPE_STRING, rlm_example_t, string) },
-	{ FR_CONF_OFFSET("ipaddr", PW_TYPE_IPV4_ADDR, rlm_example_t, ipaddr), .dflt = "*" },
+	{ FR_CONF_OFFSET("integer", FR_TYPE_UINT32, rlm_example_t, value), .dflt = "1" },
+	{ FR_CONF_OFFSET("boolean", FR_TYPE_BOOL, rlm_example_t, boolean), .dflt = "no" },
+	{ FR_CONF_OFFSET("string", FR_TYPE_STRING, rlm_example_t, string) },
+	{ FR_CONF_OFFSET("ipaddr", FR_TYPE_IPV4_ADDR, rlm_example_t, ipaddr), .dflt = "*" },
 	CONF_PARSER_TERMINATOR
 };
 
 static int rlm_example_cmp(UNUSED void *instance, REQUEST *request, UNUSED VALUE_PAIR *thing, VALUE_PAIR *check,
 			   UNUSED VALUE_PAIR *check_pairs, UNUSED VALUE_PAIR **reply_pairs)
 {
-	rad_assert(check->da->type == PW_TYPE_STRING);
+	rad_assert(check->vp_type == FR_TYPE_STRING);
 
 	RINFO("Example-Paircmp called with \"%s\"", check->vp_strvalue);
 
@@ -70,7 +70,7 @@ static int rlm_example_cmp(UNUSED void *instance, REQUEST *request, UNUSED VALUE
  *	to external databases, read configuration files, set up
  *	dictionary entries, etc.
  */
-static int mod_instantiate(CONF_SECTION *conf, void *instance)
+static int mod_instantiate(void *instance, CONF_SECTION *conf)
 {
 	rlm_example_t	*inst = instance;
 
@@ -78,11 +78,11 @@ static int mod_instantiate(CONF_SECTION *conf, void *instance)
 	 *	Do more work here
 	 */
 	if (!inst->boolean) {
-		cf_log_err_cs(conf, "Boolean is false: forcing error!");
+		cf_log_err(conf, "Boolean is false: forcing error!");
 		return -1;
 	}
 
-	paircompare_register_byname("Example-Paircmp", fr_dict_attr_by_num(NULL, 0, PW_USER_NAME), false,
+	paircompare_register_byname("Example-Paircmp", fr_dict_attr_by_num(NULL, 0, FR_USER_NAME), false,
 				    rlm_example_cmp, inst);
 
 	return 0;
@@ -94,14 +94,14 @@ static int mod_instantiate(CONF_SECTION *conf, void *instance)
  *	from the database. The authentication code only needs to check
  *	the password, the rest is done here.
  */
-static rlm_rcode_t CC_HINT(nonnull) mod_authorize(UNUSED void *instance, REQUEST *request)
+static rlm_rcode_t CC_HINT(nonnull) mod_authorize(UNUSED void *instance, UNUSED void *thread, REQUEST *request)
 {
 	VALUE_PAIR *state;
 
 	/*
 	 *  Look for the 'state' attribute.
 	 */
-	state = fr_pair_find_by_num(request->packet->vps, 0, PW_STATE, TAG_ANY);
+	state = fr_pair_find_by_num(request->packet->vps, 0, FR_STATE, TAG_ANY);
 	if (state != NULL) {
 		RDEBUG("Found reply to access challenge");
 		return RLM_MODULE_OK;
@@ -118,7 +118,7 @@ static rlm_rcode_t CC_HINT(nonnull) mod_authorize(UNUSED void *instance, REQUEST
 	 *
 	 *  The server will take care of sending it to the user.
 	 */
-	request->reply->code = PW_CODE_ACCESS_CHALLENGE;
+	request->reply->code = FR_CODE_ACCESS_CHALLENGE;
 	RDEBUG("Sending Access-Challenge");
 
 	return RLM_MODULE_HANDLED;
@@ -127,7 +127,7 @@ static rlm_rcode_t CC_HINT(nonnull) mod_authorize(UNUSED void *instance, REQUEST
 /*
  *	Authenticate the user with the given password.
  */
-static rlm_rcode_t CC_HINT(nonnull) mod_authenticate(UNUSED void *instance, UNUSED REQUEST *request)
+static rlm_rcode_t CC_HINT(nonnull) mod_authenticate(UNUSED void *instance, UNUSED void *thread, UNUSED REQUEST *request)
 {
 	return RLM_MODULE_OK;
 }
@@ -136,7 +136,7 @@ static rlm_rcode_t CC_HINT(nonnull) mod_authenticate(UNUSED void *instance, UNUS
 /*
  *	Massage the request before recording it or proxying it
  */
-static rlm_rcode_t CC_HINT(nonnull) mod_preacct(UNUSED void *instance, UNUSED REQUEST *request)
+static rlm_rcode_t CC_HINT(nonnull) mod_preacct(UNUSED void *instance, UNUSED void *thread, UNUSED REQUEST *request)
 {
 	return RLM_MODULE_OK;
 }
@@ -144,25 +144,8 @@ static rlm_rcode_t CC_HINT(nonnull) mod_preacct(UNUSED void *instance, UNUSED RE
 /*
  *	Write accounting information to this modules database.
  */
-static rlm_rcode_t CC_HINT(nonnull) mod_accounting(UNUSED void *instance, UNUSED REQUEST *request)
+static rlm_rcode_t CC_HINT(nonnull) mod_accounting(UNUSED void *instance, UNUSED void *thread, UNUSED REQUEST *request)
 {
-	return RLM_MODULE_OK;
-}
-
-/*
- *	See if a user is already logged in. Sets request->simul_count to the
- *	current session count for this user and sets request->simul_mpp to 2
- *	if it looks like a multilink attempt based on the requested IP
- *	address, otherwise leaves request->simul_mpp alone.
- *
- *	Check twice. If on the first pass the user exceeds his
- *	max. number of logins, do a second pass and validate all
- *	logins by querying the terminal server (using eg. SNMP).
- */
-static rlm_rcode_t CC_HINT(nonnull) mod_checksimul(UNUSED void *instance, REQUEST *request)
-{
-	request->simul_count=0;
-
 	return RLM_MODULE_OK;
 }
 #endif
@@ -202,7 +185,6 @@ rad_module_t rlm_example = {
 #ifdef WITH_ACCOUNTING
 		[MOD_PREACCT]		= mod_preacct,
 		[MOD_ACCOUNTING]	= mod_accounting,
-		[MOD_SESSION]		= mod_checksimul
 #endif
 	},
 };

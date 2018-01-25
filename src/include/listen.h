@@ -62,6 +62,7 @@ typedef struct rad_protocol_t rad_protocol_t;
 
 typedef int (*rad_listen_recv_t)(rad_listen_t *);
 typedef int (*rad_listen_send_t)(rad_listen_t *, REQUEST *);
+typedef int (*rad_listen_error_t)(rad_listen_t *, int);
 typedef int (*rad_listen_print_t)(rad_listen_t const *, char *, size_t);
 typedef void (*rad_listen_debug_t)(REQUEST *, RADIUS_PACKET *, bool received);
 typedef int (*rad_listen_encode_t)(rad_listen_t *, REQUEST *);
@@ -78,7 +79,8 @@ struct rad_listen {
 	int			fd;
 	char const		*server;	//!< Name of the virtual server that the listener is associated with
 	CONF_SECTION		*server_cs;	//!< Virtual server that the listener is associated with
-	int			status;
+	RAD_LISTEN_STATUS	status;
+	bool			old_style;
 
 #ifdef WITH_TCP
 	int			count;
@@ -94,6 +96,7 @@ struct rad_listen {
 
 	rad_listen_recv_t	recv;
 	rad_listen_send_t	send;
+	rad_listen_error_t	error;
 	rad_listen_encode_t	encode;
 	rad_listen_decode_t	decode;
 	rad_listen_debug_t	debug;
@@ -103,7 +106,7 @@ struct rad_listen {
 	 *	Events associated with this listener
 	 */
 	struct timeval		when;
-	fr_event_t		*ev;
+	fr_event_timer_t const	*ev;
 
 	CONF_SECTION const	*cs;
 	void			*data;
@@ -178,13 +181,6 @@ typedef struct listen_socket_t {
 
 	RADCLIENT_LIST		*clients;
 } listen_socket_t;
-
-int listen_bootstrap(CONF_SECTION *server, CONF_SECTION *cs, char const *server_name);
-int listen_compile(CONF_SECTION *server_cs, CONF_SECTION *listen_cs);
-void listen_free(rad_listen_t **head);
-int listen_init(rad_listen_t **head, bool spawn_flag);
-rad_listen_t *proxy_new_listener(TALLOC_CTX *ctx, home_server_t *home, uint16_t src_port);
-RADCLIENT *client_listener_find(rad_listen_t *listener, fr_ipaddr_t const *ipaddr, uint16_t src_port);
 
 #ifdef __cplusplus
 }

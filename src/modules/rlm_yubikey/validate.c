@@ -13,7 +13,7 @@
 #include "rlm_yubikey.h"
 
 #ifdef HAVE_YKCLIENT
-#include <freeradius-devel/connection.h>
+#include <freeradius-devel/pool.h>
 
 /** Frees a ykclient handle
  *
@@ -29,17 +29,17 @@ static int _mod_conn_free(ykclient_handle_t **yandle)
 
 /** Creates a new connection handle for use by the FR connection API.
  *
- * Matches the fr_connection_create_t function prototype, is passed to
- * fr_connection_pool_init, and called when a new connection is required by the
+ * Matches the fr_pool_connection_create_t function prototype, is passed to
+ * fr_pool_init, and called when a new connection is required by the
  * connection pool API.
  *
- * @see fr_connection_pool_init
- * @see fr_connection_create_t
+ * @see fr_pool_init
+ * @see fr_pool_connection_create_t
  * @see connection.c
  */
 static void *mod_conn_create(TALLOC_CTX *ctx, void *instance, UNUSED struct timeval const *timeout)
 {
-	rlm_yubikey_t *inst = instance;
+	rlm_yubikey_t const *inst = instance;
 	ykclient_rc status;
 	ykclient_handle_t *yandle, **marker;
 
@@ -88,7 +88,7 @@ yk_error:
 	status = ykclient_init(&inst->ykc);
 	if (status != YKCLIENT_OK) goto yk_error;
 
-	servers = cf_section_sub_find(conf, "servers");
+	servers = cf_section_find(conf, "servers", CF_IDENT_ANY);
 	if (servers) {
 		CONF_PAIR *uri, *first;
 		/*
@@ -140,20 +140,20 @@ init:
 
 int rlm_yubikey_ykclient_detach(rlm_yubikey_t *inst)
 {
-	fr_connection_pool_free(inst->pool);
+	fr_pool_free(inst->pool);
 	ykclient_done(&inst->ykc);
 	ykclient_global_done();
 
 	return 0;
 }
 
-rlm_rcode_t rlm_yubikey_validate(rlm_yubikey_t *inst, REQUEST *request,  char const *passcode)
+rlm_rcode_t rlm_yubikey_validate(rlm_yubikey_t const *inst, REQUEST *request, char const *passcode)
 {
 	rlm_rcode_t rcode = RLM_MODULE_OK;
 	ykclient_rc status;
 	ykclient_handle_t *yandle;
 
-	yandle = fr_connection_get(inst->pool, request);
+	yandle = fr_pool_connection_get(inst->pool, request);
 	if (!yandle) return RLM_MODULE_FAIL;
 
 	/*
@@ -190,7 +190,7 @@ rlm_rcode_t rlm_yubikey_validate(rlm_yubikey_t *inst, REQUEST *request,  char co
 		}
 	}
 
-	fr_connection_release(inst->pool, request, yandle);
+	fr_pool_connection_release(inst->pool, request, yandle);
 
 	return rcode;
 }

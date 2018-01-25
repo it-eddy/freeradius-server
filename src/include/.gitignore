@@ -11,10 +11,16 @@ missing.h
 radpaths.h
 eap.sim.h
 eap.aka.h
+tacacs.h
 rfc*.h
 tls.h
 vqp.h
 protocol/*
+
+# Symlinks
+util
+radius
+ethernet
 
 # Build scripts
 build-radpaths-h

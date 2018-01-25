@@ -1,3 +1,4 @@
+
 #
 #  Tests for parsing conditional expressions.
 #
@@ -44,12 +45,6 @@ data ERROR offset 4 Invalid operator
 
 condition (ok =x handled)
 data ERROR offset 4 Invalid operator
-
-condition (ok =~ handled)
-data ERROR offset 7 Expected regular expression
-
-condition (ok == /foo/)
-data ERROR offset 7 Unexpected regular expression
 
 condition (ok == handled"foo")
 data ERROR offset 14 Unexpected start of string
@@ -111,9 +106,6 @@ data handled && &Response-Packet-Type == Access-Challenge
 condition handled &&&Response-Packet-Type == Access-Challenge
 data handled && &Response-Packet-Type == Access-Challenge
 
-condition /foo/ =~ bar
-data ERROR offset 0 Conditional check cannot begin with a regular expression
-
 condition reply == request
 data ERROR offset 0 Cannot use list references in condition
 
@@ -125,18 +117,6 @@ data ERROR offset 0 Cannot use list references in condition
 
 condition request:User-Name == reply:User-Name
 data &User-Name == &reply:User-Name
-
-#
-#  Convert !~ to !(COND) for regex
-#
-condition foo =~ /bar/
-data foo =~ /bar/
-
-condition foo !~ /bar/
-data !foo =~ /bar/
-
-condition !foo !~ /bar/
-data foo =~ /bar/
 
 #
 #  Convert != to !(COND) for normal checks
@@ -462,10 +442,10 @@ condition <ipaddr>&Class == &Framed-IP-Address
 data <ipaddr>&Class == &Framed-IP-Address
 
 #
-#  Tags of zero mean restrict to attributes with no tag
+#  Tags of zero mean there's no tag
 #
 condition &Tunnel-Password:0 == "Hello"
-data &Tunnel-Password:0 == "Hello"
+data &Tunnel-Password == "Hello"
 
 condition &Tunnel-Password:1 == "Hello"
 data &Tunnel-Password:1 == "Hello"
@@ -524,11 +504,11 @@ data &WiMAX-PFDv2-Src-Port == 6809
 
 #
 #  This OID is known, but the data is malformed.
-#  This is disallowed.  Fix the configuration so that
-#  it works.
+#  Allow it so that we can look for malformed attributes
+#  in packets.
 #
 condition &Attr-26.24757.84.9.5.7 == 0x1a99
-data ERROR offset 27 Failed to parse value for attribute
+data &Attr-26.24757.84.9.5.7 == 0x1a99
 
 #  This one is really unknown
 condition &Attr-26.24757.84.9.5.15 == 0x1a99
@@ -617,36 +597,24 @@ data false
 #
 #  'Unknown' attributes which are defined in the main dictionary
 #  should be resolved to their real names.
-condition &Attr-1 == 'bar'
-data &User-Name == 'bar'
+condition &Attr-1 == 0x616263
+data &User-Name == 'abc'
 
-condition &Vendor-11344-Attr-1 == 127.0.0.1
-data &FreeRADIUS-Proxied-To == 127.0.0.1
-
-condition &FreeRADIUS-Attr-1 == 127.0.0.1
+condition &Attr-26.11344.1 == 0x7f000001
 data &FreeRADIUS-Proxied-To == 127.0.0.1
 
 #
 #  Escape the backslashes correctly
 #  And print them correctly
 #
-condition &User-Name =~ /@|\\/
-data &User-Name =~ /@|\\/
-
 condition &User-Name == '\\'
 data &User-Name == '\\'
-
-condition &User-Name !~ /^foo\nbar$/
-data !&User-Name =~ /^foo\nbar$/
 
 condition &User-Name == "@|\\"
 data &User-Name == "@|\\"
 
 condition &User-Name != "foo\nbar"
 data !&User-Name == "foo\nbar"
-
-condition User-Name =~ /^([^\\]*)\\(.*)$/
-data &User-Name =~ /^([^\\]*)\\(.*)$/
 
 #
 #  We require explicit casts

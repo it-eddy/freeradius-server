@@ -48,13 +48,13 @@ typedef struct rlm_always_t {
  *	A mapping of configuration file names to internal variables.
  */
 static const CONF_PARSER module_config[] = {
-	{ FR_CONF_OFFSET("rcode", PW_TYPE_STRING, rlm_always_t, rcode_str), .dflt = "fail" },
-	{ FR_CONF_OFFSET("simulcount", PW_TYPE_INTEGER, rlm_always_t, simulcount), .dflt = "0" },
-	{ FR_CONF_OFFSET("mpp", PW_TYPE_BOOLEAN, rlm_always_t, mpp), .dflt = "no" },
+	{ FR_CONF_OFFSET("rcode", FR_TYPE_STRING, rlm_always_t, rcode_str), .dflt = "fail" },
+	{ FR_CONF_OFFSET("simulcount", FR_TYPE_UINT32, rlm_always_t, simulcount), .dflt = "0" },
+	{ FR_CONF_OFFSET("mpp", FR_TYPE_BOOL, rlm_always_t, mpp), .dflt = "no" },
 	CONF_PARSER_TERMINATOR
 };
 
-static int mod_instantiate(CONF_SECTION *conf, void *instance)
+static int mod_instantiate(void *instance, CONF_SECTION *conf)
 {
 	rlm_always_t *inst = instance;
 
@@ -65,7 +65,7 @@ static int mod_instantiate(CONF_SECTION *conf, void *instance)
 	 */
 	inst->rcode = fr_str2int(mod_rcode_table, inst->rcode_str, RLM_MODULE_UNKNOWN);
 	if (inst->rcode == RLM_MODULE_UNKNOWN) {
-		cf_log_err_cs(conf, "rcode value \"%s\" is invalid", inst->rcode_str);
+		cf_log_err(conf, "rcode value \"%s\" is invalid", inst->rcode_str);
 		return -1;
 	}
 	inst->rcode_old = NULL;	/* Hack - forces the compiler not to optimise away rcode_old */
@@ -97,7 +97,7 @@ static void reparse_rcode(rlm_always_t *inst)
  *	Just return the rcode ... this function is autz, auth, acct, and
  *	preacct!
  */
-static rlm_rcode_t CC_HINT(nonnull) mod_always_return(void *instance, UNUSED REQUEST *request)
+static rlm_rcode_t CC_HINT(nonnull) mod_always_return(void *instance, UNUSED void *thread, UNUSED REQUEST *request)
 {
 	rlm_always_t *inst = instance;
 
@@ -106,29 +106,10 @@ static rlm_rcode_t CC_HINT(nonnull) mod_always_return(void *instance, UNUSED REQ
 	return inst->rcode;
 }
 
-#ifdef WITH_SESSION_MGMT
-/*
- *	checksimul fakes some other variables besides the rcode...
- */
-static rlm_rcode_t CC_HINT(nonnull) mod_checksimul(void *instance, REQUEST *request)
-{
-	struct rlm_always_t *inst = instance;
-
-	if (inst->rcode_old != inst->rcode_str) reparse_rcode(inst);
-
-	request->simul_count = inst->simulcount;
-
-	if (inst->mpp) request->simul_mpp = 2;
-
-	return inst->rcode;
-}
-#endif
-
 extern rad_module_t rlm_always;
 rad_module_t rlm_always = {
 	.magic		= RLM_MODULE_INIT,
 	.name		= "always",
-	.type		= RLM_TYPE_HUP_SAFE,
 	.inst_size	= sizeof(rlm_always_t),
 	.config		= module_config,
 	.instantiate	= mod_instantiate,
@@ -137,9 +118,6 @@ rad_module_t rlm_always = {
 		[MOD_AUTHORIZE]		= mod_always_return,
 		[MOD_PREACCT]		= mod_always_return,
 		[MOD_ACCOUNTING]	= mod_always_return,
-#ifdef WITH_SESSION_MGMT
-		[MOD_SESSION]		= mod_checksimul,
-#endif
 		[MOD_PRE_PROXY]		= mod_always_return,
 		[MOD_POST_PROXY]	= mod_always_return,
 		[MOD_POST_AUTH]		= mod_always_return,

@@ -4,8 +4,8 @@ ifneq "$(LIBREADLINE)" ""
 TARGET		:= $(TARGETNAME)
 endif
 
-SOURCES		:= radmin.c channel.c
+SOURCES		:= radmin.c conduit.c
 
 TGT_INSTALLDIR  := ${sbindir}
-TGT_PREREQS	:= libfreeradius-server.a libfreeradius-radius.a
+TGT_PREREQS	:= $(LIBFREERADIUS_SERVER) libfreeradius-util.a
 TGT_LDLIBS	:= $(LIBS) $(LIBREADLINE)

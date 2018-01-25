@@ -29,8 +29,6 @@ RCSIDH(realms_h, "$Id$")
 extern "C" {
 #endif
 
-extern bool home_servers_udp;	//!< Whether there are any UDP home servers
-
 typedef enum {
 	HOME_TYPE_INVALID = 0,
 	HOME_TYPE_AUTH,		//!< Authentication server
@@ -72,6 +70,9 @@ typedef struct home_server {
 							//!< stats or when specifying home servers for a pool.
 
 	bool			dual;			//!< One of a pair of homeservers on consecutive ports.
+
+	bool			is_ourself;		//!< if we're proxying to one of our own ports.
+
 	char const		*server;		//!< For internal proxying
 	char const		*parent_server;
 
@@ -94,7 +95,7 @@ typedef struct home_server {
 
 	char const		*secret;
 
-	fr_event_t		*ev;
+	fr_event_timer_t const	*ev;
 	struct timeval		when;
 
 	struct timeval		response_window;
@@ -186,33 +187,6 @@ typedef struct _realm {
 	home_pool_t		*coa_pool;
 #endif
 } REALM;
-
-typedef struct realm_config realm_config_t;
-
-int		realms_init(CONF_SECTION *config);
-void		realms_free(void);
-REALM		*realm_find(char const *name); /* name is from a packet */
-REALM		*realm_find2(char const *name); /* ... with name taken from realm_find */
-
-void		realm_home_server_sanitize(home_server_t *home, CONF_SECTION *cs);
-int		realm_pool_add(home_pool_t *pool, CONF_SECTION *cs);
-void		realm_pool_free(home_pool_t *pool);
-bool		realm_home_server_add(home_server_t *home);
-int		realm_realm_add( REALM *r, CONF_SECTION *cs);
-
-void		home_server_update_request(home_server_t *home, REQUEST *request);
-home_server_t	*home_server_ldb(char const *realmname, home_pool_t *pool, REQUEST *request);
-home_server_t	*home_server_find(fr_ipaddr_t *ipaddr, uint16_t port, int proto);
-
-home_server_t	*home_server_afrom_cs(TALLOC_CTX *ctx, realm_config_t *rc, CONF_SECTION *cs);
-CONF_SECTION	*home_server_cs_afrom_client(CONF_SECTION *client);
-#ifdef WITH_COA
-home_server_t	*home_server_byname(char const *name, int type);
-#endif
-#ifdef WITH_STATS
-home_server_t	*home_server_bynumber(int number);
-#endif
-home_pool_t	*home_pool_byname(char const *name, int type);
 
 #ifdef __cplusplus
 }

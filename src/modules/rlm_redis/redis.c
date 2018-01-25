@@ -130,7 +130,7 @@ fr_redis_rcode_t fr_redis_command_status(fr_redis_conn_t *conn, redisReply *repl
  * @param request The current request.
  * @param idx Response number.
  */
-void fr_redis_reply_print(log_lvl_t lvl, redisReply *reply, REQUEST *request, int idx)
+void fr_redis_reply_print(fr_log_lvl_t lvl, redisReply *reply, REQUEST *request, int idx)
 {
 	size_t i = 0;
 
@@ -168,11 +168,11 @@ void fr_redis_reply_print(log_lvl_t lvl, redisReply *reply, REQUEST *request, in
 	}
 }
 
-/** Convert a string or integer type to #value_data_t of specified type
+/** Convert a string or integer type to #fr_value_box_t of specified type
  *
- * Will work with REDIS_REPLY_STRING (which is converted to #PW_TYPE_STRING
+ * Will work with REDIS_REPLY_STRING (which is converted to #FR_TYPE_STRING
  * then cast to dst_type), or REDIS_REPLY_INTEGER (which is converted to
- * #PW_TYPE_INTEGER64, then cast to dst_type).
+ * #FR_TYPE_UINT64, then cast to dst_type).
  *
  * @note Any unsupported types will trigger an assert. You must check the
  *	reply type prior to calling this function.
@@ -188,11 +188,10 @@ void fr_redis_reply_print(log_lvl_t lvl, redisReply *reply, REQUEST *request, in
  *	- 0 on success.
  *	- -1 on cast or parse failure.
  */
-int fr_redis_reply_to_value_data(TALLOC_CTX *ctx, value_data_t *out, redisReply *reply,
-				 PW_TYPE dst_type, fr_dict_attr_t const *dst_enumv)
+int fr_redis_reply_to_value_box(TALLOC_CTX *ctx, fr_value_box_t *out, redisReply *reply,
+				 fr_type_t dst_type, fr_dict_attr_t const *dst_enumv)
 {
-	value_data_t	in;
-	PW_TYPE		src_type = 0;
+	fr_value_box_t	in;
 
 	memset(&in, 0, sizeof(in));
 
@@ -211,38 +210,31 @@ int fr_redis_reply_to_value_data(TALLOC_CTX *ctx, value_data_t *out, redisReply 
 			return -1;
 		}
 		if (reply->integer < 0) {		/* 32bit signed (supported) */
-			src_type = PW_TYPE_SIGNED;
-			in.sinteger = (int32_t) reply->integer;
-			in.length = sizeof(in.sinteger);
+			in.type = FR_TYPE_INT32;
+			in.vb_int32 = (int32_t) reply->integer;
 		}
 		else if (reply->integer > UINT32_MAX) {	/* 64bit unsigned (supported) */
-			src_type = PW_TYPE_INTEGER64;
-			in.integer64 = (uint64_t) reply->integer;
-			in.length = sizeof(in.integer64);
+			in.type = FR_TYPE_UINT64;
+			in.vb_uint64 = (uint64_t) reply->integer;
 		}
 		else if (reply->integer > UINT16_MAX) {	/* 32bit unsigned (supported) */
-			src_type = PW_TYPE_INTEGER;
-			in.integer = (uint32_t) reply->integer;
-			in.length = sizeof(in.integer);
+			in.type = FR_TYPE_UINT32;
+			in.vb_uint32 = (uint32_t) reply->integer;
 		}
 		else if (reply->integer > UINT8_MAX) {	/* 16bit unsigned (supported) */
-			src_type = PW_TYPE_SHORT;
-			in.ushort = (uint16_t) reply->integer;
-			in.length = sizeof(in.ushort);
+			in.type = FR_TYPE_UINT16;
+			in.vb_uint16 = (uint16_t) reply->integer;
 		}
-		else if (reply->integer >= 0) {		/* 8bit unsigned (supported) */
-			src_type = PW_TYPE_BYTE;
-			in.byte = (uint8_t) reply->integer;
-			in.length = sizeof(in.byte);
-		} else {
-			rad_assert(0);
+		else {		/* 8bit unsigned (supported) */
+			in.type = FR_TYPE_UINT8;
+			in.vb_uint8 = (uint8_t) reply->integer;
 		}
 		break;
 
 	case REDIS_REPLY_STRING:
-		src_type = PW_TYPE_STRING;
-		in.ptr = reply->str;
-		in.length = reply->len;
+		in.type = FR_TYPE_STRING;
+		in.datum.ptr = reply->str;
+		in.datum.length = reply->len;
 		break;
 
 	case REDIS_REPLY_ARRAY:
@@ -251,11 +243,8 @@ int fr_redis_reply_to_value_data(TALLOC_CTX *ctx, value_data_t *out, redisReply 
 		rad_assert(0);
 	}
 
-	if (src_type == dst_type) {
-		if (value_data_copy(ctx, out, src_type, &in) < 0) return -1;
-	} else {
-		if (value_data_cast(ctx, out, dst_type, dst_enumv, src_type, NULL, &in) < 0) return -1;
-	}
+	if (fr_value_box_cast(ctx, out, dst_type, dst_enumv, &in) < 0) return -1;
+
 	return 0;
 }
 
@@ -323,20 +312,17 @@ int fr_redis_reply_to_map(TALLOC_CTX *ctx, vp_map_t **out, REQUEST *request,
 	case REDIS_REPLY_STRING:
 	case REDIS_REPLY_INTEGER:
 	{
-		value_data_t vpt;
+		fr_value_box_t vpt;
 
 		/* Logs own errors */
-		if (fr_redis_reply_to_value_data(map, &vpt, value,
+		if (fr_redis_reply_to_value_box(map, &vpt, value,
 						 map->lhs->tmpl_da->type, map->lhs->tmpl_da) < 0) {
-			REDEBUG("Failed converting Redis data: %s", fr_strerror());
+			RPEDEBUG("Failed converting Redis data");
 			goto error;
 		}
 
 		/* This will only fail only memory allocation errors */
-		if (tmpl_afrom_value_data(map, &map->rhs, &vpt,
-					  map->lhs->tmpl_da->type, map->lhs->tmpl_da, true) < 0) {
-			goto error;
-		}
+		if (tmpl_afrom_value_box(map, &map->rhs, &vpt, true) < 0) goto error;
 	}
 		break;
 
@@ -346,7 +332,7 @@ int fr_redis_reply_to_map(TALLOC_CTX *ctx, vp_map_t **out, REQUEST *request,
 		goto error;
 
 	}
-	VERIFY_MAP(map);
+	MAP_VERIFY(map);
 
 	*out = map;
 
@@ -383,7 +369,7 @@ int fr_redis_tuple_from_map(TALLOC_CTX *pool, char const *out[], size_t out_len[
 	rad_assert(map->lhs->type == TMPL_TYPE_ATTR);
 	rad_assert(map->rhs->type == TMPL_TYPE_DATA);
 
-	key_len = tmpl_snprint(key_buf, sizeof(key_buf), map->lhs, map->lhs->tmpl_da);
+	key_len = tmpl_snprint(key_buf, sizeof(key_buf), map->lhs);
 	if (is_truncated(key_len, sizeof(key_buf))) {
 		fr_strerror_printf("Key too long.  Must be < " STRINGIFY(sizeof(key_buf)) " "
 				   "bytes, got %zu bytes", key_len);
@@ -392,11 +378,11 @@ int fr_redis_tuple_from_map(TALLOC_CTX *pool, char const *out[], size_t out_len[
 	key = talloc_bstrndup(pool, key_buf, key_len);
 	if (!key) return -1;
 
-	switch (map->rhs->tmpl_data_type) {
-	case PW_TYPE_STRING:
-	case PW_TYPE_OCTETS:
-		out[2] = map->rhs->tmpl_data_value.ptr;
-		out_len[2] = map->rhs->tmpl_data_length;
+	switch (map->rhs->tmpl_value_type) {
+	case FR_TYPE_STRING:
+	case FR_TYPE_OCTETS:
+		out[2] = map->rhs->tmpl_value.datum.ptr;
+		out_len[2] = map->rhs->tmpl_value_length;
 		break;
 
 	/*
@@ -407,8 +393,7 @@ int fr_redis_tuple_from_map(TALLOC_CTX *pool, char const *out[], size_t out_len[
 		char	value[256];
 		size_t	len;
 
-		len = value_data_snprint(value, sizeof(value), map->rhs->tmpl_data_type, map->lhs->tmpl_da,
-					&map->rhs->tmpl_data_value, '\0');
+		len = fr_value_box_snprint(value, sizeof(value), &map->rhs->tmpl_value, '\0');
 		new = talloc_bstrndup(pool, value, len);
 		if (!new) {
 			talloc_free(key);
@@ -439,42 +424,45 @@ int fr_redis_tuple_from_map(TALLOC_CTX *pool, char const *out[], size_t out_len[
  * If the number of responses != pipelined, that's also an error, a very serious one,
  * in libhiredis or Redis.  We can't really do much here apart from error out.
  *
+ * @param[out] pipelined Number of pipelined commands we sent to the server.
  * @param[out] rcode Status of the first errored response, or REDIS_RCODE_SUCCESS
  *	if all responses were processed.
  * @param[out] out Where to write the replies from pipelined commands.
  *	Will contain exactly 1 element on error, else the number passed in pipelined.
  * @param[in] out_len number of elements in out.
  * @param[in] conn the pipelined commands were issued on.
- * @param[in] pipelined Number of pipelined commands we sent to the server.
  * @return
  *	- #REDIS_RCODE_SUCCESS on success.
  *	- #REDIS_RCODE_ERROR on command/response mismatch or command error.
  *	- REDIS_RCODE_* on other errors;
  */
-fr_redis_rcode_t fr_redis_pipeline_result(fr_redis_rcode_t *rcode, redisReply *out[], size_t out_len,
-					  fr_redis_conn_t *conn, int pipelined)
+fr_redis_rcode_t fr_redis_pipeline_result(unsigned int *pipelined, fr_redis_rcode_t *rcode,
+					  redisReply *out[], size_t out_len,
+					  fr_redis_conn_t *conn)
 {
 	size_t			i;
 	redisReply		**out_p = out;
 	fr_redis_rcode_t	status = REDIS_RCODE_SUCCESS;
 	redisReply		*reply = NULL;
 
-	rad_assert(out_len >= (size_t)pipelined);
+	rad_assert(out_len >= (size_t)*pipelined);
 
-#ifdef NDEBUG
-	if ((size_t) pipelined > out_len) {
-		for (i = 0; i < (size_t)pipelined; i++) {
+	fr_strerror();	/* Clear any outstanding errors */
+
+	if ((size_t) *pipelined > out_len) {
+		for (i = 0; i < (size_t)*pipelined; i++) {
 			if (redisGetReply(conn->handle, (void **)&reply) != REDIS_OK) break;
 			fr_redis_reply_free(reply);
 		}
+
+		*pipelined = 0;			/* all outstanding responses should be cleared */
 
 		fr_strerror_printf("Too many pipelined commands");
 		out[0] = NULL;
 		return REDIS_RCODE_ERROR;
 	}
-#endif
 
-	for (i = 0; i < (size_t)pipelined; i++) {
+	for (i = 0; i < (size_t)*pipelined; i++) {
 		bool maybe_more = false;
 
 		/*
@@ -495,6 +483,11 @@ fr_redis_rcode_t fr_redis_pipeline_result(fr_redis_rcode_t *rcode, redisReply *o
 			size_t j;
 		error:
 			/*
+			 *	Append the hiredis error
+			 */
+			if (conn->handle->errstr[0]) fr_strerror_printf_push("%s", conn->handle->errstr);
+
+			/*
 			 *	Free everything that came before the bad reply
 			 */
 			for (j = 0; j < i; j++) {
@@ -505,7 +498,7 @@ fr_redis_rcode_t fr_redis_pipeline_result(fr_redis_rcode_t *rcode, redisReply *o
 			/*
 			 *	...and drain the rest of the pipelined responses
 			 */
-			for (j = i + 1; j < (size_t)pipelined; j++) {
+			for (j = i + 1; j < (size_t)*pipelined; j++) {
 				redisReply *to_clear;
 
 				if (redisGetReply(conn->handle, (void **)&to_clear) != REDIS_OK) break;
@@ -513,18 +506,24 @@ fr_redis_rcode_t fr_redis_pipeline_result(fr_redis_rcode_t *rcode, redisReply *o
 			}
 
 			out[0] = reply;
-			if (rcode) *rcode = status;
+
+			*rcode = status;
+			*pipelined = 0;		 /* all outstanding responses should be cleared */
+
 			return reply ? 1 : 0;
 		}
 	}
 
-	if (i != (size_t)pipelined) {
-		fr_strerror_printf("Expected %i responses, got %zu", pipelined, i);
+	if (i != (size_t)*pipelined) {
+		fr_strerror_printf("Expected %u responses, got %zu", *pipelined, i);
 		status = REDIS_RCODE_ERROR;
 		goto error;
 	}
 
-	if (rcode) *rcode = status;
+	*rcode = status;
+
+	*pipelined = 0;				/* all outstanding responses should be cleared */
+
 	return i;
 }
 

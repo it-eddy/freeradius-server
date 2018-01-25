@@ -80,7 +80,7 @@
 #  define LD_LIBRARY_PATH_LOCAL		"DYLD_FALLBACK_LIBRARY_PATH"
 #endif
 
-#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || (defined(__sun) && defined(__GNUC__))
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || (defined(__sun) && defined(__GNUC__))
 #  define SHELL_CMD 			"/bin/sh"
 #  define DYNAMIC_LIB_EXT		"so"
 #  define MODULE_LIB_EXT		"so"
@@ -439,9 +439,6 @@ static count_chars *alloc_countchars(void)
 {
 	count_chars *out;
 	out = lt_malloc(sizeof(count_chars));
-	if (!out) {
-		exit(1);
-	}
 	init_count_chars(out);
 
 	return out;
@@ -1354,10 +1351,8 @@ static void add_rpath_noinstall(count_chars *cc, char const *arg, int pathlen)
 	char const *path;
 
 	path = load_noinstall_path(arg, pathlen);
-	if (path) {
-		add_rpath(cc, path);
-		lt_const_free(path);
-	}
+	add_rpath(cc, path);
+	lt_const_free(path);
 }
 #endif
 
@@ -1656,6 +1651,8 @@ static int parse_input_file_name(char const *arg, command_t *cmd)
 				char *tmp;
 
 				tmp = strdup(arg);
+				if (!tmp) exit(1);
+
 				tmp[pathlen] = '\0';
 				push_count_chars(cmd->arglist, tmp);
 
@@ -2255,6 +2252,7 @@ static int run_mode(command_t *cmd)
 
 		strcpy(libpath, cmd->arglist->vals[0]);
 		add_dotlibs(libpath);
+#if 0
 		l = strrchr(libpath, '/');
 		if (!l) l = strrchr(libpath, '\\');
 		if (l) {
@@ -2263,6 +2261,7 @@ static int run_mode(command_t *cmd)
 		} else {
 			l = ".libs/";
 		}
+#endif
 
 		l = "./build/lib/local/.libs";
 		setenv(LD_LIBRARY_PATH_LOCAL, l, 1);
@@ -2352,6 +2351,7 @@ static int add_for_runtime(command_t *cmd)
 	}
 	if (cmd->output == OUT_DYNAMIC_LIB_ONLY ||
 		cmd->output == OUT_LIB) {
+		int i;
 		FILE *f=fopen(cmd->fake_output_name,"w");
 		char *lib_so = basename((char *)cmd->module_name.normal);
 		count_chars *dep = cmd->shared_opts.dependencies;
@@ -2370,10 +2370,8 @@ static int add_for_runtime(command_t *cmd)
 
 		fprintf(f,"# Libraries that this one depends upon.\n");
 		fprintf(f,"dependency_libs='");
-		while (dep->num--) {
-			fprintf(f,"%s", dep->vals[dep->num]);
-			if ((dep->num - 1) >= 1)
-				fputc(' ', f);
+		for (i = 0; i < dep->num; i++) {
+			fprintf(f,"%s ", dep->vals[i]);
 		}
 		fprintf(f,"'\n\n");
 
@@ -2493,7 +2491,24 @@ static void parse_args(int argc, char *argv[], command_t *cmd)
 		arg_used = 1;
 
 		if (cmd->mode == MODE_EXECUTE) {
-			push_count_chars(cmd->arglist, arg);
+			if (strchr(arg, ' ') == NULL) {
+				push_count_chars(cmd->arglist, arg);
+
+			} else {
+				size_t len;
+				char *sp;
+
+				len = strlen(arg);
+
+				sp = lt_malloc(len + 3);
+				sp[0] = '\'';
+				memcpy(sp + 1, arg, len);
+				sp[len + 1] = '\'';
+				sp[len + 2] = '\0';
+
+				push_count_chars(cmd->arglist, sp);
+			}
+
 			continue;
 		}
 

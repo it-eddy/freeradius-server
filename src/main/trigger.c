@@ -26,17 +26,28 @@
 RCSID("$Id$")
 
 #include <freeradius-devel/radiusd.h>
+#include <freeradius-devel/cf_parse.h>
 #include <freeradius-devel/rad_assert.h>
 
-static CONF_SECTION *trigger_exec_main, *trigger_exec_subcs;
+static CONF_SECTION const	*trigger_exec_main, *trigger_exec_subcs;
+static rbtree_t			*trigger_last_fired_tree;
+static pthread_mutex_t		*trigger_mutex;
 
 #define REQUEST_INDEX_TRIGGER_NAME	1
 #define REQUEST_INDEX_TRIGGER_ARGS	2
 
+/** Describes a rate limiting entry for a trigger
+ *
+ */
+typedef struct {
+	CONF_ITEM	*ci;		//!< Config item this rate limit counter is associated with.
+	time_t		last_fired;	//!< When this trigger last fired.
+} trigger_last_fired_t;
+
 /** Retrieve attributes from a special trigger list
  *
  */
-static ssize_t xlat_trigger(char **out, UNUSED size_t outlen,
+static ssize_t xlat_trigger(UNUSED TALLOC_CTX *ctx, char **out, UNUSED size_t outlen,
 			    UNUSED void const *mod_inst, UNUSED void const *xlat_inst,
 			    REQUEST *request, char const *fmt)
 {
@@ -50,6 +61,7 @@ static ssize_t xlat_trigger(char **out, UNUSED size_t outlen,
 	}
 
 	head = request_data_reference(request, &trigger_exec_main, REQUEST_INDEX_TRIGGER_ARGS);
+
 	/*
 	 *	No arguments available.
 	 */
@@ -71,25 +83,63 @@ static ssize_t xlat_trigger(char **out, UNUSED size_t outlen,
 	return talloc_array_length(*out) - 1;
 }
 
+static int _mutex_free(pthread_mutex_t *mutex)
+{
+	pthread_mutex_destroy(mutex);
+	return 0;
+}
+
+static void _trigger_last_fired_free(void *data)
+{
+	talloc_free(data);
+}
+
+/** Compares two last fired structures
+ *
+ * @param a first pointer to compare.
+ * @param b second pointer to compare.
+ * @return
+ *	- -1 if a < b.
+ *	- +1 if b > a.
+ *	- 0 if both equal.
+ */
+static int _trigger_last_fired_cmp(void const *a, void const *b)
+{
+	trigger_last_fired_t const *lf_a = a, *lf_b = b;
+
+	return (lf_a->ci < lf_b->ci) - (lf_a->ci > lf_b->ci);
+}
+
 /** Set the global trigger section trigger_exec will search in, and register xlats
  *
  * @note Triggers are used by the connection pool, which is used in the server library
  *	which may not have the mainconfig available.  Additionally, utilities may want
  *	to set their own root config sections.
  *
- * @param cs to use as global trigger section
+ * @param cs	to use as global trigger section.
  */
-void trigger_exec_init(CONF_SECTION *cs)
+void trigger_exec_init(CONF_SECTION const *cs)
 {
 	trigger_exec_main = cs;
-	trigger_exec_subcs = cf_section_sub_find(cs, "trigger");
+	trigger_exec_subcs = cf_section_find(cs, "trigger", NULL);
 
-	xlat_register(NULL, "trigger", xlat_trigger, NULL, NULL, 0, 0);
+	MEM(trigger_last_fired_tree = rbtree_create(talloc_null_ctx(),
+						    _trigger_last_fired_cmp, _trigger_last_fired_free, 0));
+
+	trigger_mutex = talloc(talloc_null_ctx(), pthread_mutex_t);
+	pthread_mutex_init(trigger_mutex, 0);
+	talloc_set_destructor(trigger_mutex, _mutex_free);
+
+	xlat_register(NULL, "trigger", xlat_trigger, NULL, NULL, 0, 0, false);
 }
 
-static void time_free(void *data)
+/** Free trigger resources
+ *
+ */
+void trigger_exec_free(void)
 {
-	talloc_free(data);
+	TALLOC_FREE(trigger_last_fired_tree);
+	TALLOC_FREE(trigger_mutex);
 }
 
 /** Execute a trigger - call an executable to process an event
@@ -106,20 +156,20 @@ static void time_free(void *data)
  * @return 		- 0 on success.
  *			- -1 on failure.
  */
-int trigger_exec(REQUEST *request, CONF_SECTION *cs, char const *name, bool rate_limit, VALUE_PAIR *args)
+int trigger_exec(REQUEST *request, CONF_SECTION const *cs, char const *name, bool rate_limit, VALUE_PAIR *args)
 {
-	CONF_SECTION	*subcs;
+	CONF_SECTION const	*subcs;
 
-	CONF_ITEM	*ci;
-	CONF_PAIR	*cp;
+	CONF_ITEM		*ci;
+	CONF_PAIR		*cp;
 
-	char const	*attr;
-	char const	*value;
+	char const		*attr;
+	char const		*value;
 
-	VALUE_PAIR	*vp;
+	VALUE_PAIR		*vp;
 
-	REQUEST		*fake = NULL;
-	int		ret = 0;
+	REQUEST			*fake = NULL;
+	int			ret = 0;
 
 	/*
 	 *	Use global "trigger" section if no local config is given.
@@ -144,7 +194,7 @@ int trigger_exec(REQUEST *request, CONF_SECTION *cs, char const *name, bool rate
 	 *	try using the global "trigger" section, and reset the
 	 *	reference to the full path, rather than the sub-path.
 	 */
-	subcs = cf_section_sub_find(cs, "trigger");
+	subcs = cf_section_find(cs, "trigger", NULL);
 	if (!subcs && trigger_exec_main && (cs != trigger_exec_main)) {
 		subcs = trigger_exec_subcs;
 		attr = name;
@@ -181,32 +231,29 @@ int trigger_exec(REQUEST *request, CONF_SECTION *cs, char const *name, bool rate
 	 *	Perform periodic rate_limiting.
 	 */
 	if (rate_limit) {
-		time_t *last_time;
+		trigger_last_fired_t	find, *found;
+		time_t			now = time(NULL);
 
-		last_time = cf_data_find(cs, value);
-		if (!last_time) {
-			/*
-			 *	Can't be parented off config due to threading
-			 *	issues.
-			 */
-			last_time = talloc_zero(NULL, time_t);
-			*last_time = 0;
+		find.ci = ci;
 
-			if (cf_data_add(cs, value, last_time, time_free) < 0) {
-				talloc_free(last_time);
-				last_time = NULL;
-			}
+		pthread_mutex_lock(trigger_mutex);
+
+		found = rbtree_finddata(trigger_last_fired_tree, &find);
+		if (!found) {
+			MEM(found = talloc(NULL, trigger_last_fired_t));
+			found->ci = ci;
+			found->last_fired = 0;
+
+			rbtree_insert(trigger_last_fired_tree, found);
 		}
+
+		pthread_mutex_unlock(trigger_mutex);
 
 		/*
 		 *	Send the rate_limited traps at most once per second.
 		 */
-		if (last_time) {
-			time_t now = time(NULL);
-			if (*last_time == now) return -1;
-
-			*last_time = now;
-		}
+		if (found->last_fired == now) return -1;
+		found->last_fired = now;
 	}
 
 	/*
@@ -243,8 +290,8 @@ int trigger_exec(REQUEST *request, CONF_SECTION *cs, char const *name, bool rate
 	 */
 	if (!check_config) ret = radius_exec_program(request, NULL, 0, NULL,
 						     request, value, vp, false, true, EXEC_TIMEOUT);
-	request_data_reference(request, &trigger_exec_main, REQUEST_INDEX_TRIGGER_NAME);
-	request_data_reference(request, &trigger_exec_main, REQUEST_INDEX_TRIGGER_ARGS);
+	(void) request_data_get(request, &trigger_exec_main, REQUEST_INDEX_TRIGGER_NAME);
+	(void) request_data_get(request, &trigger_exec_main, REQUEST_INDEX_TRIGGER_ARGS);
 
 	if (fake) talloc_free(fake);
 
@@ -267,27 +314,27 @@ VALUE_PAIR *trigger_args_afrom_server(TALLOC_CTX *ctx, char const *server, uint1
 	VALUE_PAIR		*out = NULL, *vp;
 	vp_cursor_t		cursor;
 
-	server_da = fr_dict_attr_by_num(NULL, 0, PW_CONNECTION_POOL_SERVER);
+	server_da = fr_dict_attr_by_num(NULL, 0, FR_CONNECTION_POOL_SERVER);
 	if (!server_da) {
 		ERROR("Incomplete dictionary: Missing definition for \"Connection-Pool-Server\"");
 		return NULL;
 	}
 
-	port_da = fr_dict_attr_by_num(NULL, 0, PW_CONNECTION_POOL_PORT);
+	port_da = fr_dict_attr_by_num(NULL, 0, FR_CONNECTION_POOL_PORT);
 	if (!port_da) {
 		ERROR("Incomplete dictionary: Missing definition for \"Connection-Pool-Port\"");
 		return NULL;
 	}
 
-	fr_cursor_init(&cursor, &out);
+	fr_pair_cursor_init(&cursor, &out);
 
 	MEM(vp = fr_pair_afrom_da(ctx, server_da));
 	fr_pair_value_strcpy(vp, server);
-	fr_cursor_append(&cursor, vp);
+	fr_pair_cursor_append(&cursor, vp);
 
 	MEM(vp = fr_pair_afrom_da(ctx, port_da));
-	vp->vp_short = port;
-	fr_cursor_append(&cursor, vp);
+	vp->vp_uint16 = port;
+	fr_pair_cursor_append(&cursor, vp);
 
 	return out;
 }

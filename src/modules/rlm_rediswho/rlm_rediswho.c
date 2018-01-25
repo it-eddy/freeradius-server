@@ -54,24 +54,24 @@ typedef struct rlm_rediswho {
 } rlm_rediswho_t;
 
 static CONF_PARSER section_config[] = {
-	{ FR_CONF_OFFSET("insert", PW_TYPE_STRING | PW_TYPE_REQUIRED | PW_TYPE_XLAT, rlm_rediswho_t, insert) },
-	{ FR_CONF_OFFSET("trim", PW_TYPE_STRING | PW_TYPE_XLAT, rlm_rediswho_t, trim) }, /* required only if trim_count > 0 */
-	{ FR_CONF_OFFSET("expire", PW_TYPE_STRING | PW_TYPE_REQUIRED | PW_TYPE_XLAT, rlm_rediswho_t, expire) },
+	{ FR_CONF_OFFSET("insert", FR_TYPE_STRING | FR_TYPE_REQUIRED | FR_TYPE_XLAT, rlm_rediswho_t, insert) },
+	{ FR_CONF_OFFSET("trim", FR_TYPE_STRING | FR_TYPE_XLAT, rlm_rediswho_t, trim) }, /* required only if trim_count > 0 */
+	{ FR_CONF_OFFSET("expire", FR_TYPE_STRING | FR_TYPE_REQUIRED | FR_TYPE_XLAT, rlm_rediswho_t, expire) },
 	CONF_PARSER_TERMINATOR
 };
 
 static CONF_PARSER module_config[] = {
 	REDIS_COMMON_CONFIG,
 
-	{ FR_CONF_OFFSET("trim_count", PW_TYPE_SIGNED, rlm_rediswho_t, trim_count), .dflt = "-1" },
+	{ FR_CONF_OFFSET("trim_count", FR_TYPE_INT32, rlm_rediswho_t, trim_count), .dflt = "-1" },
 
 	/*
 	 *	These all smash the same variables, because we don't care about them right now.
 	 *	In 3.1, we should have a way of saying "parse a set of sub-sections according to a template"
 	 */
-	{ FR_CONF_POINTER("Start", PW_TYPE_SUBSECTION, NULL), .subcs = section_config },
-	{ FR_CONF_POINTER("Interim-Update", PW_TYPE_SUBSECTION, NULL), .subcs = section_config },
-	{ FR_CONF_POINTER("Stop", PW_TYPE_SUBSECTION, NULL), .subcs = section_config },
+	{ FR_CONF_POINTER("Start", FR_TYPE_SUBSECTION, NULL), .subcs = section_config },
+	{ FR_CONF_POINTER("Interim-Update", FR_TYPE_SUBSECTION, NULL), .subcs = section_config },
+	{ FR_CONF_POINTER("Stop", FR_TYPE_SUBSECTION, NULL), .subcs = section_config },
 
 	CONF_PARSER_TERMINATOR
 };
@@ -79,7 +79,7 @@ static CONF_PARSER module_config[] = {
 /*
  *	Query the database executing a command with no result rows
  */
-static int rediswho_command(rlm_rediswho_t *inst, REQUEST *request, char const *fmt)
+static int rediswho_command(rlm_rediswho_t const *inst, REQUEST *request, char const *fmt)
 {
 	fr_redis_conn_t		*conn;
 
@@ -146,7 +146,7 @@ static int rediswho_command(rlm_rediswho_t *inst, REQUEST *request, char const *
 	return ret;
 }
 
-static rlm_rcode_t mod_accounting_all(rlm_rediswho_t *inst, REQUEST *request,
+static rlm_rcode_t mod_accounting_all(rlm_rediswho_t const *inst, REQUEST *request,
 				      char const *insert,
 				      char const *trim,
 				      char const *expire)
@@ -165,30 +165,30 @@ static rlm_rcode_t mod_accounting_all(rlm_rediswho_t *inst, REQUEST *request,
 	return RLM_MODULE_OK;
 }
 
-static rlm_rcode_t CC_HINT(nonnull) mod_accounting(void *instance, REQUEST *request)
+static rlm_rcode_t CC_HINT(nonnull) mod_accounting(void *instance, UNUSED void *thread, REQUEST *request)
 {
-	rlm_rediswho_t 	*inst = instance;
-	rlm_rcode_t	rcode;
-	VALUE_PAIR	*vp;
-	fr_dict_enum_t	*dv;
-	CONF_SECTION	*cs;
-	char const	*insert, *trim, *expire;
+	rlm_rediswho_t const	*inst = instance;
+	rlm_rcode_t		rcode;
+	VALUE_PAIR		*vp;
+	fr_dict_enum_t		*dv;
+	CONF_SECTION		*cs;
+	char const		*insert, *trim, *expire;
 
-	vp = fr_pair_find_by_num(request->packet->vps, 0, PW_ACCT_STATUS_TYPE, TAG_ANY);
+	vp = fr_pair_find_by_num(request->packet->vps, 0, FR_ACCT_STATUS_TYPE, TAG_ANY);
 	if (!vp) {
 		RDEBUG("Could not find account status type in packet");
 		return RLM_MODULE_NOOP;
 	}
 
-	dv = fr_dict_enum_by_da(NULL, vp->da, vp->vp_integer);
+	dv = fr_dict_enum_by_value(NULL, vp->da, &vp->data);
 	if (!dv) {
-		RDEBUG("Unknown Acct-Status-Type %u", vp->vp_integer);
+		RDEBUG("Unknown Acct-Status-Type %u", vp->vp_uint32);
 		return RLM_MODULE_NOOP;
 	}
 
-	cs = cf_section_sub_find(inst->cs, dv->name);
+	cs = cf_section_find(inst->cs, dv->alias, NULL);
 	if (!cs) {
-		RDEBUG("No subsection %s", dv->name);
+		RDEBUG("No subsection %s", dv->alias);
 		return RLM_MODULE_NOOP;
 	}
 
@@ -201,7 +201,7 @@ static rlm_rcode_t CC_HINT(nonnull) mod_accounting(void *instance, REQUEST *requ
 	return rcode;
 }
 
-static int mod_bootstrap(CONF_SECTION *conf, void *instance)
+static int mod_bootstrap(void *instance, CONF_SECTION *conf)
 {
 	rlm_rediswho_t *inst = instance;
 
@@ -212,7 +212,7 @@ static int mod_bootstrap(CONF_SECTION *conf, void *instance)
 	return 0;
 }
 
-static int mod_instantiate(CONF_SECTION *conf, void *instance)
+static int mod_instantiate(void *instance, CONF_SECTION *conf)
 {
 	rlm_rediswho_t *inst = instance;
 

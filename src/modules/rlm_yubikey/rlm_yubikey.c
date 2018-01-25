@@ -29,19 +29,19 @@ RCSID("$Id$")
 
 #ifdef HAVE_YKCLIENT
 static const CONF_PARSER validation_config[] = {
-	{ FR_CONF_OFFSET("client_id", PW_TYPE_INTEGER, rlm_yubikey_t, client_id), .dflt = 0 },
-	{ FR_CONF_OFFSET("api_key", PW_TYPE_STRING | PW_TYPE_SECRET, rlm_yubikey_t, api_key) },
+	{ FR_CONF_OFFSET("client_id", FR_TYPE_UINT32, rlm_yubikey_t, client_id), .dflt = 0 },
+	{ FR_CONF_OFFSET("api_key", FR_TYPE_STRING | FR_TYPE_SECRET, rlm_yubikey_t, api_key) },
 	CONF_PARSER_TERMINATOR
 };
 #endif
 
 static const CONF_PARSER module_config[] = {
-	{ FR_CONF_OFFSET("id_length", PW_TYPE_INTEGER, rlm_yubikey_t, id_len), .dflt = "12" },
-	{ FR_CONF_OFFSET("split", PW_TYPE_BOOLEAN, rlm_yubikey_t, split), .dflt = "yes" },
-	{ FR_CONF_OFFSET("decrypt", PW_TYPE_BOOLEAN, rlm_yubikey_t, decrypt), .dflt = "no" },
-	{ FR_CONF_OFFSET("validate", PW_TYPE_BOOLEAN, rlm_yubikey_t, validate), .dflt = "no" },
+	{ FR_CONF_OFFSET("id_length", FR_TYPE_UINT32, rlm_yubikey_t, id_len), .dflt = "12" },
+	{ FR_CONF_OFFSET("split", FR_TYPE_BOOL, rlm_yubikey_t, split), .dflt = "yes" },
+	{ FR_CONF_OFFSET("decrypt", FR_TYPE_BOOL, rlm_yubikey_t, decrypt), .dflt = "no" },
+	{ FR_CONF_OFFSET("validate", FR_TYPE_BOOL, rlm_yubikey_t, validate), .dflt = "no" },
 #ifdef HAVE_YKCLIENT
-	{ FR_CONF_POINTER("validation", PW_TYPE_SUBSECTION, NULL), .subcs = (void const *) validation_config },
+	{ FR_CONF_POINTER("validation", FR_TYPE_SUBSECTION, NULL), .subcs = (void const *) validation_config },
 #endif
 	CONF_PARSER_TERMINATOR
 };
@@ -96,7 +96,7 @@ static ssize_t modhex2hex(char const *modhex, uint8_t *hex, size_t len)
  *
  * Example: "%{modhextohex:vvrbuctetdhc}" == "ffc1e0d3d260"
  */
-static ssize_t modhex_to_hex_xlat(char **out, size_t outlen,
+static ssize_t modhex_to_hex_xlat(UNUSED TALLOC_CTX *ctx, char **out, size_t outlen,
 			  	  UNUSED void const *mod_inst, UNUSED void const *xlat_inst,
 			  	  REQUEST *request, char const *fmt)
 {
@@ -117,7 +117,7 @@ static ssize_t modhex_to_hex_xlat(char **out, size_t outlen,
 }
 
 
-static int mod_bootstrap(CONF_SECTION *conf, void *instance)
+static int mod_bootstrap(void *instance, CONF_SECTION *conf)
 {
 	rlm_yubikey_t *inst = instance;
 
@@ -126,14 +126,14 @@ static int mod_bootstrap(CONF_SECTION *conf, void *instance)
 
 #ifndef HAVE_YUBIKEY
 	if (inst->decrypt) {
-		cf_log_err_cs(conf, "Requires libyubikey for OTP decryption");
+		cf_log_err(conf, "Requires libyubikey for OTP decryption");
 		return -1;
 	}
 #endif
 
 	if (!cf_section_name2(conf)) return 0;
 
-	xlat_register(inst, "modhextohex", modhex_to_hex_xlat, NULL, NULL, 0, XLAT_DEFAULT_BUF_LEN);
+	xlat_register(inst, "modhextohex", modhex_to_hex_xlat, NULL, NULL, 0, XLAT_DEFAULT_BUF_LEN, true);
 
 	return 0;
 }
@@ -148,7 +148,7 @@ static int mod_bootstrap(CONF_SECTION *conf, void *instance)
  *	that must be referenced in later calls, store a handle to it
  *	in *instance otherwise put a null pointer there.
  */
-static int mod_instantiate(CONF_SECTION *conf, void *instance)
+static int mod_instantiate(void *instance, CONF_SECTION *conf)
 {
 	rlm_yubikey_t *inst = instance;
 
@@ -156,9 +156,9 @@ static int mod_instantiate(CONF_SECTION *conf, void *instance)
 #ifdef HAVE_YKCLIENT
 		CONF_SECTION *cs;
 
-		cs = cf_section_sub_find(conf, "validation");
+		cs = cf_section_find(conf, "validation", CF_IDENT_ANY);
 		if (!cs) {
-			cf_log_err_cs(conf, "Missing validation section");
+			cf_log_err(conf, "Missing validation section");
 			return -1;
 		}
 
@@ -166,7 +166,7 @@ static int mod_instantiate(CONF_SECTION *conf, void *instance)
 			return -1;
 		}
 #else
-		cf_log_err_cs(conf, "Requires libykclient for OTP validation against Yubicloud servers");
+		cf_log_err(conf, "Requires libykclient for OTP validation against Yubicloud servers");
 		return -1;
 #endif
 	}
@@ -174,10 +174,6 @@ static int mod_instantiate(CONF_SECTION *conf, void *instance)
 	return 0;
 }
 
-/*
- *	Only free memory we allocated.  The strings allocated via
- *	cf_section_parse() do not need to be freed.
- */
 #ifdef HAVE_YKCLIENT
 static int mod_detach(void *instance)
 {
@@ -186,7 +182,7 @@ static int mod_detach(void *instance)
 }
 #endif
 
-static int CC_HINT(nonnull) otp_string_valid(rlm_yubikey_t *inst, char const *otp, size_t len)
+static int CC_HINT(nonnull) otp_string_valid(rlm_yubikey_t const *inst, char const *otp, size_t len)
 {
 	size_t i;
 
@@ -204,9 +200,9 @@ static int CC_HINT(nonnull) otp_string_valid(rlm_yubikey_t *inst, char const *ot
  *	from the database. The authentication code only needs to check
  *	the password, the rest is done here.
  */
-static rlm_rcode_t CC_HINT(nonnull) mod_authorize(void *instance, REQUEST *request)
+static rlm_rcode_t CC_HINT(nonnull) mod_authorize(void *instance, UNUSED void *thread, REQUEST *request)
 {
-	rlm_yubikey_t *inst = instance;
+	rlm_yubikey_t const *inst = instance;
 
 	fr_dict_enum_t *dval;
 	char const *passcode;
@@ -219,12 +215,12 @@ static rlm_rcode_t CC_HINT(nonnull) mod_authorize(void *instance, REQUEST *reque
 	/*
 	 *	Can't do yubikey auth if there's no password.
 	 */
-	if (!request->password || (request->password->da->attr != PW_USER_PASSWORD)) {
+	if (!request->password || (request->password->da->attr != FR_USER_PASSWORD)) {
 		/*
 		 *	Don't print out debugging messages if we know
 		 *	they're useless.
 		 */
-		if (request->packet->code != PW_CODE_ACCESS_CHALLENGE) {
+		if (request->packet->code != FR_CODE_ACCESS_CHALLENGE) {
 			RDEBUG2("No cleartext password in the request. Can't do Yubikey authentication");
 		}
 
@@ -315,10 +311,10 @@ static rlm_rcode_t CC_HINT(nonnull) mod_authorize(void *instance, REQUEST *reque
 		fr_pair_value_bstrncpy(vp, passcode, inst->id_len);
 	}
 
-	dval = fr_dict_enum_by_name(NULL, fr_dict_attr_by_num(NULL, 0, PW_AUTH_TYPE), inst->name);
+	dval = fr_dict_enum_by_alias(NULL, fr_dict_attr_by_num(NULL, 0, FR_AUTH_TYPE), inst->name);
 	if (dval) {
-		vp = radius_pair_create(request, &request->control, PW_AUTH_TYPE, 0);
-		vp->vp_integer = dval->value;
+		vp = radius_pair_create(request, &request->control, FR_AUTH_TYPE, 0);
+		fr_value_box_copy(NULL, &vp->data, dval->value);
 	}
 
 	return RLM_MODULE_OK;
@@ -328,10 +324,10 @@ static rlm_rcode_t CC_HINT(nonnull) mod_authorize(void *instance, REQUEST *reque
 /*
  *	Authenticate the user with the given password.
  */
-static rlm_rcode_t CC_HINT(nonnull) mod_authenticate(void *instance, REQUEST *request)
+static rlm_rcode_t CC_HINT(nonnull) mod_authenticate(void *instance, UNUSED void *thread, REQUEST *request)
 {
 	rlm_rcode_t rcode = RLM_MODULE_NOOP;
-	rlm_yubikey_t *inst = instance;
+	rlm_yubikey_t const *inst = instance;
 	char const *passcode = NULL;
 	fr_dict_attr_t const *da;
 	VALUE_PAIR const *vp;
@@ -351,7 +347,7 @@ static rlm_rcode_t CC_HINT(nonnull) mod_authenticate(void *instance, REQUEST *re
 		/*
 		 *	Can't do yubikey auth if there's no password.
 		 */
-		if (!request->password || (request->password->da->attr != PW_USER_PASSWORD)) {
+		if (!request->password || (request->password->da->attr != FR_USER_PASSWORD)) {
 			REDEBUG("No User-Password in the request. Can't do Yubikey authentication");
 			return RLM_MODULE_INVALID;
 		}

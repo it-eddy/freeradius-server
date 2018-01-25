@@ -52,7 +52,7 @@ typedef struct rlm_pam_t {
 } rlm_pam_t;
 
 static const CONF_PARSER module_config[] = {
-	{ FR_CONF_OFFSET("pam_auth", PW_TYPE_STRING, rlm_pam_t, pam_auth_name) },
+	{ FR_CONF_OFFSET("pam_auth", FR_TYPE_STRING, rlm_pam_t, pam_auth_name) },
 	CONF_PARSER_TERMINATOR
 };
 
@@ -63,7 +63,7 @@ typedef struct rlm_pam_data_t {
 	bool		error;		//!< True if pam_conv failed.
 } rlm_pam_data_t;
 
-static int mod_instantiate(UNUSED CONF_SECTION *conf, void *instance)
+static int mod_instantiate(void *instance, UNUSED CONF_SECTION *conf)
 {
 	rlm_pam_t *inst = instance;
 
@@ -189,11 +189,11 @@ static int do_pam(REQUEST *request, char const *username, char const *passwd, ch
 	return 0;
 }
 
-static rlm_rcode_t CC_HINT(nonnull) mod_authenticate(void *instance, REQUEST *request)
+static rlm_rcode_t CC_HINT(nonnull) mod_authenticate(void *instance, UNUSED void *thread, REQUEST *request)
 {
-	int ret;
-	VALUE_PAIR *pair;
-	rlm_pam_t *data = (rlm_pam_t *) instance;
+	int		ret;
+	VALUE_PAIR	*pair;
+	rlm_pam_t const	*data = instance;
 
 	char const *pam_auth_string = data->pam_auth_name;
 
@@ -219,7 +219,7 @@ static rlm_rcode_t CC_HINT(nonnull) mod_authenticate(void *instance, REQUEST *re
 	 *  Ensure that we're being passed a plain-text password,
 	 *  and not anything else.
 	 */
-	if (request->password->da->attr != PW_USER_PASSWORD) {
+	if (request->password->da->attr != FR_USER_PASSWORD) {
 		RAUTH("Attribute \"User-Password\" is required for authentication.  Cannot use \"%s\".", request->password->da->name);
 		return RLM_MODULE_INVALID;
 	}
@@ -228,7 +228,7 @@ static rlm_rcode_t CC_HINT(nonnull) mod_authenticate(void *instance, REQUEST *re
 	 *	Let the 'users' file over-ride the PAM auth name string,
 	 *	for backwards compatibility.
 	 */
-	pair = fr_pair_find_by_num(request->control, 0, PW_PAM_AUTH, TAG_ANY);
+	pair = fr_pair_find_by_num(request->control, 0, FR_PAM_AUTH, TAG_ANY);
 	if (pair) pam_auth_string = pair->vp_strvalue;
 
 	ret = do_pam(request, request->username->vp_strvalue, request->password->vp_strvalue, pam_auth_string);

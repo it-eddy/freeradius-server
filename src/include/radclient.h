@@ -41,6 +41,7 @@ extern "C" {
 
 
 #define ERROR(fmt, ...)		if (do_output) fr_perror("radclient: " fmt, ## __VA_ARGS__)
+#define WARN(fmt, ...)		if (do_output) fprintf(stderr, fmt "\n", ## __VA_ARGS__)
 
 #define RDEBUG_ENABLED()	(do_output && (fr_debug_lvl > 0))
 #define RDEBUG_ENABLED2()	(do_output && (fr_debug_lvl > 1))
@@ -79,7 +80,7 @@ struct rc_request {
 	RADIUS_PACKET	*packet;	//!< The outgoing request.
 	RADIUS_PACKET	*reply;		//!< The incoming response.
 	VALUE_PAIR	*filter;	//!< If the reply passes the filter, then the request passes.
-	PW_CODE		filter_code;	//!< Expected code of the response packet.
+	FR_CODE		filter_code;	//!< Expected code of the response packet.
 
 	int		resend;
 	int		tries;
