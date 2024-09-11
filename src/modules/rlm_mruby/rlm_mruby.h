@@ -1,5 +1,6 @@
+#pragma once
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -18,10 +19,12 @@
  * @file rlm_mruby.h
  * @brief Translates requests between the server an an mruby interpreter.
  *
- * @copyright 2016 Herwin Weststrate <freeradius@herwinw.nl>
+ * @copyright 2016 Herwin Weststrate (freeradius@herwinw.nl)
  * @copyright 2016 The FreeRADIUS server project
  */
 
+DIAG_OFF(DIAG_UNKNOWN_PRAGMAS)
+DIAG_OFF(documentation)
 #include <mruby.h>
 #include <mruby/compile.h>
 #include <mruby/array.h>
@@ -29,5 +32,7 @@
 #include <mruby/numeric.h>
 #include <mruby/string.h>
 #include <mruby/variable.h>
+DIAG_ON(documentation)
+DIAG_ON(DIAG_UNKNOWN_PRAGMAS)
 
 struct RClass *mruby_request_class(mrb_state *mrb, struct RClass *parent);

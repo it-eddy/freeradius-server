@@ -1,10 +1,6 @@
 #
-#  PRE: update if
+#  PRE: if return
 #
-update control {
-	Cleartext-Password := 'hello'
-}
-
 if (User-Name == "bob") {
 	ok
 
@@ -13,15 +9,13 @@ if (User-Name == "bob") {
 	#  will prevent the "pap" module from being run
 	#  in the "authorize" section.
 	#
-	update control {
-		Auth-Type := PAP
-	}
+	control.Auth-Type := ::PAP
 
 	#
 	#  Stop processing "authorize", and go to the next section.
 	#
 	return {	# ERROR
-	       ok = 1
+		ok = 1
 	}
 
 	#

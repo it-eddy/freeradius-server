@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
@@ -20,19 +21,15 @@
  * @brief Function prototypes and datatypes used in the module.
  * @file mod.h
  *
- * @author Aaron Hurt <ahurt@anbcs.com>
+ * @author Aaron Hurt (ahurt@anbcs.com)
  * @copyright 2013-2014 The FreeRADIUS Server Project.
  */
-
-#ifndef _mod_h_
-#define _mod_h_
-
 RCSIDH(mod_h, "$Id$")
 
-#include <freeradius-devel/radiusd.h>
-#include <freeradius-devel/pool.h>
-#include <libcouchbase/couchbase.h>
-#include "../rlm_json/json.h"
+#include <freeradius-devel/server/base.h>
+#include <freeradius-devel/server/pool.h>
+
+#include <freeradius-devel/json/base.h>
 
 /* maximum size of a stored value */
 #define MAX_VALUE_SIZE 20480
@@ -44,23 +41,26 @@ RCSIDH(mod_h, "$Id$")
  *
  * This struct contains the core module configuration.
  */
-typedef struct rlm_couchbase_t {
-	vp_tmpl_t		*acct_key;		//!< Accounting document key.
+typedef struct {
+	tmpl_t		*acct_key;		//!< Accounting document key.
 	char const		*doctype;		//!< Value of accounting 'docType' element name.
 	uint32_t		expire;			//!< Accounting document expire time in seconds.
 
 	char const		*server_raw;     	//!< Raw server string before parsing.
 	char const		*server;         	//!< Couchbase server list.
 	char const		*bucket;         	//!< Couchbase bucket.
+	char const		*username;       	//!< Couchbase bucket username.
 	char const		*password;       	//!< Couchbase bucket password.
 
-	vp_tmpl_t		*user_key;       	//!< User document key.
+	tmpl_t		*user_key;       	//!< User document key.
 
 	bool			read_clients;		//!< Toggle for loading client records.
 	const char		*client_view;    	//!< Couchbase view that returns client documents.
 
 	json_object		*map;           	//!< Json object to hold user defined attribute map.
-	fr_pool_t	*pool;			//!< Connection pool.
+	fr_pool_t		*pool;			//!< Connection pool.
+	char const		*name;			//!< Module instance name.
+	void			*api_opts;		//!< Couchbase API internal options.
 } rlm_couchbase_t;
 
 /** Couchbase instance specific information
@@ -68,28 +68,31 @@ typedef struct rlm_couchbase_t {
  * This struct contains the Couchbase connection handle as well as a
  * cookie pointer to store fetched document payloads.
  */
-typedef struct rlm_couchbase_handle_t {
+typedef struct {
 	void *handle;    //!< Real couchbase instance.
 	void *cookie;    //!< Couchbase cookie (@p cookie_u @p cookie_t).
 } rlm_couchbase_handle_t;
 
 /* define functions */
-void *mod_conn_create(TALLOC_CTX *ctx, void *instance, struct timeval const *timeout);
+void *mod_conn_create(TALLOC_CTX *ctx, UNUSED void *instance, fr_time_delta_t timeout);
 
-int mod_conn_alive(UNUSED void *instance, void *handle);
+int mod_conn_alive(void *opaque, void *connection);
 
-int mod_build_attribute_element_map(CONF_SECTION *conf, void *instance);
+int mod_build_attribute_element_map(CONF_SECTION *conf, rlm_couchbase_t *inst);
 
 int mod_attribute_to_element(const char *name, json_object *map, void *buf);
 
-void *mod_json_object_to_value_pairs(json_object *json, const char *section, REQUEST *request);
+int mod_json_object_to_map(TALLOC_CTX *ctx, fr_dcursor_t *out, request_t *request, json_object *json, tmpl_pair_list_t list);
 
-json_object *mod_value_pair_to_json_object(REQUEST *request, VALUE_PAIR *vp);
+json_object *mod_value_pair_to_json_object(request_t *request, fr_pair_t *vp);
 
-int mod_ensure_start_timestamp(json_object *json, VALUE_PAIR *vps);
+int mod_ensure_start_timestamp(json_object *json, fr_pair_list_t *vps);
 
 int mod_client_map_section(CONF_SECTION *client, CONF_SECTION const *map, json_object *json, char const *docid);
 
 int mod_load_client_documents(rlm_couchbase_t *inst, CONF_SECTION *tmpl, CONF_SECTION *map);
 
-#endif /* _mod_h_ */
+int mod_build_api_opts(CONF_SECTION *conf, rlm_couchbase_t *inst);
+
+int mod_free_api_opts(rlm_couchbase_t *inst);
+

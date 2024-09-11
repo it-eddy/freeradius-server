@@ -1,266 +1,401 @@
-# -*- text -*-
+#  -*- text -*-
 ######################################################################
 #
-#	As of version 4.0.0, the server also supports the TACACS+
-#	protocol.
+#######################################################################
+#
+#  = The tacacs Virtual Server
+#
+#  The `tacacs` virtual server processes TACACS+ packets.
+#
+#	https://www.rfc-editor.org/rfc/rfc8907
 #
 #	$Id$
 #
 ######################################################################
 
+#
+#  ## The Virtual Server
+#
+#  This is the `tacacs` virtual server.
+#
 server tacacs {
+	#
+	#  namespace:: Needs to be "tacacs" for TACACS+ functionality.
+	#
 	namespace = tacacs
 
+	#
+	#  ### TACACS+ Configuration
+	#
+	#  All of the configuration for processing TACACS+ packets goes here.
+	#
+	tacacs {
+		#
+		#  #### Authentication subsection
+		#
+		#  This section contains configuration which is
+		#  specific to processing `Authentication` packets.
+		#
+		#  Similar sections can be added, but are not
+		#  necessary for Accounting-Request (and other)
+		#  packets.  At this time, there is no configuration
+		#  needed for other packet types.
+		#
+		Authentication {
+			#
+			#  session:: Controls how ongoing
+			#  (multi-round) sessions are handled
+			#
+			#  This section is only useful for ASCII authentications.
+			#  It is the only authentication type which supports
+			#  sending challenges for further data.
+			#
+			session {
+				#
+				#  max:: The maximum number of concurrent ongoing sessions
+				#
+#				max = 4096
+
+				#
+				#  max_rounds: The maximum number of round trips which are allowed
+				#
+				#  This is only enforced for `Authentication-Type = ASCII`, when
+				#  the server replies with `GetUser` or `GetPass` or `GetData`.
+				#
+				#  Some broken clients will send packets in a loop, forever.
+				#  This configuration helps to catch and prevent that.
+				#
+				max_rounds = 4
+
+				#
+				#  timeout:: How long to wait before expiring a
+				#  session.
+				#
+				#  The timer starts when a response
+				#  with a state value is sent.  The
+				#  timer stops when a request
+				#  containing the previously sent
+				#  state value is received.
+				#
+#				timeout = 15
+			}
+		}
+
+		#
+		#  There is currently no configuration for other packet types.
+		#
+	}
+
 	listen {
-		ipaddr = *
+		#
+		#  type:: The type of packet to accept.
+		#
+		#  Multiple types can be accepted by using multiple
+		#  lines of `type = ...`.
+		#
+		#  As described in RFC 8907, the packet types are:
+		#
+		type = Authentication-Start
+		type = Authentication-Continue
+		type = Authorization-Request
+		type = Accounting-Request
+
+		#
+		#  transport:: The transport protocol.
+		#
+		#  Only `tcp` is allowed.  TACACS+ does not use UDP or TLS.
+		#
 		transport = tcp
 
+		#
+		#  ## Protocols
+		#
+		#  tcp { ... }:: TCP is configured here.
+		#
 		tcp {
-			#  Port on which to listen.
-			#  Allowed values are:
-			#	integer port number
-			#	49 is the default TACACS+ port.
+			#
+			#  NOTE: Don't change anything if you are not sure.
+			#
+
+			#
+			#  port:: The port where we accept packets.
+			#
+			#  The port should be 49 for a production network.
+			#
 			port = 49
 
-			#  Type of packets to listen for.  Here, it is TACACS+.
-			type = tacacs
+			#
+			#  ipaddr:: The IP address where we accept packets.
+			#
+			ipaddr = *
 
-			#  Some systems support binding to an interface, in addition
-			#  to the IP address.  This feature isn't strictly necessary,
-			#  but for sites with many IP addresses on one interface,
-			#  it's useful to say "listen on all addresses for
-			#  eth0".
 			#
-			#  If your system does not support this feature, you will
-			#  get an error if you try to use it.
+			#  interface:: Interface to bind to.
 			#
-			#	interface = eth0
+#			interface = eth0
+
+			#
+			#  max_packet_size:: Our max packet size. may be different from the parent.
+			#
+#			max_packet_size = 4096
+
+			#
+			#  recv_buff:: How big the kernel's receive buffer should be.
+			#
+#			recv_buff = 1048576
+
+			#
+			#  send_buff:: How big the kernel's send buffer should be.
+			#
+#			send_buff = 1048576
+
+			#
+			#  src_ipaddr:: IP we open our socket on.
+			#
+#			src_ipaddr = ""
 		}
 
-		type = Authentication
-		type = Authorization
+		#
+		#  limit:: limits for this socket.
+		#
+		#  The `limit` section contains configuration items
+		#  which enforce various limits on the socket.  These
+		#  limits are usually transport-specific.
+		#
+		#  Limits are used to prevent "run-away" problems.
+		#
+		limit {
+			#
+			#  max_connections:: The maximum number of
+			#  connected sockets which will be accepted
+			#  for this listener.
+			#
+			#  Each connection opens a new socket, so be
+			#  aware of system file descriptor
+			#  limitations.
+			#
+			#  If the listeners do not use connected
+			#  sockets (e.g. TCP), then this configuration
+			#  item is ignored.
+			#
+			max_connections = 256
+
+			#
+			#  idle_timeout:: Time after which idle
+			#  connections are deleted.
+			#
+			#  Useful range of values: 5 to 600
+			#
+			idle_timeout = 60.0
+		}
 	}
 
 	#
-	#  This section is called when it receives an Authentication.
+	#  ## Clients
 	#
-	recv Authentication {
-		if (&TACACS-Sequence-Number > 1) {
-			update request {
-				TACACS-Authentication-Type = &session-state:TACACS-Authentication-Type
-			}
-		}
+	#  A virtual server can have multiple `client` definitions.  These clients take priority
+	#  over  the global `client` definitions.
+	#
+	#  See the main `clients.conf` file for documentation on the `client` section.
+	#
+	client tacacs {
+		ipaddr = 127.0.0.1
 
-		# draft-ietf-opsawg-tacacs section 4.4.2
-		switch &TACACS-Authentication-Type {
-			# ASCII is very generic and driven via unlang so go wild!
-			case "ASCII" {
-				if (&TACACS-Sequence-Number == 1) {
-					update request {
-						&User-Name = &TACACS-User-Name
-					}
-				} else {
-					update request {
-						User-Name = &session-state:User-Name
-						User-Password = &session-state:User-Password
-					}
-				}
+		#
+		#  This has to be specified for all TACACS+ clients.
+		#
+		#  There is no standard for TACACS+ over UDP.
+		#
+		proto = tcp
 
-				if (!&User-Name) {
-					if (&TACACS-User-Message) {
-						update request {
-							&User-Name = &TACACS-User-Message
-							&TACACS-User-Message !* "*"
-						}
-					} else {
-						update reply {
-							TACACS-Authentication-Status = Get-User
-							TACACS-Server-Message = "username: "
-						}
-						handled
-					}
-				}
-				if (!&User-Password) {
-					if (&TACACS-User-Message) {
-						update request {
-							&User-Password = &TACACS-User-Message
-							&TACACS-User-Message !* "*"
-						}
-					} else {
-						update reply {
-							TACACS-Authentication-Status = Get-Pass
-							TACACS-Server-Message = "password: "
-						}
-						handled
-					}
-				}
-				#if (&User-Name && &User-Password) {
-				#	if (!&TACACS-User-Message) {
-				#		update reply {
-				#			TACACS-Authentication-Status = Get-Data
-				#			TACACS-Authentication-Flags = No-Echo
-				#			TACACS-Server-Message = "pin: "
-				#		}
-				#		handled
-				#	}
-				#	if (&TACACS-User-Message != "1234") {
-				#		reject
-				#	}
-				#}
-			}
-			case "PAP" {
-				if (&TACACS-Sequence-Number == 1) {
-					if (!&TACACS-User-Name) {
-						update reply {
-							&TACACS-Server-Message = "missing User-Name field"
-						}
-						invalid
-					}
+		#
+		#  The TACACS+ key, or secret.  If a secret is defined, then
+		#  it will be used.  All packets coming from this client MUST be
+		#  encrypted with the shared secret.
+		#
+		#  The `secret` configuration item can be omitted or deleted,
+		#  in which case all of the information (including passwords)
+		#  are sent over the network in the clear.  This practice is
+		#  not recommended.
+		#
+		secret = testing123
+	}
 
-					update request {
-						&User-Name = &TACACS-User-Name
-						&User-Password = &TACACS-Data
-					}
-				} else {
-					update request {
-						User-Name = &session-state:User-Name
-					}
-				}
+	#
+	#  ## Authentication-Start
+	#
 
-				if (!&User-Password) {
-					if (&TACACS-User-Message) {
-						update request {
-							&User-Password = &TACACS-User-Message
-						}
-					} else {
-						update reply {
-							TACACS-Authentication-Status = Get-Pass
-							TACACS-Server-Message = "password: "
-						}
-						handled
-					}
-				}
-			}
-			case "CHAP" {
-				if (&TACACS-Sequence-Number > 1) {
-					invalid
-				}
+	#
+	#  ### Recv
+	#
+	recv Authentication-Start {
+		-sql
 
-				if (&TACACS-User-Name && &TACACS-Data =~ /^(.)(.{16})(.{16})$/) {
-					update request {
-						&User-Name = &TACACS-User-Name
-						&CHAP-Challenge = "%{2}"
-						&CHAP-Password = "%{1}%{3}"
-					}
-				} else {
-					update reply {
-						&TACACS-Server-Message = "missing User-Name and/or Data fields"
-					}
-					invalid
-				}
-			}
-			case "MSCHAP" {		# UNTESTED
-				if (&TACACS-Sequence-Number > 1) {
-					invalid
-				}
+		#
+		#  In general, it is not necessary to set `Auth-Type` here.  The packet header
+		#  contains a TACACS `Authentication-Type` with value `PAP`, `CHAP`, etc.  That value will
+		#  be used automatically.
+		#
+		#  The only reason to set `Auth-Type` here is when you want to use a custom
+		#  authentication method, such as `ldap`.
+		#
+	}
 
-				if (&TACACS-User-Name && &TACACS-Data =~ /^(.)(.{8})(.{50})$/) {
-					update request {
-						&User-Name = &TACACS-User-Name
-						&MS-CHAP-Challenge = "%{2}"
-						&MS-CHAP-Response = "%{1}%{3}"
-					}
-				} else {
-					update reply {
-						&TACACS-Server-Message = "missing User-Name and/or Data fields"
-					}
-					invalid
-				}
-			}
-			case "MSCHAPv2" {	# UNTESTED
-				if (&TACACS-Sequence-Number > 1) {
-					invalid
-				}
-
-				if (&TACACS-User-Name && &TACACS-Data =~ /^(.)(.{16})(.{50})$/) {
-					update request {
-						&User-Name = &TACACS-User-Name
-						&MS-CHAP-Challenge = "%{2}"
-						&MS-CHAP2-Response = "%{1}%{3}"
-					}
-				} else {
-					update reply {
-						&TACACS-Server-Message = "missing User-Name and/or Data fields"
-					}
-					invalid
-				}
-			}
-			case {
-				update reply {
-					&TACACS-Server-Message = "unsupported authentication type"
-				}
-				invalid
-			}
-		}
-
-		files
-
-		mschap
-
-		chap
-
+	authenticate PAP {
 		pap
-	}
-
-	#
-	#  This section is called when it sends an Authentication.
-	#
-	send Authentication {
-		switch &TACACS-Authentication-Type {
-			case "ASCII" {
-				update session-state {
-					&TACACS-Authentication-Type := &TACACS-Authentication-Type
-					&User-Name := &User-Name
-					&User-Password := &User-Password
-				}
-			}
-			case {
-				update reply {
-					&reply:TACACS-Server-Message = &reply:Reply-Message
-				}
-			}
-		}
-	}
-
-	recv Authorization {
-		update config {
-			&Auth-Type = Accept
-		}
-	}
-
-	send Authorization {
-	}
-
-	recv Accounting-Request {
-		update config {
-			&Auth-Type = Accept
-		}
-	}
-
-	send Accounting-Response {
-	}
-
-	# Proxying of TACACS+ requests is NOT supported.
-
-	authenticate MSCHAP {
-		mschap
 	}
 
 	authenticate CHAP {
 		chap
 	}
 
-	authenticate PAP {
+	authenticate MSCHAP {
+		mschap
+	}
+
+	authenticate MSCHAPv2 {
+		mschap
+	}
+
+	#
+	#  The automatic state machine will ensure that both User-Name
+	#  and User-Password have been provided by this point making
+	#  ASCII authentication equivalent to PAP.
+	#
+	#  Alternatively, if extra data is required, set
+	#  &reply.Authentication-Status := Getdata
+	#  to request the extra data, which will be in &User-Message in
+	#  the next packet (if the client provides it)
+	#
+	authenticate ASCII {
 		pap
 	}
+
+	#
+	#  ### Send
+	#
+	send Authentication-Pass {
+		&reply.Server-Message := "Hello %{User-Name}"
+
+		#
+		#  Call an instance of `linelog` to log the authentication success
+		#  - equivalent to the previous log `auth = yes` option in v3.
+		#  See `mods-enabled/linelog` for message formats and destinations.
+		#
+#		log_auth_authentication_pass
+	}
+
+	send Authentication-Fail {
+		&reply.Server-Message := "Failed login!"
+
+		#
+		#  Call an instance of `linelog` to log the authentication failure
+		#  - equivalent to the previous log `auth = yes` option in v3.
+		#  See `mods-enabled/linelog` for message formats and destinations.
+		#
+#		log_auth_authentication_fail
+	}
+
+	#
+	#  With ASCII methods, GetUser and GetPass typically send a prompt
+	#  for the client to present to the user.
+	#
+	send Authentication-GetUser {
+		&reply.Server-Message := "Username:"
+	}
+
+	send Authentication-GetPass {
+		&reply.Server-Message := "Password:"
+	}
+
+	#
+	#  ## Authentication-Continue
+	#
+	#  This should handle ASCII methods as PAP with challenge-response.
+	#
+
+	#
+	#  ### Recv
+	#
+	recv Authentication-Continue {
+		#
+		#	https://tools.ietf.org/id/draft-ietf-opsawg-07.html#rfc.section.4.3
+		#
+		"%{Authentication-Continue-Flags}"
+		"%{User-Message}"
+		"%{Data}"
+	}
+
+	#
+	#	## Authorization
+	#
+
+	#
+	#	### Recv
+	#
+	recv Authorization-Request {
+		"%{Authentication-Method}"
+		"%{Privilege-Level}"
+		"%{Authentication-Type}"
+		"%{Authentication-Service}"
+		"%{User-Name}"
+		"%{Client-Port}"
+		"%{Remote-Address}"
+		"%{Argument-List}"
+	}
+
+	#
+	#	### Send
+	#
+	send Authorization-Pass-Add {
+		&reply.Authorization-Status := Pass-Add
+		&reply.Server-Message := "authorization-response-server"
+		&reply.Data := "authorization-response-data"
+		&reply.Argument-List := "key1=var1"
+	}
+
+	#
+	#	## Accounting
+	#
+
+	#
+	#	### Recv
+	#
+	recv Accounting-Request {
+		#
+		#  Create a 'detail'ed log of the packets.
+		#
+		detail
+	}
+
+	#  First packet for a session
+	accounting Start {
+	}
+
+	#  Updates a previous start
+	accounting Watchdog-Update {
+	}
+
+	#  Updates a session
+	accounting Watchdog {
+	}
+
+	#  Stops a session
+	accounting Stop {
+	}
+
+	#
+	#	### Send
+	#
+	send Accounting-Success {
+		&reply.Server-Message := "Success"
+	}
+
+	send Accounting-Error {
+		&reply.Server-Message := "Error"
+	}
+
+	#
+	#	NOTE: Proxying of TACACS+ requests is NOT supported.
+	#
 }

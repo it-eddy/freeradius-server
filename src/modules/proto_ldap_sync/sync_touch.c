@@ -23,8 +23,12 @@
  *
  * @copyright 2017 Arran Cudbard-Bell (a.cudbardb@freeradius.org)
  */
-#include <freeradius-devel/ldap/libfreeradius-ldap.h>
-#include <freeradius-devel/rad_assert.h>
+RCSID("$Id$")
+
+USES_APPLE_DEPRECATED_API
+
+#include <freeradius-devel/ldap/base.h>
+#include <freeradius-devel/util/debug.h>
 
 typedef struct {
 	uint64_t	id;		//!< Bitfield ID.
@@ -46,38 +50,35 @@ int main(int argc, char **argv)
 	int			ret;
 	int			sockfd;
 
-	fr_log_fp = stderr;
-
 	conf = talloc_zero(NULL, sync_touch_conf_t);
 	conf->proto = IPPROTO_UDP;
 	conf->dict_dir = DICTDIR;
-	conf->radius_dir = RADDBDIR;
+	conf->raddb_dir = RADDBDIR;
 	conf->secret = talloc_strdup(conf, "testing123");
-	conf->timeout.tv_sec = 3;
+	conf->timeout = fr_time_delta_from_sec(3);
 	conf->retries = 5;
 
 #ifndef NDEBUG
-	if (fr_fault_setup(getenv("PANIC_ACTION"), argv[0]) < 0) {
+	if (fr_fault_setup(autofree, getenv("PANIC_ACTION"), argv[0]) < 0) {
 		fr_perror("sync_touch");
-		exit(EXIT_FAILURE);
+		fr_exit_now(EXIT_FAILURE);
 	}
 #endif
 
 	talloc_set_log_stderr();
 
-	while ((c = getopt(argc, argv, "46c:d:D:f:Fhi:l:n:p:qr:sS:t:vx")) != EOF) switch (c) {
-
+	while ((c = getopt(argc, argv, "46c:d:D:f:Fhi:l:n:p:qr:sS:t:vx")) != -1) switch (c) {
 		case 'S':
 		{
 			char *p;
 			fp = fopen(optarg, "r");
 			if (!fp) {
 			       ERROR("Error opening %s: %s", optarg, fr_syserror(errno));
-			       exit(EXIT_FAILURE);
+			       fr_exit_now(EXIT_FAILURE);
 			}
 			if (fgets(filesecret, sizeof(filesecret), fp) == NULL) {
 			       ERROR("Error reading %s: %s", optarg, fr_syserror(errno));
-			       exit(EXIT_FAILURE);
+			       fr_exit_now(EXIT_FAILURE);
 			}
 			fclose(fp);
 
@@ -91,7 +92,7 @@ int main(int argc, char **argv)
 
 			if (strlen(filesecret) < 2) {
 			       ERROR("Secret in %s is too short", optarg);
-			       exit(EXIT_FAILURE);
+			       fr_exit_now(EXIT_FAILURE);
 			}
 			talloc_free(conf->secret);
 			conf->secret = talloc_strdup(conf, filesecret);
@@ -99,15 +100,15 @@ int main(int argc, char **argv)
 		       break;
 
 		case 't':
-			if (fr_timeval_from_str(&conf->timeout, optarg) < 0) {
+			if (fr_time_delta_from_str(&conf->timeout, optarg, strlen(optarg), FR_TIME_RES_SEC) < 0) {
 				PERROR("Failed parsing timeout value");
-				exit(EXIT_FAILURE);
+				fr_exit_now(EXIT_FAILURE);
 			}
 			break;
 
 		case 'v':
 			DEBUG("%s", sync_touch_version);
-			exit(0);
+			fr_exit_now(0);
 
 		case 'x':
 			fr_debug_lvl++;
@@ -129,23 +130,24 @@ int main(int argc, char **argv)
 	 */
 	if (fr_check_lib_magic(RADIUSD_MAGIC_NUMBER) < 0) {
 		fr_perror("sync_touch");
-		return EXIT_FAILURE;
+		fr_exit_now(EXIT_FAILURE);
 	}
 
-	if (fr_dict_from_file(conf, &conf->dict, conf->dict_dir, FR_DICTIONARY_FILE, "radius") < 0) {
+	if (!fr_dict_global_ctx_init(NULL, true, dict_dir)) {
 		fr_perror("sync_touch");
-		return EXIT_FAILURE;
+		fr_exit_now(EXIT_FAILURE);
 	}
 
-	if (fr_dict_read(conf->dict, conf->radius_dir, FR_DICTIONARY_FILE) == -1) {
-		fr_log_perror(&default_log, L_ERR, "Failed to initialize the dictionaries");
-		return EXIT_FAILURE;
+	if (fr_dict_internal_afrom_file(&conf->dict, FR_DICTIONARY_FILE, __FILE__) < 0) {
+		fr_perror("sync_touch");
+		fr_exit_now(EXIT_FAILURE);
 	}
-	fr_strerror();	/* Clear the error buffer */
 
-	if (fr_log_fp) setvbuf(fr_log_fp, NULL, _IONBF, 0);
-
-
+	if (fr_dict_read(dict_freeradius, conf->raddb_dir, FR_DICTIONARY_FILE) == -1) {
+		fr_perror("sync_touch");
+		fr_exit_now(EXIT_FAILURE);
+	}
+	fr_strerror_clear();	/* Clear the error buffer */
 
 	fr_set_signal(SIGPIPE, rs_signal_stop);
 	fr_set_signal(SIGINT, rs_signal_stop);
@@ -159,8 +161,6 @@ int main(int argc, char **argv)
 	DEBUG("Read loop done");
 
 finish:
-	if (fr_log_fp) fflush(fr_log_fp);
-
 	/*
 	 *	Everything should be parented from conf
 	 */

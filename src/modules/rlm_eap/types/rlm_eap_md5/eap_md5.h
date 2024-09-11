@@ -1,9 +1,7 @@
-#ifndef _EAP_MD5_H
-#define _EAP_MD5_H
-
+#pragma once
 RCSIDH(eap_md5_h, "$Id$")
 
-#include "eap.h"
+#include <freeradius-devel/eap/base.h>
 
 #define FR_MD5_CHALLENGE	1
 #define FR_MD5_RESPONSE		2
@@ -25,7 +23,7 @@ RCSIDH(eap_md5_h, "$Id$")
  */
 
 /* eap packet structure */
-typedef struct md5_packet_t {
+typedef struct {
 /*
 	uint8_t	code;
 	uint8_t	id;
@@ -35,7 +33,7 @@ typedef struct md5_packet_t {
 	uint8_t	value_name[1];
 } md5_packet_t;
 
-typedef struct md5_packet {
+typedef struct {
 	unsigned char	code;
 	unsigned char	id;
 	unsigned short	length;
@@ -47,6 +45,5 @@ typedef struct md5_packet {
 /* function declarations here */
 
 int 		eap_md5_compose(eap_round_t *auth, MD5_PACKET *reply);
-MD5_PACKET 	*eap_md5_extract(eap_round_t *auth);
-int 		eap_md5_verify(MD5_PACKET *pkt, VALUE_PAIR* pwd, uint8_t *ch);
-#endif /*_EAP_MD5_H*/
+MD5_PACKET 	*eap_md5_extract(request_t *request, eap_round_t *auth);
+int 		eap_md5_verify(request_t *request, MD5_PACKET *pkt, fr_pair_t* pwd, uint8_t *ch);

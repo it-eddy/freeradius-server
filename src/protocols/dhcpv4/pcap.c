@@ -21,12 +21,12 @@
  * @brief Alternative mechanism to send/recv DHCP packets using libpcap.
  *
  * @copyright 2008,2017 The FreeRADIUS server project
- * @copyright 2008 Alan DeKok <aland@deployingradius.com>
+ * @copyright 2008 Alan DeKok (aland@deployingradius.com)
  */
 
-#ifdef HAVE_PCAP_H
-#include <freeradius-devel/pcap.h>
-#include <freeradius-devel/dhcpv4/dhcpv4.h>
+#ifdef HAVE_LIBPCAP
+#include <freeradius-devel/util/pcap.h>
+#include "dhcpv4.h"
 
 /** Send DHCP packet using PCAP
  *
@@ -37,7 +37,7 @@
  *	- -1 on failure.
  *	- 0 on success.
  */
-int fr_dhcpv4_pcap_send(fr_pcap_t *pcap, uint8_t *dst_ether_addr, RADIUS_PACKET *packet)
+int fr_dhcpv4_pcap_send(fr_pcap_t *pcap, uint8_t *dst_ether_addr, fr_packet_t *packet)
 {
 	int			ret;
 	uint8_t			dhcp_packet[1518] = { 0 };
@@ -51,8 +51,8 @@ int fr_dhcpv4_pcap_send(fr_pcap_t *pcap, uint8_t *dst_ether_addr, RADIUS_PACKET 
 
 	/* fill in Ethernet layer (L2) */
 	eth_hdr = (ethernet_header_t *)dhcp_packet;
-	memcpy(eth_hdr->ether_dst, dst_ether_addr, ETH_ADDR_LEN);
-	memcpy(eth_hdr->ether_src, pcap->ether_addr, ETH_ADDR_LEN);
+	memcpy(eth_hdr->src_addr, pcap->ether_addr, ETH_ADDR_LEN);
+	memcpy(eth_hdr->dst_addr, dst_ether_addr, ETH_ADDR_LEN);
 	eth_hdr->ether_type = htons(ETH_TYPE_IP);
 	end += ETH_ADDR_LEN + ETH_ADDR_LEN + sizeof(eth_hdr->ether_type);
 
@@ -67,8 +67,8 @@ int fr_dhcpv4_pcap_send(fr_pcap_t *pcap, uint8_t *dst_ether_addr, RADIUS_PACKET 
 	ip_hdr->ip_p = 17;
 	ip_hdr->ip_sum = 0; /* Filled later */
 
-	ip_hdr->ip_src.s_addr = packet->src_ipaddr.addr.v4.s_addr;
-	ip_hdr->ip_dst.s_addr = packet->dst_ipaddr.addr.v4.s_addr;
+	ip_hdr->ip_src.s_addr = packet->socket.inet.src_ipaddr.addr.v4.s_addr;
+	ip_hdr->ip_dst.s_addr = packet->socket.inet.dst_ipaddr.addr.v4.s_addr;
 
 	/* IP header checksum */
 	ip_hdr->ip_sum = fr_ip_header_checksum((uint8_t const *)ip_hdr, 5);
@@ -77,8 +77,8 @@ int fr_dhcpv4_pcap_send(fr_pcap_t *pcap, uint8_t *dst_ether_addr, RADIUS_PACKET 
 	/* fill in UDP layer (L4) */
 	udp_hdr = (udp_header_t *)end;
 
-	udp_hdr->src = htons(packet->src_port);
-	udp_hdr->dst = htons(packet->dst_port);
+	udp_hdr->src = htons(packet->socket.inet.src_port);
+	udp_hdr->dst = htons(packet->socket.inet.dst_port);
 	l4_len = (UDP_HDR_SIZE + packet->data_len);
 	udp_hdr->len = htons(l4_len);
 	udp_hdr->checksum = 0; /* UDP checksum will be done after dhcp header */
@@ -90,9 +90,9 @@ int fr_dhcpv4_pcap_send(fr_pcap_t *pcap, uint8_t *dst_ether_addr, RADIUS_PACKET 
 	memcpy(dhcp, packet->data, packet->data_len);
 
 	/* UDP checksum is done here */
-	udp_hdr->checksum = fr_udp_checksum((uint8_t const *)udp_hdr, ntohs(udp_hdr->len), udp_hdr->checksum,
-					    packet->src_ipaddr.addr.v4,
-					    packet->dst_ipaddr.addr.v4);
+	udp_hdr->checksum = fr_udp_checksum((uint8_t const *)udp_hdr, l4_len, udp_hdr->checksum,
+					    packet->socket.inet.src_ipaddr.addr.v4,
+					    packet->socket.inet.dst_ipaddr.addr.v4);
 
 	ret = pcap_inject(pcap->handle, dhcp_packet, (end - dhcp_packet + packet->data_len));
 	if (ret < 0) {
@@ -107,10 +107,10 @@ int fr_dhcpv4_pcap_send(fr_pcap_t *pcap, uint8_t *dst_ether_addr, RADIUS_PACKET 
  *
  * @param pcap handle
  * @return
- *	- pointer to RADIUS_PACKET if successful.
+ *	- pointer to fr_packet_t if successful.
  *	- NULL if failed.
  */
-RADIUS_PACKET *fr_dhcpv4_pcap_recv(fr_pcap_t *pcap)
+fr_packet_t *fr_dhcpv4_pcap_recv(fr_pcap_t *pcap)
 {
 	int			ret;
 
@@ -120,7 +120,7 @@ RADIUS_PACKET *fr_dhcpv4_pcap_recv(fr_pcap_t *pcap)
 	uint16_t		src_port, dst_port;
 	struct pcap_pkthdr	*header;
 	ssize_t			link_len, len;
-	RADIUS_PACKET		*packet;
+	fr_packet_t		*packet;
 
 	/*
 	 *	Pointers into the packet data we just received
@@ -133,7 +133,7 @@ RADIUS_PACKET *fr_dhcpv4_pcap_recv(fr_pcap_t *pcap)
 
 	ret = pcap_next_ex(pcap->handle, &header, &data);
 	if (ret == 0) {
-		fr_strerror_printf("No packet received from libpcap");
+		fr_strerror_const("No packet received from libpcap");
 		return NULL; /* no packet */
 	}
 	if (ret < 0) {
@@ -141,9 +141,9 @@ RADIUS_PACKET *fr_dhcpv4_pcap_recv(fr_pcap_t *pcap)
 		return NULL;
 	}
 
-	link_len = fr_link_layer_offset(data, header->caplen, pcap->link_layer);
+	link_len = fr_pcap_link_layer_offset(data, header->caplen, pcap->link_layer);
 	if (link_len < 0) {
-		fr_strerror_printf_push("Failed determining link layer header offset");
+		fr_strerror_const_push("Failed determining link layer header offset");
 		return NULL;
 	}
 
@@ -161,7 +161,7 @@ RADIUS_PACKET *fr_dhcpv4_pcap_recv(fr_pcap_t *pcap)
 		break;
 
 	case 6:
-		fr_strerror_printf("IPv6 packets not supported by DHCPv4");
+		fr_strerror_const("IPv6 packets not supported by DHCPv4");
 		return NULL;
 
 	default:
@@ -188,6 +188,7 @@ RADIUS_PACKET *fr_dhcpv4_pcap_recv(fr_pcap_t *pcap)
 	/*
 	 *	UDP header validation.
 	 */
+	/* coverity[tainted_data] */
 	ret = fr_udp_header_check(p, (header->caplen - (p - data)), ip);
 	if (ret < 0) return NULL;
 
@@ -208,14 +209,21 @@ RADIUS_PACKET *fr_dhcpv4_pcap_recv(fr_pcap_t *pcap)
 	dst_ipaddr.prefix = 32;
 	dst_ipaddr.scope_id = 0;
 
-	packet = fr_dhcpv4_packet_ok(p, data_len, src_ipaddr, src_port, dst_ipaddr, dst_port);
-	if (packet) {
-		packet->data = talloc_memdup(packet, p, packet->data_len);
-		packet->timestamp = header->ts;
-		packet->if_index = pcap->if_index;
-		return packet;
-	}
+	if (!fr_dhcpv4_ok(p, data_len, NULL, NULL)) return NULL;
 
-	return NULL;
+	packet = fr_dhcpv4_packet_alloc(p, data_len);
+	if (!packet) return NULL;
+
+	packet->socket.inet.dst_port = dst_port;
+	packet->socket.inet.src_port = src_port;
+
+	packet->socket.inet.src_ipaddr = src_ipaddr;
+	packet->socket.inet.dst_ipaddr = dst_ipaddr;
+	packet->socket.inet.ifindex = pcap->ifindex;
+
+	packet->data = talloc_memdup(packet, p, packet->data_len);
+	packet->timestamp = fr_time_from_timeval(&header->ts);
+
+	return packet;
 }
-#endif	/* HAVE_PCAP_H */
+#endif	/* HAVE_LIBPCAP */

@@ -1,5 +1,6 @@
+#pragma once
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -20,10 +21,10 @@
  * @brief Serialize and deserialise cache entries.
  *
  * @author Arran Cudbard-Bell
- * @copyright 2014  Arran Cudbard-Bell <a.cudbardb@freeradius.org>
- * @copyright 2014  The FreeRADIUS server project
+ * @copyright 2014 Arran Cudbard-Bell (a.cudbardb@freeradius.org)
+ * @copyright 2014 The FreeRADIUS server project
  */
 RCSIDH(serialize_h, "$Id$")
 
 int cache_serialize(TALLOC_CTX *ctx, char **out, rlm_cache_entry_t const *c);
-int cache_deserialize(rlm_cache_entry_t *c, char *in, ssize_t inlen);
+int cache_deserialize(rlm_cache_entry_t *c, fr_dict_t const *dict, char *in, ssize_t inlen);

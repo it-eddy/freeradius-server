@@ -19,31 +19,29 @@
  * @file rlm_sql_mysql.c
  * @brief MySQL driver.
  *
- * @copyright 2014-2015  Arran Cudbard-Bell <a.cudbardb@freeradius.org>
- * @copyright 2000-2007,2015  The FreeRADIUS server project
- * @copyright 2000  Mike Machado <mike@innercite.com>
- * @copyright 2000  Alan DeKok <aland@ox.org>
+ * @copyright 2014-2015 Arran Cudbard-Bell (a.cudbardb@freeradius.org)
+ * @copyright 2000-2007,2015 The FreeRADIUS server project
+ * @copyright 2000 Mike Machado (mike@innercite.com)
+ * @copyright 2000 Alan DeKok (aland@freeradius.org)
  */
 RCSID("$Id$")
 
-#define LOG_PREFIX "rlm_sql_mysql - "
+#define LOG_PREFIX "sql - mysql"
 
-#include <freeradius-devel/radiusd.h>
-#include <freeradius-devel/rad_assert.h>
+#include <freeradius-devel/server/base.h>
+#include <freeradius-devel/util/debug.h>
 
 #include <sys/stat.h>
 
 #include "config.h"
 
 #ifdef HAVE_MYSQL_MYSQL_H
-#  include <mysql/mysql_version.h>
 #  include <mysql/errmsg.h>
 DIAG_OFF(strict-prototypes)	/* Seen with homebrew mysql client 5.7.13 */
-#  include <mysql.h>
+#  include <mysql/mysql.h>
 DIAG_ON(strict-prototypes)
 #  include <mysql/mysqld_error.h>
 #elif defined(HAVE_MYSQL_H)
-#  include <mysql_version.h>
 #  include <errmsg.h>
 DIAG_OFF(strict-prototypes)	/* Seen with homebrew mysql client 5.7.13 */
 #  include <mysql.h>
@@ -59,78 +57,112 @@ typedef enum {
 	SERVER_WARNINGS_NO
 } rlm_sql_mysql_warnings;
 
-static const FR_NAME_NUMBER server_warnings_table[] = {
-	{ "auto",	SERVER_WARNINGS_AUTO	},
-	{ "yes",	SERVER_WARNINGS_YES	},
-	{ "no",		SERVER_WARNINGS_NO	},
-	{ NULL, 0 }
+static fr_table_num_sorted_t const server_warnings_table[] = {
+	{ L("auto"),	SERVER_WARNINGS_AUTO	},
+	{ L("no"),		SERVER_WARNINGS_NO	},
+	{ L("yes"),	SERVER_WARNINGS_YES	}
 };
+static size_t server_warnings_table_len = NUM_ELEMENTS(server_warnings_table);
 
-typedef struct rlm_sql_mysql_conn {
-	MYSQL		db;
-	MYSQL		*sock;
-	MYSQL_RES	*result;
+typedef struct {
+	MYSQL		db;			//!< Structure representing connection details.
+	MYSQL		*sock;			//!< Connection details as returned by connection init functions.
+	MYSQL_RES	*result;		//!< Result from most recent query.
+	connection_t	*conn;			//!< Generic connection structure for this connection.
+	int		fd;			//!< fd for this connection's I/O events.
+	fr_sql_query_t	*query_ctx;		//!< Current query running on this connection.
+	int		status;			//!< returned by the most recent non-blocking function call.
 } rlm_sql_mysql_conn_t;
 
-typedef struct rlm_sql_mysql_config {
-	char const *tls_ca_file;		//!< Path to the CA used to validate the server's certificate.
-	char const *tls_ca_path;		//!< Directory containing CAs that may be used to validate the
+typedef struct {
+	char const	*tls_ca_file;		//!< Path to the CA used to validate the server's certificate.
+	char const	*tls_ca_path;		//!< Directory containing CAs that may be used to validate the
 						//!< servers certificate.
-	char const *tls_certificate_file;	//!< Public certificate we present to the server.
-	char const *tls_private_key_file;	//!< Private key for the certificate we present to the server.
-	char const *tls_cipher;
+	char const	*tls_certificate_file;	//!< Public certificate we present to the server.
+	char const	*tls_private_key_file;	//!< Private key for the certificate we present to the server.
 
-	char const *warnings_str;		//!< Whether we always query the server for additional warnings.
+	char const	*tls_crl_file;		//!< Public certificate we present to the server.
+	char const	*tls_crl_path;		//!< Private key for the certificate we present to the server.
+
+	char const	*tls_cipher;		//!< Colon separated list of TLS ciphers for TLS <= 1.2.
+
+	bool		tls_required;		//!< Require that the connection is encrypted.
+	bool		tls_check_cert;		//!< Verify there's a trust relationship between the server's
+						///< cert and one of the CAs we have configured.
+	bool		tls_check_cert_cn;	//!< Verify that the CN in the server cert matches the host
+						///< we passed to mysql_real_connect().
+
+	char const	*warnings_str;		//!< Whether we always query the server for additional warnings.
 	rlm_sql_mysql_warnings	warnings;	//!< mysql_warning_count() doesn't
 						//!< appear to work with NDB cluster
+
+	char const	*character_set;		//!< Character set to use on connections.
 } rlm_sql_mysql_t;
 
-static CONF_PARSER tls_config[] = {
-	{ FR_CONF_OFFSET("ca_file", FR_TYPE_FILE_INPUT, rlm_sql_mysql_t, tls_ca_file) },
-	{ FR_CONF_OFFSET("ca_path", FR_TYPE_FILE_INPUT, rlm_sql_mysql_t, tls_ca_path) },
-	{ FR_CONF_OFFSET("certificate_file", FR_TYPE_FILE_INPUT, rlm_sql_mysql_t, tls_certificate_file) },
-	{ FR_CONF_OFFSET("private_key_file", FR_TYPE_FILE_INPUT, rlm_sql_mysql_t, tls_private_key_file) },
-
+static conf_parser_t tls_config[] = {
+	{ FR_CONF_OFFSET_FLAGS("ca_file", CONF_FLAG_FILE_INPUT, rlm_sql_mysql_t, tls_ca_file) },
+	{ FR_CONF_OFFSET_FLAGS("ca_path", CONF_FLAG_FILE_INPUT, rlm_sql_mysql_t, tls_ca_path) },
+	{ FR_CONF_OFFSET_FLAGS("certificate_file", CONF_FLAG_FILE_INPUT, rlm_sql_mysql_t, tls_certificate_file) },
+	{ FR_CONF_OFFSET_FLAGS("private_key_file", CONF_FLAG_FILE_INPUT, rlm_sql_mysql_t, tls_private_key_file) },
+	{ FR_CONF_OFFSET_FLAGS("crl_file", CONF_FLAG_FILE_INPUT, rlm_sql_mysql_t, tls_crl_file) },
+	{ FR_CONF_OFFSET_FLAGS("crl_path", CONF_FLAG_FILE_INPUT, rlm_sql_mysql_t, tls_crl_path) },
 	/*
 	 *	MySQL Specific TLS attributes
 	 */
-	{ FR_CONF_OFFSET("cipher", FR_TYPE_STRING, rlm_sql_mysql_t, tls_cipher) },
+	{ FR_CONF_OFFSET("cipher", rlm_sql_mysql_t, tls_cipher) },
+
+	/*
+	 *	The closest thing we have to these options in other modules is
+	 *	in rlm_rest.  rlm_ldap has its own bizarre option set.
+	 *
+	 *	There, the options can be toggled independently, here they can't
+	 *	but for consistency we break them out anyway, and warn if the user
+	 *	has provided an invalid list of flags.
+	 */
+	{ FR_CONF_OFFSET("tls_required", rlm_sql_mysql_t, tls_required) },
+	{ FR_CONF_OFFSET("check_cert", rlm_sql_mysql_t, tls_check_cert) },
+	{ FR_CONF_OFFSET("check_cert_cn", rlm_sql_mysql_t, tls_check_cert_cn) },
 	CONF_PARSER_TERMINATOR
 };
 
-static const CONF_PARSER driver_config[] = {
-	{ FR_CONF_POINTER("tls", FR_TYPE_SUBSECTION, NULL), .subcs = (void const *) tls_config },
+static const conf_parser_t driver_config[] = {
+	{ FR_CONF_POINTER("tls", 0, CONF_FLAG_SUBSECTION, NULL), .subcs = (void const *) tls_config },
 
-	{ FR_CONF_OFFSET("warnings", FR_TYPE_STRING, rlm_sql_mysql_t, warnings_str), .dflt = "auto" },
+	{ FR_CONF_OFFSET("warnings", rlm_sql_mysql_t, warnings_str), .dflt = "auto" },
+	{ FR_CONF_OFFSET("character_set", rlm_sql_mysql_t, character_set) },
 	CONF_PARSER_TERMINATOR
 };
 
 /* Prototypes */
-static sql_rcode_t sql_free_result(rlm_sql_handle_t*, rlm_sql_config_t*);
+static sql_rcode_t sql_free_result(fr_sql_query_t *, rlm_sql_config_t const *);
 
-static int _sql_socket_destructor(rlm_sql_mysql_conn_t *conn)
+static int mod_instantiate(module_inst_ctx_t const *mctx)
 {
-	DEBUG2("Socket destructor called, closing socket");
-
-	if (conn->sock){
-		mysql_close(conn->sock);
-	}
-
-	return 0;
-}
-
-static int mod_instantiate(UNUSED rlm_sql_config_t const *config, void *instance, UNUSED CONF_SECTION *cs)
-{
-	rlm_sql_mysql_t		*inst = instance;
+	rlm_sql_mysql_t		*inst = talloc_get_type_abort(mctx->mi->data, rlm_sql_mysql_t);
 	int			warnings;
 
-	warnings = fr_str2int(server_warnings_table, inst->warnings_str, -1);
+	warnings = fr_table_value_by_str(server_warnings_table, inst->warnings_str, -1);
 	if (warnings < 0) {
 		ERROR("Invalid warnings value \"%s\", must be yes, no, or auto", inst->warnings_str);
 		return -1;
 	}
 	inst->warnings = (rlm_sql_mysql_warnings)warnings;
 
+	if (inst->tls_check_cert && !inst->tls_required) {
+		WARN("Implicitly setting tls_required = yes, as tls_check_cert = yes");
+		inst->tls_required = true;
+	}
+	if (inst->tls_check_cert_cn) {
+		if (!inst->tls_required) {
+			WARN("Implicitly setting tls_required = yes, as check_cert_cn = yes");
+			inst->tls_required = true;
+		}
+
+		if (!inst->tls_check_cert) {
+			WARN("Implicitly setting check_cert = yes, as check_cert_cn = yes");
+			inst->tls_check_cert = true;
+		}
+	}
 	return 0;
 }
 
@@ -152,19 +184,93 @@ static int mod_load(void)
 	return 0;
 }
 
-static sql_rcode_t sql_socket_init(rlm_sql_handle_t *handle, rlm_sql_config_t *config, struct timeval const *timeout)
+/** Callback for I/O events in response to mysql_real_connect_start()
+ */
+static void _sql_connect_io_notify(fr_event_list_t *el, int fd, UNUSED int flags, void *uctx)
 {
-	rlm_sql_mysql_conn_t *conn;
-	rlm_sql_mysql_t *inst = config->driver;
-	unsigned int connect_timeout = timeout->tv_sec;
-	unsigned long sql_flags;
+	rlm_sql_mysql_conn_t	*c = talloc_get_type_abort(uctx, rlm_sql_mysql_conn_t);
 
-	MEM(conn = handle->conn = talloc_zero(handle, rlm_sql_mysql_conn_t));
-	talloc_set_destructor(conn, _sql_socket_destructor);
+	fr_event_fd_delete(el, fd, FR_EVENT_FILTER_IO);
+
+	if (c->status == 0) goto connected;
+	c->status = mysql_real_connect_cont(&c->sock, &c->db, c->status);
+
+	/*
+	 *	If status is not zero, we're still waiting for something.
+	 *	The event will be fired again when that happens.
+	 */
+	if (c->status != 0) {
+		(void) fr_event_fd_insert(c, NULL, c->conn->el, c->fd,
+				          c->status & MYSQL_WAIT_READ ? _sql_connect_io_notify : NULL,
+					  c->status & MYSQL_WAIT_WRITE ? _sql_connect_io_notify : NULL, NULL, c);
+		return;
+	}
+
+connected:
+	if (!c->sock) {
+		ERROR("MySQL error: %s", mysql_error(&c->db));
+		connection_signal_reconnect(c->conn, CONNECTION_FAILED);
+		return;
+	}
+
+	DEBUG2("Connected to database on %s, server version %s, protocol version %i",
+	       mysql_get_host_info(c->sock),
+	       mysql_get_server_info(c->sock), mysql_get_proto_info(c->sock));
+
+	connection_signal_connected(c->conn);
+}
+
+static void _sql_connect_query_run(connection_t *conn, UNUSED connection_state_t prev,
+				   UNUSED connection_state_t state, void *uctx)
+{
+	rlm_sql_t const		*sql = talloc_get_type_abort_const(uctx, rlm_sql_t);
+	rlm_sql_mysql_conn_t	*sql_conn = talloc_get_type_abort(conn->h, rlm_sql_mysql_conn_t);
+	int			ret;
+	MYSQL_RES		*result;
+
+	DEBUG2("Executing \"%s\" on connection %s", sql->config.connect_query, conn->name);
+
+	ret = mysql_real_query(sql_conn->sock, sql->config.connect_query, strlen(sql->config.connect_query));
+	if (ret != 0) {
+		char const *info;
+		ERROR("Failed running \"open_query\"");
+		info = mysql_info(sql_conn->sock);
+		if (info) ERROR("%s", info);
+		connection_signal_reconnect(conn, CONNECTION_FAILED);
+		return;
+	}
+
+	/*
+	 *	These queries should not return any results - but let's be safe
+	 */
+	result = mysql_store_result(sql_conn->sock);
+	if (result) mysql_free_result(result);
+	while ((mysql_next_result(sql_conn->sock) == 0) &&
+	       (result = mysql_store_result(sql_conn->sock))) {
+		mysql_free_result(result);
+	}
+}
+
+CC_NO_UBSAN(function) /* UBSAN: false positive - public vs private connection_t trips --fsanitize=function*/
+static connection_state_t _sql_connection_init(void **h, connection_t *conn, void *uctx)
+{
+	rlm_sql_t const		*sql = talloc_get_type_abort_const(uctx, rlm_sql_t);
+	rlm_sql_mysql_t const	*inst = talloc_get_type_abort(sql->driver_submodule->data, rlm_sql_mysql_t);
+	rlm_sql_mysql_conn_t	*c;
+	rlm_sql_config_t const	*config = &sql->config;
+
+	unsigned long		sql_flags;
+	enum mysql_option	ssl_mysql_opt;
+	unsigned int		ssl_mode = 0;
+	bool			ssl_mode_isset = false;
+
+	MEM(c = talloc_zero(conn, rlm_sql_mysql_conn_t));
+	c->conn = conn;
+	c->fd = -1;
 
 	DEBUG("Starting connect to MySQL server");
 
-	mysql_init(&(conn->db));
+	mysql_init(&c->db);
 
 	/*
 	 *	If any of the TLS options are set, configure TLS
@@ -174,84 +280,113 @@ static sql_rcode_t sql_socket_init(rlm_sql_handle_t *handle, rlm_sql_config_t *c
 	 */
 	if (inst->tls_ca_file || inst->tls_ca_path ||
 	    inst->tls_certificate_file || inst->tls_private_key_file) {
-		mysql_ssl_set(&(conn->db), inst->tls_private_key_file, inst->tls_certificate_file,
+		mysql_ssl_set(&(c->db), inst->tls_private_key_file, inst->tls_certificate_file,
 			      inst->tls_ca_file, inst->tls_ca_path, inst->tls_cipher);
 	}
 
-	mysql_options(&(conn->db), MYSQL_READ_DEFAULT_GROUP, "freeradius");
+#ifdef MARIADB_BASE_VERSION
+	if (inst->tls_required || inst->tls_check_cert || inst->tls_check_cert_cn) {
+		ssl_mode_isset = true;
+		/**
+		 * For MariaDB, It should be true as can be seen in
+		 * https://github.com/MariaDB/server/blob/mariadb-5.5.68/sql-common/client.c#L4338
+		 */
+		ssl_mode = true;
+		ssl_mysql_opt = MYSQL_OPT_SSL_VERIFY_SERVER_CERT;
+	}
+#else
+	ssl_mysql_opt = MYSQL_OPT_SSL_MODE;
+	if (inst->tls_required) {
+		ssl_mode = SSL_MODE_REQUIRED;
+		ssl_mode_isset = true;
+	}
+	if (inst->tls_check_cert) {
+		ssl_mode = SSL_MODE_VERIFY_CA;
+		ssl_mode_isset = true;
+	}
+	if (inst->tls_check_cert_cn) {
+		ssl_mode = SSL_MODE_VERIFY_IDENTITY;
+		ssl_mode_isset = true;
+	}
+#endif
+	if (ssl_mode_isset) mysql_options(&(c->db), ssl_mysql_opt, &ssl_mode);
+
+	if (inst->tls_crl_file) mysql_options(&(c->db), MYSQL_OPT_SSL_CRL, inst->tls_crl_file);
+	if (inst->tls_crl_path) mysql_options(&(c->db), MYSQL_OPT_SSL_CRLPATH, inst->tls_crl_path);
+
+	mysql_options(&(c->db), MYSQL_READ_DEFAULT_GROUP, "freeradius");
+
+	if (inst->character_set) mysql_options(&(c->db), MYSQL_SET_CHARSET_NAME, inst->character_set);
 
 	/*
 	 *	We need to know about connection errors, and are capable
 	 *	of reconnecting automatically.
 	 */
-#ifdef MYSQL_OPT_RECONNECT
 	{
-		my_bool reconnect = 0;
-		mysql_options(&(conn->db), MYSQL_OPT_RECONNECT, &reconnect);
+		bool reconnect = 0;
+		mysql_options(&(c->db), MYSQL_OPT_RECONNECT, &reconnect);
 	}
-#endif
 
-#if (MYSQL_VERSION_ID >= 50000)
-	mysql_options(&(conn->db), MYSQL_OPT_CONNECT_TIMEOUT, &connect_timeout);
-
-	if (config->query_timeout) {
-		unsigned int read_timeout = config->query_timeout;
-		unsigned int write_timeout = config->query_timeout;
-
-		/*
-		 *	The timeout in seconds for each attempt to read from the server.
-		 *	There are retries if necessary, so the total effective timeout
-		 *	value is three times the option value.
-		 */
-		if (config->query_timeout >= 3) read_timeout /= 3;
-
-		/*
-		 *	The timeout in seconds for each attempt to write to the server.
-		 *	There is a retry if necessary, so the total effective timeout
-		 *	value is two times the option value.
-		 */
-		if (config->query_timeout >= 2) write_timeout /= 2;
-
-		/*
-		 *	Connect timeout is actually connect timeout (according to the
-		 *	docs) there are no automatic retries.
-		 */
-		mysql_options(&(conn->db), MYSQL_OPT_READ_TIMEOUT, &read_timeout);
-		mysql_options(&(conn->db), MYSQL_OPT_WRITE_TIMEOUT, &write_timeout);
-	}
-#endif
-
-#if (MYSQL_VERSION_ID >= 40100)
 	sql_flags = CLIENT_MULTI_RESULTS | CLIENT_FOUND_ROWS;
-#else
-	sql_flags = CLIENT_FOUND_ROWS;
-#endif
 
 #ifdef CLIENT_MULTI_STATEMENTS
 	sql_flags |= CLIENT_MULTI_STATEMENTS;
 #endif
-	conn->sock = mysql_real_connect(&(conn->db),
-					config->sql_server,
-					config->sql_login,
-					config->sql_password,
-					config->sql_db,
-					config->sql_port,
-					NULL,
-					sql_flags);
-	if (!conn->sock) {
-		ERROR("Couldn't connect to MySQL server %s@%s:%s", config->sql_login,
-		      config->sql_server, config->sql_db);
-		ERROR("MySQL error: %s", mysql_error(&conn->db));
 
-		conn->sock = NULL;
-		return RLM_SQL_ERROR;
+ 	mysql_options(&c->db, MYSQL_OPT_NONBLOCK, 0);
+
+	c->status = mysql_real_connect_start(&c->sock, &c->db,
+					     config->sql_server,
+					     config->sql_login,
+					     config->sql_password,
+					     config->sql_db,
+					     config->sql_port, NULL, sql_flags);
+
+	c->fd = mysql_get_socket(&c->db);
+
+	if (c->fd <= 0) {
+		ERROR("Could't connect to MySQL server %s@%s:%s", config->sql_login,
+		      config->sql_server, config->sql_db);
+		ERROR("MySQL error: %s", mysql_error(&c->db));
+	error:
+		talloc_free(c);
+		return CONNECTION_STATE_FAILED;
 	}
 
-	DEBUG2("Connected to database '%s' on %s, server version %s, protocol version %i",
-	       config->sql_db, mysql_get_host_info(conn->sock),
-	       mysql_get_server_info(conn->sock), mysql_get_proto_info(conn->sock));
+	if (c->status == 0) {
+		DEBUG2("Connected to database '%s' on %s, server version %s, protocol version %i",
+		       config->sql_db, mysql_get_host_info(c->sock),
+		       mysql_get_server_info(c->sock), mysql_get_proto_info(c->sock));
+		connection_signal_connected(c->conn);
+		return CONNECTION_STATE_CONNECTING;
+	}
 
-	return RLM_SQL_OK;
+	if (fr_event_fd_insert(c, NULL, c->conn->el, c->fd,
+			       c->status & MYSQL_WAIT_READ ? _sql_connect_io_notify : NULL,
+			       c->status & MYSQL_WAIT_WRITE ? _sql_connect_io_notify : NULL, NULL, c) != 0) goto error;
+
+	DEBUG2("Connecting to database '%s' on %s:%d, fd %d",
+	       config->sql_db, config->sql_server, config->sql_port, c->fd);
+
+	*h = c;
+
+	if (config->connect_query) connection_add_watch_post(conn, CONNECTION_STATE_CONNECTED,
+							     _sql_connect_query_run, true, sql);
+
+	return CONNECTION_STATE_CONNECTING;
+}
+
+static void _sql_connection_close(fr_event_list_t *el, void *h, UNUSED void *uctx)
+{
+	rlm_sql_mysql_conn_t	*c = talloc_get_type_abort(h, rlm_sql_mysql_conn_t);
+
+	if (c->fd >= 0) {
+		fr_event_fd_delete(el, c->fd, FR_EVENT_FILTER_IO);
+		c->fd = -1;
+	}
+	mysql_close(&c->db);
+	c->query_ctx = NULL;
+	talloc_free(h);
 }
 
 /** Analyse the last error that occurred on the socket, and determine an action
@@ -274,7 +409,6 @@ static sql_rcode_t sql_check_error(MYSQL *server, int client_errno)
 	if (sql_errno > 0) switch (sql_errno) {
 	case CR_SERVER_GONE_ERROR:
 	case CR_SERVER_LOST:
-	case -1:
 		return RLM_SQL_RECONNECT;
 
 	case CR_OUT_OF_MEMORY:
@@ -324,115 +458,38 @@ static sql_rcode_t sql_check_error(MYSQL *server, int client_errno)
 	return RLM_SQL_OK;
 }
 
-static sql_rcode_t sql_query(rlm_sql_handle_t *handle, UNUSED rlm_sql_config_t *config, char const *query)
+static sql_rcode_t sql_store_result(rlm_sql_mysql_conn_t *conn, UNUSED rlm_sql_config_t const *config)
 {
-	rlm_sql_mysql_conn_t *conn = handle->conn;
-	sql_rcode_t rcode;
-	char const *info;
-
-	if (!conn->sock) {
-		ERROR("Socket not connected");
-		return RLM_SQL_RECONNECT;
-	}
-
-	mysql_query(conn->sock, query);
-	rcode = sql_check_error(conn->sock, 0);
-	if (rcode != RLM_SQL_OK) {
-		return rcode;
-	}
-
-	/* Only returns non-null string for INSERTS */
-	info = mysql_info(conn->sock);
-	if (info) DEBUG2("%s", info);
-
-	return RLM_SQL_OK;
-}
-
-static sql_rcode_t sql_store_result(rlm_sql_handle_t *handle, UNUSED rlm_sql_config_t *config)
-{
-	rlm_sql_mysql_conn_t *conn = handle->conn;
 	sql_rcode_t rcode;
 	int ret;
-
-	if (!conn->sock) {
-		ERROR("Socket not connected");
-		return RLM_SQL_RECONNECT;
-	}
 
 retry_store_result:
 	conn->result = mysql_store_result(conn->sock);
 	if (!conn->result) {
 		rcode = sql_check_error(conn->sock, 0);
 		if (rcode != RLM_SQL_OK) return rcode;
-#if (MYSQL_VERSION_ID >= 40100)
 		ret = mysql_next_result(conn->sock);
 		if (ret == 0) {
 			/* there are more results */
 			goto retry_store_result;
 		} else if (ret > 0) return sql_check_error(NULL, ret);
 		/* ret == -1 signals no more results */
-#endif
 	}
 	return RLM_SQL_OK;
 }
 
-static int sql_num_fields(rlm_sql_handle_t *handle, UNUSED rlm_sql_config_t *config)
+static int sql_num_rows(fr_sql_query_t *query_ctx, UNUSED rlm_sql_config_t const *config)
 {
-	int num = 0;
-	rlm_sql_mysql_conn_t *conn = handle->conn;
+	rlm_sql_mysql_conn_t *conn = talloc_get_type_abort(query_ctx->tconn->conn->h, rlm_sql_mysql_conn_t);
 
-#if MYSQL_VERSION_ID >= 32224
-	/*
-	 *	Count takes a connection handle
-	 */
-	num = mysql_field_count(conn->sock);
-#else
-	if (!conn->result) return 0;
-	/*
-	 *	Fields takes a result struct (which can't be NULL)
-	 */
-	num = mysql_num_fields(conn->result)
-#endif
-	return num;
-}
-
-static sql_rcode_t sql_select_query(rlm_sql_handle_t *handle, rlm_sql_config_t *config, char const *query)
-{
-	sql_rcode_t rcode;
-
-	rcode = sql_query(handle, config, query);
-	if (rcode != RLM_SQL_OK) {
-		return rcode;
-	}
-
-	rcode = sql_store_result(handle, config);
-	if (rcode != RLM_SQL_OK) {
-		return rcode;
-	}
-
-	/* Why? Per http://www.mysql.com/doc/n/o/node_591.html,
-	 * this cannot return an error.  Perhaps just to complain if no
-	 * fields are found?
-	 */
-	sql_num_fields(handle, config);
-
-	return rcode;
-}
-
-static int sql_num_rows(rlm_sql_handle_t *handle, UNUSED rlm_sql_config_t *config)
-{
-	rlm_sql_mysql_conn_t *conn = handle->conn;
-
-	if (conn->result) {
-		return mysql_num_rows(conn->result);
-	}
+	if (conn->result) return mysql_num_rows(conn->result);
 
 	return 0;
 }
 
-static sql_rcode_t sql_fields(char const **out[], rlm_sql_handle_t *handle, rlm_sql_config_t *config)
+static sql_rcode_t sql_fields(char const **out[], fr_sql_query_t *query_ctx, UNUSED rlm_sql_config_t const *config)
 {
-	rlm_sql_mysql_conn_t *conn = handle->conn;
+	rlm_sql_mysql_conn_t *conn = talloc_get_type_abort(query_ctx->tconn->conn->h, rlm_sql_mysql_conn_t);
 
 	unsigned int	fields, i;
 	MYSQL_FIELD	*field_info;
@@ -443,7 +500,7 @@ static sql_rcode_t sql_fields(char const **out[], rlm_sql_handle_t *handle, rlm_
 	 *	Different versions of SQL use different functions,
 	 *	and some don't like NULL pointers.
 	 */
-	fields = sql_num_fields(handle, config);
+	fields = mysql_field_count(conn->sock);
 	if (fields == 0) return RLM_SQL_ERROR;
 
 	/*
@@ -453,7 +510,7 @@ static sql_rcode_t sql_fields(char const **out[], rlm_sql_handle_t *handle, rlm_
 	field_info = mysql_fetch_fields(conn->result);
 	if (!field_info) return RLM_SQL_ERROR;
 
-	MEM(names = talloc_array(handle, char const *, fields));
+	MEM(names = talloc_array(query_ctx, char const *, fields));
 
 	for (i = 0; i < fields; i++) names[i] = field_info[i].name;
 	*out = names;
@@ -461,67 +518,77 @@ static sql_rcode_t sql_fields(char const **out[], rlm_sql_handle_t *handle, rlm_
 	return RLM_SQL_OK;
 }
 
-static sql_rcode_t sql_fetch_row(rlm_sql_row_t *out, rlm_sql_handle_t *handle, rlm_sql_config_t *config)
+static unlang_action_t sql_fetch_row(rlm_rcode_t *p_result, UNUSED int *priority, UNUSED request_t *request, void *uctx)
 {
-	rlm_sql_mysql_conn_t	*conn = handle->conn;
-	sql_rcode_t		rcode;
+	fr_sql_query_t		*query_ctx = talloc_get_type_abort(uctx, fr_sql_query_t);
+	rlm_sql_mysql_conn_t	*conn = talloc_get_type_abort(query_ctx->tconn->conn->h, rlm_sql_mysql_conn_t);
 	MYSQL_ROW		row;
 	int			ret;
 	unsigned int		num_fields, i;
 	unsigned long		*field_lens;
 
-	*out = NULL;
-
 	/*
 	 *  Check pointer before de-referencing it.
 	 */
-	if (!conn->result) return RLM_SQL_RECONNECT;
+	if (!conn->result) {
+		query_ctx->rcode = RLM_SQL_RECONNECT;
+		RETURN_MODULE_FAIL;
+	}
 
-	TALLOC_FREE(handle->row);		/* Clear previous row set */
+	TALLOC_FREE(query_ctx->row);		/* Clear previous row set */
 
 retry_fetch_row:
 	row = mysql_fetch_row(conn->result);
 	if (!row) {
-		rcode = sql_check_error(conn->sock, 0);
-		if (rcode != RLM_SQL_OK) return rcode;
+		query_ctx->rcode = sql_check_error(conn->sock, 0);
+		if (query_ctx->rcode != RLM_SQL_OK) RETURN_MODULE_FAIL;
 
-#if (MYSQL_VERSION_ID >= 40100)
-		sql_free_result(handle, config);
+		mysql_free_result(conn->result);
+		conn->result = NULL;
 
 		ret = mysql_next_result(conn->sock);
 		if (ret == 0) {
 			/* there are more results */
-			if ((sql_store_result(handle, config) == 0) && (conn->result != NULL)) {
+			if ((sql_store_result(conn, &query_ctx->inst->config) == 0) && (conn->result != NULL)) {
 				goto retry_fetch_row;
 			}
-		} else if (ret > 0) return sql_check_error(NULL, ret);
+		} else if (ret > 0) {
+			query_ctx->rcode = sql_check_error(NULL, ret);
+			if (query_ctx->rcode == RLM_SQL_OK) RETURN_MODULE_OK;
+			RETURN_MODULE_FAIL;
+		}
 		/* If ret is -1 then there are no more rows */
-#endif
-		return RLM_SQL_NO_MORE_ROWS;
+
+		query_ctx->rcode = RLM_SQL_NO_MORE_ROWS;
+		RETURN_MODULE_OK;
 	}
 
-	num_fields = mysql_num_fields(conn->result);
-	if (!num_fields) return RLM_SQL_NO_MORE_ROWS;
+	num_fields = mysql_field_count(conn->sock);
+	if (!num_fields) {
+		query_ctx->rcode = RLM_SQL_NO_MORE_ROWS;
+		RETURN_MODULE_OK;
+	}
 
  	field_lens = mysql_fetch_lengths(conn->result);
 
-	MEM(*out = handle->row = talloc_zero_array(handle, char *, num_fields + 1));
+	MEM(query_ctx->row = talloc_zero_array(query_ctx, char *, num_fields + 1));
 	for (i = 0; i < num_fields; i++) {
-		MEM(handle->row[i] = talloc_bstrndup(handle->row, row[i], field_lens[i]));
+		MEM(query_ctx->row[i] = talloc_bstrndup(query_ctx->row, row[i], field_lens[i]));
 	}
 
-	return RLM_SQL_OK;
+	query_ctx->rcode = RLM_SQL_OK;
+	RETURN_MODULE_OK;
 }
 
-static sql_rcode_t sql_free_result(rlm_sql_handle_t *handle, UNUSED rlm_sql_config_t *config)
+static sql_rcode_t sql_free_result(fr_sql_query_t *query_ctx, UNUSED rlm_sql_config_t const *config)
 {
-	rlm_sql_mysql_conn_t *conn = handle->conn;
+	rlm_sql_mysql_conn_t *conn = talloc_get_type_abort(query_ctx->tconn->conn->h, rlm_sql_mysql_conn_t);
 
 	if (conn->result) {
 		mysql_free_result(conn->result);
 		conn->result = NULL;
 	}
-	TALLOC_FREE(handle->row);
+	TALLOC_FREE(query_ctx->row);
 
 	return RLM_SQL_OK;
 }
@@ -537,17 +604,15 @@ static sql_rcode_t sql_free_result(rlm_sql_handle_t *handle, UNUSED rlm_sql_conf
  * @param ctx to allocate temporary error buffers in.
  * @param out Array of sql_log_entrys to fill.
  * @param outlen Length of out array.
- * @param handle rlm_sql connection handle.
+ * @param conn MySQL connection the query was run on.
  * @param config rlm_sql config.
  * @return
  *	- Number of errors written to the #sql_log_entry_t array.
  *	- -1 on failure.
  */
 static size_t sql_warnings(TALLOC_CTX *ctx, sql_log_entry_t out[], size_t outlen,
-			   rlm_sql_handle_t *handle, UNUSED rlm_sql_config_t *config)
+			   rlm_sql_mysql_conn_t *conn, UNUSED rlm_sql_config_t const *config)
 {
-	rlm_sql_mysql_conn_t	*conn = handle->conn;
-
 	MYSQL_RES		*result;
 	MYSQL_ROW		row;
 	unsigned int		num_fields;
@@ -597,27 +662,29 @@ static size_t sql_warnings(TALLOC_CTX *ctx, sql_log_entry_t out[], size_t outlen
 	return i;
 }
 
-/** Retrieves any errors associated with the connection handle
+/** Retrieves any errors associated with the query context
  *
  * @note Caller should free any memory allocated in ctx (talloc_free_children()).
  *
  * @param ctx to allocate temporary error buffers in.
  * @param out Array of sql_log_entrys to fill.
  * @param outlen Length of out array.
- * @param handle rlm_sql connection handle.
+ * @param query_ctx Query context to retrieve error for.
  * @param config rlm_sql config.
  * @return number of errors written to the #sql_log_entry_t array.
  */
 static size_t sql_error(TALLOC_CTX *ctx, sql_log_entry_t out[], size_t outlen,
-			rlm_sql_handle_t *handle, rlm_sql_config_t *config)
+			fr_sql_query_t *query_ctx, rlm_sql_config_t const *config)
 {
-	rlm_sql_mysql_conn_t	*conn = handle->conn;
-	rlm_sql_mysql_t	*inst = config->driver;
+	rlm_sql_mysql_t const	*inst = talloc_get_type_abort_const(query_ctx->inst->driver_submodule->data, rlm_sql_mysql_t);
+	rlm_sql_mysql_conn_t	*conn;
 	char const		*error;
 	size_t			i = 0;
 
-	rad_assert(conn && conn->sock);
-	rad_assert(outlen > 0);
+	if (!query_ctx->tconn) return 0;
+	conn = talloc_get_type_abort(query_ctx->tconn->conn->h, rlm_sql_mysql_conn_t);
+
+	fr_assert(outlen > 0);
 
 	error = mysql_error(conn->sock);
 
@@ -626,7 +693,7 @@ static size_t sql_error(TALLOC_CTX *ctx, sql_log_entry_t out[], size_t outlen,
 	 */
 	if (error && (error[0] != '\0')) {
 		error = talloc_typed_asprintf(ctx, "ERROR %u (%s): %s", mysql_errno(conn->sock), error,
-					mysql_sqlstate(conn->sock));
+					      mysql_sqlstate(conn->sock));
 	}
 
 	/*
@@ -648,9 +715,9 @@ static size_t sql_error(TALLOC_CTX *ctx, sql_log_entry_t out[], size_t outlen,
 				break;
 			}
 
-		/* FALL-THROUGH */
+		FALL_THROUGH;
 		case SERVER_WARNINGS_YES:
-			ret = sql_warnings(ctx, out, outlen - 1, handle, config);
+			ret = sql_warnings(ctx, out, outlen - 1, conn, config);
 			if (ret > 0) i += ret;
 			break;
 
@@ -658,7 +725,7 @@ static size_t sql_error(TALLOC_CTX *ctx, sql_log_entry_t out[], size_t outlen,
 			break;
 
 		default:
-			rad_assert(0);
+			fr_assert(0);
 		}
 	}
 
@@ -678,12 +745,32 @@ static size_t sql_error(TALLOC_CTX *ctx, sql_log_entry_t out[], size_t outlen,
  * whether more results exist and process them in turn if so.
  *
  */
-static sql_rcode_t sql_finish_query(rlm_sql_handle_t *handle, rlm_sql_config_t *config)
+static sql_rcode_t sql_finish_query(fr_sql_query_t *query_ctx, rlm_sql_config_t const *config)
 {
-#if (MYSQL_VERSION_ID >= 40100)
-	rlm_sql_mysql_conn_t	*conn = handle->conn;
+	rlm_sql_mysql_conn_t	*conn;
 	int			ret;
 	MYSQL_RES		*result;
+
+	/*
+	 *	If the query is not in a state which would return results, then do nothing.
+	 */
+	if (query_ctx->treq && !(query_ctx->treq->state &
+	    (TRUNK_REQUEST_STATE_SENT | TRUNK_REQUEST_STATE_REAPABLE | TRUNK_REQUEST_STATE_COMPLETE))) return RLM_SQL_OK;
+
+	/*
+	 *	If the connection doesn't exist there's nothing to do
+	 */
+	if (!query_ctx->tconn || !query_ctx->tconn->conn || !query_ctx->tconn->conn->h) return RLM_SQL_ERROR;
+
+	conn = talloc_get_type_abort(query_ctx->tconn->conn->h, rlm_sql_mysql_conn_t);
+
+	/*
+	 *	If the connection is not active, then all that we can do is free any stored results
+	 */
+	if (query_ctx->tconn->conn->state != CONNECTION_STATE_CONNECTED) {
+		sql_free_result(query_ctx, config);
+		return RLM_SQL_OK;
+	}
 
 	/*
 	 *	If there's no result associated with the
@@ -702,7 +789,7 @@ static sql_rcode_t sql_finish_query(rlm_sql_handle_t *handle, rlm_sql_config_t *
 	 *	already stored result.
 	 */
 	} else {
-		sql_free_result(handle, config);	/* sql_free_result sets conn->result to NULL */
+		sql_free_result(query_ctx, config);	/* sql_free_result sets conn->result to NULL */
 	}
 
 	/*
@@ -720,22 +807,22 @@ static sql_rcode_t sql_finish_query(rlm_sql_handle_t *handle, rlm_sql_config_t *
 		mysql_free_result(result);
 	}
 	if (ret > 0) return sql_check_error(NULL, ret);
-#endif
+
 	return RLM_SQL_OK;
 }
 
-static int sql_affected_rows(rlm_sql_handle_t *handle, UNUSED rlm_sql_config_t *config)
+static int sql_affected_rows(fr_sql_query_t *query_ctx, UNUSED rlm_sql_config_t const *config)
 {
-	rlm_sql_mysql_conn_t *conn = handle->conn;
+	rlm_sql_mysql_conn_t *conn = talloc_get_type_abort(query_ctx->tconn->conn->h, rlm_sql_mysql_conn_t);
 
 	return mysql_affected_rows(conn->sock);
 }
 
-static size_t sql_escape_func(UNUSED REQUEST *request, char *out, size_t outlen, char const *in, void *arg)
+static size_t sql_escape_func(UNUSED request_t *request, char *out, size_t outlen, char const *in, void *arg)
 {
 	size_t			inlen;
-	rlm_sql_handle_t	*handle = talloc_get_type_abort(arg, rlm_sql_handle_t);
-	rlm_sql_mysql_conn_t	*conn = handle->conn;
+	connection_t		*c = talloc_get_type_abort(arg, connection_t);
+	rlm_sql_mysql_conn_t	*conn = talloc_get_type_abort(c->h, rlm_sql_mysql_conn_t);
 
 	/* Check for potential buffer overflow */
 	inlen = strlen(in);
@@ -743,26 +830,321 @@ static size_t sql_escape_func(UNUSED REQUEST *request, char *out, size_t outlen,
 	/* Prevent integer overflow */
 	if ((inlen * 2 + 1) <= inlen) return 0;
 
-	return mysql_real_escape_string(conn->sock, out, in, inlen);
+	return mysql_real_escape_string(&conn->db, out, in, inlen);
 }
 
+/** Allocate an SQL trunk connection
+ *
+ * @param[in] tconn		Trunk handle.
+ * @param[in] el		Event list which will be used for I/O and timer events.
+ * @param[in] conn_conf		Configuration of the connection.
+ * @param[in] log_prefix	What to prefix log messages with.
+ * @param[in] uctx		User context passed to trunk_alloc.
+ */
+CC_NO_UBSAN(function) /* UBSAN: false positive - public vs private connection_t trips --fsanitize=function*/
+static connection_t *sql_trunk_connection_alloc(trunk_connection_t *tconn, fr_event_list_t *el,
+						   connection_conf_t const *conn_conf,
+						   char const *log_prefix, void *uctx)
+{
+	connection_t		*conn;
+	rlm_sql_thread_t	*thread = talloc_get_type_abort(uctx, rlm_sql_thread_t);
+
+	conn = connection_alloc(tconn, el,
+				   &(connection_funcs_t){
+				   	.init = _sql_connection_init,
+				   	.close = _sql_connection_close
+				   },
+				   conn_conf, log_prefix, thread->inst);
+	if (!conn) {
+		PERROR("Failed allocating state handler for new SQL connection");
+		return NULL;
+	}
+
+	return conn;
+}
+
+TRUNK_NOTIFY_FUNC(sql_trunk_connection_notify, rlm_sql_mysql_conn_t)
+
+CC_NO_UBSAN(function) /* UBSAN: false positive - public vs private connection_t trips --fsanitize=function*/
+static void sql_trunk_request_mux(UNUSED fr_event_list_t *el, trunk_connection_t *tconn,
+				  connection_t *conn, UNUSED void *uctx)
+{
+	rlm_sql_mysql_conn_t	*sql_conn = talloc_get_type_abort(conn->h, rlm_sql_mysql_conn_t);
+	request_t		*request;
+	trunk_request_t	*treq;
+	fr_sql_query_t		*query_ctx;
+	char const		*info;
+	int			err;
+
+	if (trunk_connection_pop_request(&treq, tconn) != 0) return;
+	if (!treq) return;
+
+	query_ctx = talloc_get_type_abort(treq->preq, fr_sql_query_t);
+	request = query_ctx->request;
+
+	/*
+	 *	Each of the MariaDB async "start" calls returns a non-zero value
+	 *	if they are waiting on I/O.
+	 *	A return value of zero means that the operation completed.
+	 */
+
+	switch (query_ctx->status) {
+	case SQL_QUERY_PREPARED:
+		ROPTIONAL(RDEBUG2, DEBUG2, "Executing query: %s", query_ctx->query_str);
+		sql_conn->status = mysql_real_query_start(&err, sql_conn->sock, query_ctx->query_str, strlen(query_ctx->query_str));
+		query_ctx->tconn = tconn;
+
+		if (sql_conn->status) {
+			ROPTIONAL(RDEBUG3, DEBUG3, "Waiting for IO");
+			query_ctx->status = SQL_QUERY_SUBMITTED;
+			sql_conn->query_ctx = query_ctx;
+			trunk_request_signal_sent(treq);
+			return;
+		}
+
+		if (err) {
+			/*
+			 *	Need to check what kind of error this is - it may
+			 *	be a unique key conflict, we run the next query.
+			 */
+			info = mysql_info(sql_conn->sock);
+			query_ctx->rcode = sql_check_error(sql_conn->sock, 0);
+			if (info) ERROR("%s", info);
+			switch (query_ctx->rcode) {
+			case RLM_SQL_OK:
+			case RLM_SQL_ALT_QUERY:
+				break;
+
+			default:
+				query_ctx->status = SQL_QUERY_FAILED;
+				trunk_request_signal_fail(treq);
+				return;
+			}
+		}
+		query_ctx->status = SQL_QUERY_RETURNED;
+
+		break;
+
+	case SQL_QUERY_RETURNED:
+		ROPTIONAL(RDEBUG2, DEBUG2, "Fetching results");
+		fr_assert(query_ctx->tconn == tconn);
+		sql_conn->status = mysql_store_result_start(&sql_conn->result, sql_conn->sock);
+
+		if (sql_conn->status) {
+			ROPTIONAL(RDEBUG3, DEBUG3, "Waiting for IO");
+			query_ctx->status = SQL_QUERY_FETCHING_RESULTS;
+			sql_conn->query_ctx = query_ctx;
+			trunk_request_signal_sent(treq);
+			return;
+		}
+		query_ctx->status = SQL_QUERY_RESULTS_FETCHED;
+
+		break;
+
+	default:
+		/*
+		 *	The request outstanding on this connection returned
+		 *	immediately, so we are not actually waiting for I/O.
+		 */
+		return;
+	}
+
+	/*
+	 *	The current request is not waiting for I/O so the request can run
+	 */
+	ROPTIONAL(RDEBUG3, DEBUG3, "Got immediate response");
+	trunk_request_signal_reapable(treq);
+	if (request) unlang_interpret_mark_runnable(request);
+}
+
+CC_NO_UBSAN(function) /* UBSAN: false positive - public vs private connection_t trips --fsanitize=function*/
+static void sql_trunk_request_demux(UNUSED fr_event_list_t *el, UNUSED trunk_connection_t *tconn,
+				    connection_t *conn, UNUSED void *uctx)
+{
+	rlm_sql_mysql_conn_t	*sql_conn = talloc_get_type_abort(conn->h, rlm_sql_mysql_conn_t);
+	fr_sql_query_t		*query_ctx;
+	char const		*info;
+	int			err = 0;
+	request_t		*request;
+
+	/*
+	 *	Lookup the outstanding SQL query for this connection.
+	 *	There will only ever be one per tconn.
+	 */
+	query_ctx = sql_conn->query_ctx;
+
+	/*
+	 *	No outstanding query on this connection.
+	 *	Should not happen, but added for safety.
+	 */
+	if (unlikely(!query_ctx)) return;
+
+	switch (query_ctx->status) {
+	case SQL_QUERY_SUBMITTED:
+		sql_conn->status = mysql_real_query_cont(&err, sql_conn->sock, sql_conn->status);
+		break;
+
+	case SQL_QUERY_FETCHING_RESULTS:
+		sql_conn->status = mysql_store_result_cont(&sql_conn->result, sql_conn->sock, sql_conn->status);
+		break;
+
+	default:
+		/*
+		 *	The request outstanding on this connection returned
+		 *	immediately, so we are not actually waiting for I/O.
+		 */
+		return;
+	}
+
+	/*
+	 *	Are we still waiting for any further I/O?
+	 */
+	if (sql_conn->status != 0) return;
+
+	sql_conn->query_ctx = NULL;
+
+	switch (query_ctx->status) {
+	case SQL_QUERY_SUBMITTED:
+		query_ctx->status = SQL_QUERY_RETURNED;
+		break;
+
+	case SQL_QUERY_FETCHING_RESULTS:
+		query_ctx->status = SQL_QUERY_RESULTS_FETCHED;
+		break;
+
+	default:
+		fr_assert(0);
+	}
+
+	request = query_ctx->request;
+	if (request) unlang_interpret_mark_runnable(request);
+
+	if (err) {
+		info = mysql_info(sql_conn->sock);
+		query_ctx->rcode = sql_check_error(sql_conn->sock, 0);
+		if (info) ROPTIONAL(RERROR, ERROR, "%s", info);
+		return;
+	}
+
+	query_ctx->rcode = RLM_SQL_OK;
+}
+
+CC_NO_UBSAN(function) /* UBSAN: false positive - public vs private connection_t trips --fsanitize=function*/
+static void sql_request_cancel(connection_t *conn, void *preq, trunk_cancel_reason_t reason,
+			       UNUSED void *uctx)
+{
+	fr_sql_query_t		*query_ctx = talloc_get_type_abort(preq, fr_sql_query_t);
+	rlm_sql_mysql_conn_t	*sql_conn = talloc_get_type_abort(conn->h, rlm_sql_mysql_conn_t);
+
+	if (!query_ctx->treq) return;
+	if (reason != TRUNK_CANCEL_REASON_SIGNAL) return;
+	if (sql_conn->query_ctx == query_ctx) sql_conn->query_ctx = NULL;
+}
+
+CC_NO_UBSAN(function) /* UBSAN: false positive - public vs private connection_t trips --fsanitize=function*/
+static void sql_request_cancel_mux(UNUSED fr_event_list_t *el, trunk_connection_t *tconn,
+				   connection_t *conn, UNUSED void *uctx)
+{
+	trunk_request_t	*treq;
+
+	/*
+	 *	The MariaDB non-blocking API doesn't have any cancellation functions -
+	 *	rather you are expected to close the connection.
+	 */
+	if ((trunk_connection_pop_cancellation(&treq, tconn)) == 0) {
+		trunk_request_signal_cancel_complete(treq);
+		connection_signal_reconnect(conn, CONNECTION_FAILED);
+	}
+}
+
+static void sql_request_fail(request_t *request, void *preq, UNUSED void *rctx,
+			     UNUSED trunk_request_state_t state, UNUSED void *uctx)
+{
+	fr_sql_query_t		*query_ctx = talloc_get_type_abort(preq, fr_sql_query_t);
+
+	query_ctx->treq = NULL;
+	query_ctx->rcode = RLM_SQL_ERROR;
+
+	if (request) unlang_interpret_mark_runnable(request);
+}
+
+static unlang_action_t sql_query_resume(rlm_rcode_t *p_result, UNUSED int *priority, UNUSED request_t *request, void *uctx)
+{
+	fr_sql_query_t		*query_ctx = talloc_get_type_abort(uctx, fr_sql_query_t);
+
+	if (query_ctx->rcode == RLM_SQL_OK) RETURN_MODULE_OK;
+	RETURN_MODULE_FAIL;
+}
+
+static unlang_action_t sql_select_query_resume(rlm_rcode_t *p_result, UNUSED int *priority, UNUSED request_t *request, void *uctx)
+{
+	fr_sql_query_t		*query_ctx = talloc_get_type_abort(uctx, fr_sql_query_t);
+
+	if (query_ctx->rcode != RLM_SQL_OK) RETURN_MODULE_FAIL;
+
+	if (query_ctx->status == SQL_QUERY_RETURNED) {
+		trunk_request_requeue(query_ctx->treq);
+
+		if (unlang_function_repeat_set(request, sql_select_query_resume) < 0) {
+			query_ctx->rcode = RLM_SQL_ERROR;
+			RETURN_MODULE_FAIL;
+		}
+
+		return UNLANG_ACTION_YIELD;
+	}
+
+	RETURN_MODULE_OK;
+}
+
+/** Allocate the argument used for the SQL escape function
+ *
+ * In this case, a dedicated connection to allow the escape
+ * function to have access to server side parameters, though
+ * no packets ever flow after the connection is made.
+ */
+static void *sql_escape_arg_alloc(TALLOC_CTX *ctx, fr_event_list_t *el, void *uctx)
+{
+	rlm_sql_t const	*inst = talloc_get_type_abort(uctx, rlm_sql_t);
+	connection_t *conn;
+
+	conn = connection_alloc(ctx, el,
+				    &(connection_funcs_t){
+					.init = _sql_connection_init,
+					.close = _sql_connection_close,
+				    },
+				    inst->config.trunk_conf.conn_conf,
+				    inst->name, inst);
+
+	if (!conn) {
+		PERROR("Failed allocating state handler for SQL escape connection");
+		return NULL;
+	}
+
+	connection_signal_init(conn);
+	return conn;
+}
+
+static void sql_escape_arg_free(void *uctx)
+{
+	connection_t	*conn = talloc_get_type_abort(uctx, connection_t);
+	connection_signal_halt(conn);
+}
 
 /* Exported to rlm_sql */
 extern rlm_sql_driver_t rlm_sql_mysql;
 rlm_sql_driver_t rlm_sql_mysql = {
-	.name				= "rlm_sql_mysql",
-	.magic				= RLM_MODULE_INIT,
+	.common = {
+		.name				= "sql_mysql",
+		.magic				= MODULE_MAGIC_INIT,
+		.inst_size			= sizeof(rlm_sql_mysql_t),
+		.onload				= mod_load,
+		.unload				= mod_unload,
+		.config				= driver_config,
+		.instantiate			= mod_instantiate
+	},
 	.flags				= RLM_SQL_RCODE_FLAGS_ALT_QUERY,
-	.inst_size			= sizeof(rlm_sql_mysql_t),
-	.load				= mod_load,
-	.unload				= mod_unload,
-	.config				= driver_config,
-	.mod_instantiate		= mod_instantiate,
-	.sql_socket_init		= sql_socket_init,
-	.sql_query			= sql_query,
-	.sql_select_query		= sql_select_query,
-	.sql_store_result		= sql_store_result,
-	.sql_num_fields			= sql_num_fields,
+	.sql_query_resume		= sql_query_resume,
+	.sql_select_query_resume	= sql_select_query_resume,
 	.sql_num_rows			= sql_num_rows,
 	.sql_affected_rows		= sql_affected_rows,
 	.sql_fields			= sql_fields,
@@ -771,5 +1153,17 @@ rlm_sql_driver_t rlm_sql_mysql = {
 	.sql_error			= sql_error,
 	.sql_finish_query		= sql_finish_query,
 	.sql_finish_select_query	= sql_finish_query,
-	.sql_escape_func		= sql_escape_func
+	.sql_escape_func		= sql_escape_func,
+	.sql_escape_arg_alloc		= sql_escape_arg_alloc,
+	.sql_escape_arg_free		= sql_escape_arg_free,
+	.uses_trunks			= true,
+	.trunk_io_funcs = {
+		.connection_alloc	= sql_trunk_connection_alloc,
+		.connection_notify	= sql_trunk_connection_notify,
+		.request_mux		= sql_trunk_request_mux,
+		.request_demux		= sql_trunk_request_demux,
+		.request_cancel_mux	= sql_request_cancel_mux,
+		.request_cancel		= sql_request_cancel,
+		.request_fail		= sql_request_fail,
+	}
 };

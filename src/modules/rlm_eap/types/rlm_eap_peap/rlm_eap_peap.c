@@ -17,21 +17,22 @@
  *   along with this program; if not, write to the Free Software
  *   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  *
- * Copyright 2003 Alan DeKok <aland@freeradius.org>
- * Copyright 2006 The FreeRADIUS server project
+ * @copyright 2003 Alan DeKok (aland@freeradius.org)
+ * @copyright 2006 The FreeRADIUS server project
  */
 RCSID("$Id$")
 
-#define LOG_PREFIX "rlm_eap_peap - "
-
+#include <freeradius-devel/eap/tls.h>
 #include "eap_peap.h"
 
-typedef struct rlm_eap_peap_t {
-	char const		*tls_conf_name;		//!< TLS configuration.
-	fr_tls_conf_t	*tls_conf;
+typedef struct {
+	SSL_CTX		*ssl_ctx;			//!< Thread local SSL_CTX.
+} rlm_eap_peap_thread_t;
 
-	char const		*inner_eap_module;	//!< module name for inner EAP
-	fr_dict_enum_t		*auth_type_eap;
+typedef struct {
+	char const		*tls_conf_name;		//!< TLS configuration.
+	fr_tls_conf_t		*tls_conf;
+
 	bool			use_tunneled_reply;	//!< Use the reply attributes from the tunneled session in
 							//!< the non-tunneled reply to the client.
 
@@ -43,34 +44,57 @@ typedef struct rlm_eap_peap_t {
 #endif
 	char const		*virtual_server;	//!< Virtual server for inner tunnel session.
 
-	bool			soh;			//!< Do we do SoH request?
-	char const		*soh_virtual_server;
 	bool			req_client_cert;	//!< Do we do require a client cert?
 } rlm_eap_peap_t;
 
+static conf_parser_t submodule_config[] = {
+	{ FR_CONF_OFFSET("tls", rlm_eap_peap_t, tls_conf_name) },
 
-static CONF_PARSER submodule_config[] = {
-	{ FR_CONF_OFFSET("tls", FR_TYPE_STRING, rlm_eap_peap_t, tls_conf_name) },
+	{ FR_CONF_DEPRECATED("copy_request_to_tunnel", rlm_eap_peap_t, NULL), .dflt = "no" },
 
-	{ FR_CONF_OFFSET("inner_eap_module", FR_TYPE_STRING, rlm_eap_peap_t, inner_eap_module), },
-
-	{ FR_CONF_DEPRECATED("copy_request_to_tunnel", FR_TYPE_BOOL, rlm_eap_peap_t, NULL), .dflt = "no" },
-
-	{ FR_CONF_DEPRECATED("use_tunneled_reply", FR_TYPE_BOOL, rlm_eap_peap_t, NULL), .dflt = "no" },
+	{ FR_CONF_DEPRECATED("use_tunneled_reply", rlm_eap_peap_t, NULL), .dflt = "no" },
 
 #ifdef WITH_PROXY
-	{ FR_CONF_OFFSET("proxy_tunneled_request_as_eap", FR_TYPE_BOOL, rlm_eap_peap_t, proxy_tunneled_request_as_eap), .dflt = "yes" },
+	{ FR_CONF_OFFSET("proxy_tunneled_request_as_eap", rlm_eap_peap_t, proxy_tunneled_request_as_eap), .dflt = "yes" },
 #endif
 
-	{ FR_CONF_OFFSET("virtual_server", FR_TYPE_STRING | FR_TYPE_REQUIRED | FR_TYPE_NOT_EMPTY, rlm_eap_peap_t, virtual_server) },
+	{ FR_CONF_OFFSET_FLAGS("virtual_server", CONF_FLAG_REQUIRED | CONF_FLAG_NOT_EMPTY, rlm_eap_peap_t, virtual_server) },
 
-	{ FR_CONF_OFFSET("soh", FR_TYPE_BOOL, rlm_eap_peap_t, soh), .dflt = "no" },
+	{ FR_CONF_OFFSET("require_client_cert", rlm_eap_peap_t, req_client_cert), .dflt = "no" },
 
-	{ FR_CONF_OFFSET("require_client_cert", FR_TYPE_BOOL, rlm_eap_peap_t, req_client_cert), .dflt = "no" },
-
-	{ FR_CONF_OFFSET("soh_virtual_server", FR_TYPE_STRING, rlm_eap_peap_t, soh_virtual_server) },
 	CONF_PARSER_TERMINATOR
 };
+
+static fr_dict_t const *dict_freeradius;
+static fr_dict_t const *dict_radius;
+
+extern fr_dict_autoload_t rlm_eap_peap_dict[];
+fr_dict_autoload_t rlm_eap_peap_dict[] = {
+	{ .out = &dict_freeradius, .proto = "freeradius" },
+	{ .out = &dict_radius, .proto = "radius" },
+	{ NULL }
+};
+
+fr_dict_attr_t const *attr_auth_type;
+fr_dict_attr_t const *attr_eap_tls_require_client_cert;
+fr_dict_attr_t const *attr_proxy_to_realm;
+
+fr_dict_attr_t const *attr_eap_message;
+fr_dict_attr_t const *attr_freeradius_proxied_to;
+fr_dict_attr_t const *attr_user_name;
+
+extern fr_dict_attr_autoload_t rlm_eap_peap_dict_attr[];
+fr_dict_attr_autoload_t rlm_eap_peap_dict_attr[] = {
+	{ .out = &attr_auth_type, .name = "Auth-Type", .type = FR_TYPE_UINT32, .dict = &dict_freeradius },
+	{ .out = &attr_eap_tls_require_client_cert, .name = "EAP-TLS-Require-Client-Cert", .type = FR_TYPE_UINT32, .dict = &dict_freeradius },
+	{ .out = &attr_proxy_to_realm, .name = "Proxy-To-Realm", .type = FR_TYPE_STRING, .dict = &dict_freeradius },
+
+	{ .out = &attr_eap_message, .name = "EAP-Message", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
+	{ .out = &attr_freeradius_proxied_to, .name = "Vendor-Specific.FreeRADIUS.Proxied-To", .type = FR_TYPE_IPV4_ADDR, .dict = &dict_radius },
+	{ .out = &attr_user_name, .name = "User-Name", .type = FR_TYPE_STRING, .dict = &dict_radius },
+	{ NULL }
+};
+
 
 /*
  *	Allocate the PEAP per-session data
@@ -85,46 +109,29 @@ static peap_tunnel_t *peap_alloc(TALLOC_CTX *ctx, rlm_eap_peap_t *inst)
 	t->proxy_tunneled_request_as_eap = inst->proxy_tunneled_request_as_eap;
 #endif
 	t->virtual_server = inst->virtual_server;
-	t->soh = inst->soh;
-	t->soh_virtual_server = inst->soh_virtual_server;
 	t->session_resumption_state = PEAP_RESUMPTION_MAYBE;
 
 	return t;
 }
 
-/*
- *	Do authentication, by letting EAP-TLS do most of the work.
- */
-static rlm_rcode_t CC_HINT(nonnull) mod_process(void *instance, eap_session_t *eap_session);
-static rlm_rcode_t mod_process(void *arg, eap_session_t *eap_session)
+static unlang_action_t mod_handshake_resume(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request)
 {
-	int			rcode;
-	eap_tls_status_t	status;
-	rlm_eap_peap_t		*inst = (rlm_eap_peap_t *) arg;
+	rlm_eap_peap_t		*inst = talloc_get_type(mctx->mi->data, rlm_eap_peap_t);
 
+	rlm_rcode_t		rcode;
+
+	eap_session_t		*eap_session = talloc_get_type_abort(mctx->rctx, eap_session_t);
 	eap_tls_session_t	*eap_tls_session = talloc_get_type_abort(eap_session->opaque, eap_tls_session_t);
-	tls_session_t		*tls_session = eap_tls_session->tls_session;
-	peap_tunnel_t		*peap = NULL;
-	REQUEST			*request = eap_session->request;
+	fr_tls_session_t	*tls_session = eap_tls_session->tls_session;
+	peap_tunnel_t		*peap = talloc_get_type_abort(tls_session->opaque, peap_tunnel_t);
 
-	if (tls_session->opaque) {
-		peap = talloc_get_type_abort(tls_session->opaque, peap_tunnel_t);
-	/*
-	 *	Session resumption requires the storage of data, so
-	 *	allocate it if it doesn't already exist.
-	 */
+	if ((eap_tls_session->state == EAP_TLS_INVALID) || (eap_tls_session->state == EAP_TLS_FAIL)) {
+		REDEBUG("[eap-tls process] = %s", fr_table_str_by_value(eap_tls_status_table, eap_tls_session->state, "<INVALID>"));
 	} else {
-		peap = tls_session->opaque = peap_alloc(tls_session, inst);
+		RDEBUG2("[eap-tls process] = %s", fr_table_str_by_value(eap_tls_status_table, eap_tls_session->state, "<INVALID>"));
 	}
 
-	status = eap_tls_process(eap_session);
-	if ((status == EAP_TLS_INVALID) || (status == EAP_TLS_FAIL)) {
-		REDEBUG("[eap-tls process] = %s", fr_int2str(eap_tls_status_table, status, "<INVALID>"));
-	} else {
-		RDEBUG2("[eap-tls process] = %s", fr_int2str(eap_tls_status_table, status, "<INVALID>"));
-	}
-
-	switch (status) {
+	switch (eap_tls_session->state) {
 	/*
 	 *	EAP-TLS handshake was successful, tell the
 	 *	client to keep talking.
@@ -147,20 +154,27 @@ static rlm_rcode_t mod_process(void *arg, eap_session_t *eap_session)
 		 *	and EAP id from the inner tunnel, and update it with
 		 *	the expected EAP id!
 		 */
-		return RLM_MODULE_HANDLED;
+		RETURN_MODULE_HANDLED;
 
 	/*
 	 *	Handshake is done, proceed with decoding tunneled
 	 *	data.
 	 */
 	case EAP_TLS_RECORD_RECV_COMPLETE:
+                /*
+                 *     TLSv1.3 makes application data immediately
+                 *     available when the handshake is finished.
+                 */
+		if (SSL_is_init_finished(tls_session->ssl) && (peap->status == PEAP_STATUS_INVALID)) {
+			peap->status = PEAP_STATUS_TUNNEL_ESTABLISHED;
+		}
 		break;
 
 	/*
 	 *	Anything else: fail.
 	 */
 	default:
-		return RLM_MODULE_FAIL;
+		RETURN_MODULE_FAIL;
 	}
 
 	/*
@@ -178,51 +192,93 @@ static rlm_rcode_t mod_process(void *arg, eap_session_t *eap_session)
 	/*
 	 *	Process the PEAP portion of the request.
 	 */
-	rcode = eap_peap_process(eap_session, tls_session, inst->auth_type_eap);
+	eap_peap_process(&rcode, request, eap_session, tls_session);
 	switch (rcode) {
 	case RLM_MODULE_REJECT:
-		eap_tls_fail(eap_session);
+		eap_tls_fail(request, eap_session);
 		break;
 
 	case RLM_MODULE_HANDLED:
-		eap_tls_request(eap_session);
+		eap_tls_request(request, eap_session);
 		break;
 
 	case RLM_MODULE_OK:
+	{
+		eap_tls_prf_label_t prf_label;
+
+		eap_crypto_prf_label_init(&prf_label, eap_session,
+					  "client EAP encryption",
+					  sizeof("client EAP encryption") - 1);
+
 		/*
 		 *	Success: Automatically return MPPE keys.
 		 */
-		if (eap_tls_success(eap_session) < 0) return 0;
-		break;
+		if (eap_tls_success(request, eap_session, &prf_label) > 0) RETURN_MODULE_FAIL;
+		*p_result = rcode;
 
 		/*
-		 *	No response packet, MUST be proxying it.
-		 *	The main EAP module will take care of discovering
-		 *	that the request now has a "proxy" packet, and
-		 *	will proxy it, rather than returning an EAP packet.
+		 *	Write the session to the session cache
+		 *
+		 *	We do this here (instead of relying on OpenSSL to call the
+		 *	session caching callback), because we only want to write
+		 *	session data to the cache if all phases were successful.
+		 *
+		 *	If we wrote out the cache data earlier, and the server
+		 *	exited whilst the session was in progress, the supplicant
+		 *	could resume the session (and get access) even if phase2
+		 *	never completed.
 		 */
+		return fr_tls_cache_pending_push(request, tls_session);
+	}
+
+	/*
+	 *	No response packet, MUST be proxying it.
+	 *	The main EAP module will take care of discovering
+	 *	that the request now has a "proxy" packet, and
+	 *	will proxy it, rather than returning an EAP packet.
+	 */
 	case RLM_MODULE_UPDATED:
-#ifdef WITH_PROXY
-		rad_assert(eap_session->request->proxy != NULL);
-#endif
 		break;
 
 	default:
-		eap_tls_fail(eap_session);
+		eap_tls_fail(request, eap_session);
 		break;
 	}
 
-	return rcode;
+	RETURN_MODULE_RCODE(rcode);
+}
+
+/*
+ *	Do authentication, by letting EAP-TLS do most of the work.
+ */
+static unlang_action_t mod_handshake_process(UNUSED rlm_rcode_t *p_result, UNUSED module_ctx_t const *mctx,
+					     request_t *request)
+{
+	eap_session_t		*eap_session = eap_session_get(request->parent);
+
+	/*
+	 *	Setup the resumption frame to process the result
+	 */
+	(void)unlang_module_yield(request, mod_handshake_resume, NULL, 0, eap_session);
+
+	/*
+	 *	Process TLS layer until done.
+	 */
+	return eap_tls_process(request, eap_session);
 }
 
 /*
  *	Send an initial eap-tls request to the peer, using the libeap functions.
  */
-static rlm_rcode_t mod_session_init(void *type_arg, eap_session_t *eap_session)
+static unlang_action_t mod_session_init(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request)
 {
+	rlm_eap_peap_t		*inst = talloc_get_type_abort(mctx->mi->data, rlm_eap_peap_t);
+	rlm_eap_peap_thread_t	*t = talloc_get_type_abort(mctx->thread, rlm_eap_peap_thread_t);
+	eap_session_t		*eap_session = eap_session_get(request->parent);
 	eap_tls_session_t	*eap_tls_session;
-	rlm_eap_peap_t		*inst = talloc_get_type_abort(type_arg, rlm_eap_peap_t);
-	VALUE_PAIR		*vp;
+	fr_tls_session_t	*tls_session;
+
+	fr_pair_t		*vp;
 	bool			client_cert;
 
 	eap_session->tls = true;
@@ -231,20 +287,17 @@ static rlm_rcode_t mod_session_init(void *type_arg, eap_session_t *eap_session)
 	 *	EAP-TLS-Require-Client-Cert attribute will override
 	 *	the require_client_cert configuration option.
 	 */
-	vp = fr_pair_find_by_num(eap_session->request->control, 0, FR_EAP_TLS_REQUIRE_CLIENT_CERT, TAG_ANY);
+	vp = fr_pair_find_by_da(&request->control_pairs, NULL, attr_eap_tls_require_client_cert);
 	if (vp) {
 		client_cert = vp->vp_uint32 ? true : false;
 	} else {
 		client_cert = inst->req_client_cert;
 	}
 
-	eap_session->opaque = eap_tls_session = eap_tls_session_init(eap_session, inst->tls_conf, client_cert);
-	if (!eap_tls_session) return RLM_MODULE_FAIL;
+	eap_session->opaque = eap_tls_session = eap_tls_session_init(request, eap_session, t->ssl_ctx, client_cert);
+	if (!eap_tls_session) RETURN_MODULE_FAIL;
 
-	/*
-	 *	Set up type-specific information.
-	 */
-	eap_tls_session->tls_session->prf_label = "client EAP encryption";
+ 	tls_session = eap_tls_session->tls_session;
 
 	/*
 	 *	As it is a poorly designed protocol, PEAP uses
@@ -268,58 +321,64 @@ static rlm_rcode_t mod_session_init(void *type_arg, eap_session_t *eap_session)
 	 *	TLS session initialization is over.  Now handle TLS
 	 *	related handshaking or application data.
 	 */
-	if (eap_tls_start(eap_session) < 0) {
+	if (eap_tls_start(request, eap_session) < 0) {
 		talloc_free(eap_tls_session);
-		return RLM_MODULE_FAIL;
+		RETURN_MODULE_FAIL;
 	}
 
-	eap_session->process = mod_process;
+	/*
+	 *	Session resumption requires the storage of data, so
+	 *	allocate it if it doesn't already exist.
+	 */
+	tls_session->opaque = peap_alloc(tls_session, inst);
 
-	return RLM_MODULE_OK;
+	eap_session->process = mod_handshake_process;
+
+	RETURN_MODULE_HANDLED;
+}
+
+static int mod_thread_instantiate(module_thread_inst_ctx_t const *mctx)
+{
+	rlm_eap_peap_t		*inst = talloc_get_type_abort(mctx->mi->data, rlm_eap_peap_t);
+	rlm_eap_peap_thread_t	*t = talloc_get_type_abort(mctx->thread, rlm_eap_peap_thread_t);
+
+	t->ssl_ctx = fr_tls_ctx_alloc(inst->tls_conf, false);
+	if (!t->ssl_ctx) return -1;
+
+	return 0;
+}
+
+static int mod_thread_detach(module_thread_inst_ctx_t const *mctx)
+{
+	rlm_eap_peap_thread_t	*t = talloc_get_type_abort(mctx->thread, rlm_eap_peap_thread_t);
+
+	if (likely(t->ssl_ctx != NULL)) SSL_CTX_free(t->ssl_ctx);
+	t->ssl_ctx = NULL;
+
+	return 0;
 }
 
 /*
  *	Attach the module.
  */
-static int mod_instantiate(void *instance, CONF_SECTION *cs)
+static int mod_instantiate(module_inst_ctx_t const *mctx)
 {
-	rlm_eap_peap_t		*inst = talloc_get_type_abort(instance, rlm_eap_peap_t);
-	fr_dict_enum_t		*dv;
+	rlm_eap_peap_t		*inst = talloc_get_type_abort(mctx->mi->data, rlm_eap_peap_t);
+	CONF_SECTION		*conf = mctx->mi->conf;
 
 	if (!virtual_server_find(inst->virtual_server)) {
-		cf_log_err_by_name(cs, "virtual_server", "Unknown virtual server '%s'", inst->virtual_server);
+		cf_log_err_by_child(conf, "virtual_server", "Unknown virtual server '%s'", inst->virtual_server);
 		return -1;
-	}
-
-	if (inst->soh_virtual_server) {
-		if (!virtual_server_find(inst->soh_virtual_server)) {
-			cf_log_err_by_name(cs, "soh_virtual_server", "Unknown virtual server '%s'", inst->virtual_server);
-			return -1;
-		}
 	}
 
 	/*
 	 *	Read tls configuration, either from group given by 'tls'
 	 *	option, or from the eap-tls configuration.
 	 */
-	inst->tls_conf = eap_tls_conf_parse(cs, "tls");
+	inst->tls_conf = eap_tls_conf_parse(conf, "tls");
 	if (!inst->tls_conf) {
-		ERROR("Failed initializing SSL context");
+		cf_log_err(conf, "Failed initializing SSL context");
 		return -1;
-	}
-
-	/*
-	 *	Don't expose this if we don't need it.
-	 */
-	if (!inst->inner_eap_module) inst->inner_eap_module = "eap";
-
-	dv = fr_dict_enum_by_alias(NULL, fr_dict_attr_by_num(NULL, 0, FR_AUTH_TYPE), inst->inner_eap_module);
-	if (!dv) {
-		WARN("Failed to find 'Auth-Type %s' section in virtual server %s.  "
-		     "The server cannot proxy inner-tunnel EAP packets",
-		     inst->inner_eap_module, inst->virtual_server);
-	} else {
-		inst->auth_type_eap = dv;
 	}
 
 	return 0;
@@ -331,14 +390,17 @@ static int mod_instantiate(void *instance, CONF_SECTION *cs)
  */
 extern rlm_eap_submodule_t rlm_eap_peap;
 rlm_eap_submodule_t rlm_eap_peap = {
-	.name		= "eap_peap",
-	.magic		= RLM_MODULE_INIT,
+	.common = {
+		.magic			= MODULE_MAGIC_INIT,
+		.name			= "eap_peap",
+		.inst_size		= sizeof(rlm_eap_peap_t),
+		.config			= submodule_config,
+		.instantiate		= mod_instantiate,
 
-	.provides	= { FR_EAP_PEAP },
-	.inst_size	= sizeof(rlm_eap_peap_t),
-	.config		= submodule_config,
-	.instantiate	= mod_instantiate,
-
-	.session_init	= mod_session_init,	/* Initialise a new EAP session */
-	.process	= mod_process		/* Process next round of EAP method */
+		.thread_inst_size	= sizeof(rlm_eap_peap_thread_t),
+		.thread_instantiate	= mod_thread_instantiate,
+		.thread_detach		= mod_thread_detach,
+	},
+	.provides		= { FR_EAP_METHOD_PEAP },
+	.session_init		= mod_session_init,	/* Initialise a new EAP session */
 };

@@ -14,20 +14,28 @@
  *   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
-/**
- * $Id$
- * @file socket.c
- * @brief Functions for establishing and managing low level sockets.
+/** Functions for establishing and managing low level sockets
  *
- * @author Arran Cudbard-Bell <a.cudbardb@freeradius.org>
- * @author Alan DeKok <aland@freeradius.org>
+ * @file src/lib/util/socket.c
+ *
+ * @author Arran Cudbard-Bell (a.cudbardb@freeradius.org)
+ * @author Alan DeKok (aland@freeradius.org)
  *
  * @copyright 2015 The FreeRADIUS project
  */
-#include <freeradius-devel/libradius.h>
-#include <freeradius-devel/udpfromto.h>
+
+#include <freeradius-devel/util/debug.h>
+#include <freeradius-devel/util/misc.h>
+#include <freeradius-devel/util/socket.h>
+#include <freeradius-devel/util/strerror.h>
+#include <freeradius-devel/util/syserror.h>
+#include <freeradius-devel/util/udpfromto.h>
+#include <freeradius-devel/util/value.h>
+#include <freeradius-devel/util/cap.h>
 
 #include <fcntl.h>
+#include <sys/socket.h>
+#include <ifaddrs.h>
 
 /** Resolve a named service to a port
  *
@@ -37,13 +45,13 @@
  *	- > 0 the port port_name resolves to.
  *	- < 0 on error.
  */
-static uint16_t socket_port_from_service(int proto, char const *port_name)
+static int socket_port_from_service(int proto, char const *port_name)
 {
 	struct servent	*service;
 	char const	*proto_name;
 
 	if (!port_name) {
-		fr_strerror_printf("No port specified");
+		fr_strerror_const("No port specified");
 		return -1;
 	}
 
@@ -79,15 +87,15 @@ static uint16_t socket_port_from_service(int proto, char const *port_name)
 #ifdef FD_CLOEXEC
 static int socket_dont_inherit(int sockfd)
 {
-	int rcode;
+	int ret;
 
 	/*
 	 *	We don't want child processes inheriting these
 	 *	file descriptors.
 	 */
-	rcode = fcntl(sockfd, F_GETFD);
-	if (rcode >= 0) {
-		if (fcntl(sockfd, F_SETFD, rcode | FD_CLOEXEC) < 0) {
+	ret = fcntl(sockfd, F_GETFD);
+	if (ret >= 0) {
+		if (fcntl(sockfd, F_SETFD, ret | FD_CLOEXEC) < 0) {
 			fr_strerror_printf("Failed setting close on exec: %s", fr_syserror(errno));
 			return -1;
 		}
@@ -124,7 +132,8 @@ static int socket_inaddr_any_v6only(int sockfd, fr_ipaddr_t const *ipaddr)
 	 */
 	if (ipaddr->af == AF_INET6) {
 #  ifdef IPV6_V6ONLY
-		if (IN6_IS_ADDR_UNSPECIFIED(&ipaddr->addr.v6)) {
+		/* unconst for emscripten/musl */
+		if (IN6_IS_ADDR_UNSPECIFIED(UNCONST(struct in6_addr *, &ipaddr->addr.v6))) {
 			int on = 1;
 
 			if (setsockopt(sockfd, IPPROTO_IPV6, IPV6_V6ONLY,
@@ -200,38 +209,266 @@ static int socket_dont_fragment(UNUSED int sockfd, UNUSED int af)
 }
 #endif	/* lots of things */
 
-/** Check the proto value is sane/supported
+/** Bind a UDP/TCP v4/v6 socket to a given ipaddr src port, and interface.
  *
- * @param[in] proto to check
- * @return
- *	- true if it is.
- *	- false if it's not.
- */
-bool fr_socket_is_valid_proto(int proto)
-{
-	/*
-	 *	Check the protocol is sane
-	 */
-	switch (proto) {
-	case IPPROTO_UDP:
-	case IPPROTO_TCP:
-#ifdef IPPROTO_SCTP
-	case IPPROTO_SCTP:
-#endif
-		return true;
+ * Use one of:
+ * - fr_socket_server_udp - for non-connected socket.
+ * - fr_socket_server_tcp
+ * ...to open a file descriptor, then call this function to bind the socket to an IP address.
+ *
+ * @param[in] sockfd		the socket which opened by fr_socket_server_*.
+ * @param[in] ifname		to bind to.
+ * @param[in,out] src_ipaddr	The IP address to bind to.  Will be updated to the IP address
+ *				that was actually bound to. Pass NULL to just bind to an interface.
+ * @param[in] src_port		the port to bind to.  NULL if any port is allowed.
 
-	default:
-		fr_strerror_printf("Unknown IP protocol %d", proto);
-		return false;
+ * @return
+ *	- 0 on success
+ *	- -1 on failure.
+ */
+int fr_socket_bind(int sockfd, char const *ifname, fr_ipaddr_t *src_ipaddr, uint16_t *src_port)
+{
+	int				ret;
+	uint16_t			my_port = 0;
+	fr_ipaddr_t			my_ipaddr;
+	struct sockaddr_storage		salocal;
+	socklen_t			salen;
+
+	/*
+	 *	Clear the thread local error stack as we may
+	 *	push multiple errors onto the stack, and this
+	 *	is likely to be the function which returns
+	 *	the "original" error.
+	 */
+	fr_strerror_clear();
+
+	if (src_port) my_port = *src_port;
+	if (src_ipaddr) {
+		my_ipaddr = *src_ipaddr;
+	} else {
+		my_ipaddr = (fr_ipaddr_t) {
+			.af = AF_UNSPEC
+		};
 	}
+
+#ifdef HAVE_CAPABILITY_H
+	/*
+	 *	If we're binding to a special port as non-root, then
+	 *	check capabilities.  If we're root, we already have
+	 *	equivalent capabilities so we don't need to check.
+	 */
+	if (src_port && (*src_port < 1024) && (geteuid() != 0)) {
+		(void)fr_cap_enable(CAP_NET_BIND_SERVICE, CAP_EFFECTIVE);	/* Sets error on failure, which will be seen if the bind fails */
+	}
+#endif
+
+	/*
+	 *	Bind to a device BEFORE touching IP addresses.
+	 */
+	if (ifname) {
+#ifdef HAVE_NET_IF_H
+		unsigned int scope_id;
+
+		scope_id = if_nametoindex(ifname);
+		if (!scope_id) {
+			fr_strerror_printf_push("Failed finding interface %s: %s", ifname, fr_syserror(errno));
+			return -1;
+		}
+
+		/*
+		 *	If the scope ID hasn't already been set, then
+		 *	set it.  This allows us to get the scope from the interface name.
+		 */
+		if ((my_ipaddr.scope_id != 0) && (scope_id != my_ipaddr.scope_id)) {
+			fr_strerror_printf_push("Cannot bind to interface %s: Socket is already bound "
+						"to another interface", ifname);
+			return -1;
+		}
+#endif
+
+#ifdef SO_BINDTODEVICE
+		/*
+		 *	The caller didn't specify a scope_id, but we
+		 *	have one from above.  Call "bind to device",
+		 *	and set the scope_id.
+		 */
+		if (!my_ipaddr.scope_id) {
+			/*
+			 *	The internet hints that CAP_NET_RAW
+			 *	is required to use SO_BINDTODEVICE.
+			 *
+			 *	This function also sets fr_strerror()
+			 *	on failure, which will be seen if the
+			 *	bind fails.  If the bind succeeds,
+			 *	then we don't really care that the
+			 *	capability change has failed.  We must
+			 *	already have that capability.
+			 */
+#ifdef HAVE_CAPABILITY_H
+			(void)fr_cap_enable(CAP_NET_RAW, CAP_EFFECTIVE);
+#endif
+			ret = setsockopt(sockfd, SOL_SOCKET, SO_BINDTODEVICE, ifname, strlen(ifname));
+			if (ret < 0) {
+				fr_strerror_printf_push("Failed binding socket to interface %s: %s",
+							ifname, fr_syserror(errno));
+				return -1;
+			} /* else it worked. */
+
+			/*
+			 *	Set the scope ID.
+			 */
+			my_ipaddr.scope_id = scope_id;
+		}
+
+		/*
+		 *	SO_BINDTODEVICE succeeded, so we're always
+		 *	bound to the socket.
+		 */
+
+#elif defined(IP_BOUND_IF) || defined(IPV6_BOUND_IF)
+		{
+			int idx = scope_id;
+
+			if (my_ipaddr.af == AF_INET) {
+				if (unlikely(setsockopt(sockfd, IPPROTO_IP, IP_BOUND_IF, &idx, sizeof(idx)) < 0)) {
+				error:
+					fr_strerror_printf_push("Failed binding socket to interface %s: %s",
+								ifname, fr_syserror(errno));
+					return -1;
+				}
+
+			} else if (my_ipaddr.af == AF_INET6) {
+				if (unlikely(setsockopt(sockfd, IPPROTO_IPV6, IPV6_BOUND_IF, &idx, sizeof(idx)) < 0)) goto error;
+
+			} else {
+				fr_strerror_printf("Invalid address family for 'interface = ...'");
+				return -1;
+			}
+
+			my_ipaddr.scope_id = scope_id;
+		}
+
+#else
+		{
+			struct ifaddrs *list = NULL;
+			bool bound = false;
+
+			/*
+			 *	Troll through all interfaces to see if there's
+			 */
+			if (getifaddrs(&list) == 0) {
+				struct ifaddrs *i;
+
+				for (i = list; i != NULL; i = i->ifa_next) {
+					if (i->ifa_addr && i->ifa_name && (strcmp(i->ifa_name, ifname) == 0)) {
+						/*
+						 *	IPv4, and there's either no src_ip, OR src_ip is INADDR_ANY,
+						 *	it's a match.
+						 *
+						 *	We also update my_ipaddr to point to this particular IP,
+						 *	so that we can later bind() to it.  This gets us the same
+						 *	effect as SO_BINDTODEVICE.
+						 */
+						if ((i->ifa_addr->sa_family == AF_INET) &&
+						    (!src_ipaddr || fr_ipaddr_is_inaddr_any(src_ipaddr))) {
+							(void) fr_ipaddr_from_sockaddr(&my_ipaddr, NULL,
+										       (struct sockaddr_storage *) i->ifa_addr,
+										       sizeof(struct sockaddr_in));
+							my_ipaddr.scope_id = scope_id;
+							bound = true;
+							break;
+						}
+
+						/*
+						 *	The caller specified a source IP, and we find a matching
+						 *	address family.  Allow it.
+						 *
+						 *	Note that we do NOT check for matching IPs here.  If we did,
+						 *	then binding to an interface and the *wrong* IP would get us
+						 *	a "bind to device is unsupported" message.
+						 *
+						 *	Instead we say "yes, we found a matching interface", and then
+						 *	allow the bind() call below to run.  If that fails, we get a
+						 *	"Can't assign requested address" error, which is more informative.
+						 */
+						if (src_ipaddr && (src_ipaddr->af == i->ifa_addr->sa_family)) {
+							my_ipaddr.scope_id = scope_id;
+							bound = true;
+							break;
+						}
+					}
+				}
+
+				freeifaddrs(list);
+
+				if (!bound) {
+					/*
+					 *	IPv4: no link local addresses,
+					 *	and no bind to device.
+					 */
+					fr_strerror_printf_push("Bind to interface %s failed: Unable to match "
+							        "interface with the given IP address.", ifname);
+					return -1;
+				}
+			} else {
+				fr_strerror_printf_push("Bind to interface %s failed, unable to get list of interfaces: %s",
+							ifname, fr_syserror(errno));
+				return -1;
+			}
+		}
+#endif
+	} /* else no interface was passed in */
+
+	/*
+	 *	Don't bind to an IP address if there's no src IP address.
+	 */
+	if (my_ipaddr.af == AF_UNSPEC) goto done;
+
+	/*
+	 *	Set up sockaddr stuff.
+	 */
+	if (fr_ipaddr_to_sockaddr(&salocal, &salen, &my_ipaddr, my_port) < 0) return -1;
+
+	ret = bind(sockfd, (struct sockaddr *) &salocal, salen);
+	if (ret < 0) {
+		fr_strerror_printf_push("Bind failed with source address %pV:%pV on interface %s: %s",
+					src_ipaddr ? fr_box_ipaddr(*src_ipaddr) : fr_box_strvalue("*"),
+					src_port ? fr_box_int16(*src_port) : fr_box_strvalue("*"),
+					ifname ? ifname : "*",
+					fr_syserror(errno));
+		return ret;
+	}
+
+	if (!src_port) goto done;
+
+	/*
+	 *	FreeBSD jail issues.  We bind to 0.0.0.0, but the
+	 *	kernel instead binds us to a 1.2.3.4.  So once the
+	 *	socket is bound, ask it what it's IP address is.
+	 */
+	salen = sizeof(salocal);
+	memset(&salocal, 0, salen);
+	if (getsockname(sockfd, (struct sockaddr *) &salocal, &salen) < 0) {
+		fr_strerror_printf_push("Failed getting socket name: %s", fr_syserror(errno));
+		return -1;
+	}
+
+	if (fr_ipaddr_from_sockaddr(&my_ipaddr, &my_port, &salocal, salen) < 0) return -1;
+	*src_port = my_port;
+	*src_ipaddr = my_ipaddr;
+
+done:
+#ifdef HAVE_CAPABILITY_H
+	/*
+	 *	Clear any errors we may have produced in the
+	 *	capabilities check.
+	 */
+	fr_strerror_clear();
+#endif
+	return 0;
 }
 
 #ifdef HAVE_SYS_UN_H
-#  include <sys/un.h>
-#  ifndef SUN_LEN
-#    define SUN_LEN(su)  (sizeof(*(su)) - sizeof((su)->sun_path) + strlen((su)->sun_path))
-#  endif
-
 /** Open a Unix socket
  *
  * @note If the file doesn't exist then errno will be set to ENOENT.
@@ -241,7 +478,7 @@ bool fr_socket_is_valid_proto(int proto)
    sockfd = fr_socket_client_unix(path, true);
    if (sockfd < 0) {
    	fr_perror();
-   	exit(1);
+   	fr_exit_now(1);
    }
    if ((errno == EINPROGRESS) && (fr_socket_wait_for_connect(sockfd, timeout) < 0)) {
    error:
@@ -331,6 +568,35 @@ int fr_socket_client_unix(UNUSED char const *path, UNUSED bool async)
 }
 #endif /* WITH_SYS_UN_H */
 
+#if defined SO_BINDTODEVICE || defined IP_BOUND_IF
+static inline CC_HINT(always_inline) int socket_bind_ifname(int sockfd, char const *ifname)
+#else
+static inline CC_HINT(always_inline) int socket_bind_ifname(UNUSED int sockfd, UNUSED char const *ifname)
+#endif
+{
+#if defined(SO_BINDTODEVICE)
+	if (setsockopt(sockfd, SOL_SOCKET, SO_BINDTODEVICE, ifname, strlen(ifname)) < 0) {
+		fr_strerror_printf("Failed binding socket to %s: %s", ifname, fr_syserror(errno));
+		return -1;
+	}
+#elif defined(IP_BOUND_IF)
+	{
+		int idx = if_nametoindex(ifname);
+		if (idx == 0) {
+		error:
+			fr_strerror_printf("Failed binding socket to %s: %s", ifname, fr_syserror(errno));
+			return -1;
+		}
+		if (unlikely(setsockopt(sockfd, IPPROTO_IP, IP_BOUND_IF, &idx, sizeof(idx)) < 0)) goto error;
+	}
+#else
+	fr_strerror_const("Binding sockets to interfaces not supported on this platform");
+	return -1;
+#endif
+
+	return 0;
+}
+
 /** Establish a connected UDP socket
  *
  * Connected UDP sockets can be used with write(), unlike unconnected sockets
@@ -338,10 +604,10 @@ int fr_socket_client_unix(UNUSED char const *path, UNUSED bool async)
  *
  * The following code demonstrates using this function with a connection timeout:
  @code {.c}
-   sockfd = fr_socket_client_udp(NULL, NULL, ipaddr, port, true);
+   sockfd = fr_socket_client_udp(NULL, NULL, NULL, ipaddr, port, true);
    if (sockfd < 0) {
    	fr_perror();
-   	exit(1);
+   	fr_exit_now(1);
    }
    if ((errno == EINPROGRESS) && (fr_socket_wait_for_connect(sockfd, timeout) < 0)) {
    error:
@@ -353,18 +619,20 @@ int fr_socket_client_unix(UNUSED char const *path, UNUSED bool async)
    if (fr_blocking(sockfd) < 0) goto error;
  @endcode
  *
+ * @param[in] ifname		If non-NULL, bind the socket to this interface.
  * @param[in,out] src_ipaddr	to bind socket to, may be NULL if socket is not bound to any specific
- *			address.  If non-null, the bound IP is copied here, too.
- * @param[out] src_port	The source port we were bound to, may be NULL.
- * @param dst_ipaddr	Where to send datagrams.
- * @param dst_port	Where to send datagrams.
- * @param async		Whether to set the socket to nonblocking, allowing use of
- *			#fr_socket_wait_for_connect.
+ *				address.  If non-null, the bound IP is copied here, too.
+ * @param[out] src_port		The source port we were bound to, may be NULL.
+ * @param[in] dst_ipaddr	Where to send datagrams.
+ * @param[in] dst_port		Where to send datagrams.
+ * @param[in] async		Whether to set the socket to nonblocking, allowing use of
+ *				#fr_socket_wait_for_connect.
  * @return
  *	- FD on success.
  *	- -1 on failure.
  */
-int fr_socket_client_udp(fr_ipaddr_t *src_ipaddr, uint16_t *src_port, fr_ipaddr_t const *dst_ipaddr, uint16_t dst_port, bool async)
+int fr_socket_client_udp(char const *ifname, fr_ipaddr_t *src_ipaddr, uint16_t *src_port,
+			 fr_ipaddr_t const *dst_ipaddr, uint16_t dst_port, bool async)
 {
 	int			sockfd;
 	struct sockaddr_storage salocal;
@@ -385,27 +653,6 @@ int fr_socket_client_udp(fr_ipaddr_t *src_ipaddr, uint16_t *src_port, fr_ipaddr_
 	}
 
 	/*
-	 *	Allow the caller to bind us to a specific source IP.
-	 */
-	if (src_ipaddr && (src_ipaddr->af != AF_UNSPEC)) {
-		/*
-		 *	Ensure don't fragment bit is set
-		 */
-		if (socket_dont_fragment(sockfd, src_ipaddr->af) < 0) goto error;
-
-		if (fr_ipaddr_to_sockaddr(src_ipaddr, 0, &salocal, &salen) < 0) {
-			close(sockfd);
-			return -1;
-		}
-
-		if (bind(sockfd, (struct sockaddr *) &salocal, salen) < 0) {
-			fr_strerror_printf("Failure binding to IP: %s", fr_syserror(errno));
-			close(sockfd);
-			return -1;
-		}
-	}
-
-	/*
 	 *	Although we ignore SIGPIPE, some operating systems
 	 *	like BSD and OSX ignore the ignoring.
 	 *
@@ -421,39 +668,12 @@ int fr_socket_client_udp(fr_ipaddr_t *src_ipaddr, uint16_t *src_port, fr_ipaddr_
 	}
 #endif
 
-	/*
-	 *	FreeBSD jail issues.  We bind to 0.0.0.0, but the
-	 *	kernel instead binds us to a 1.2.3.4.  So once the
-	 *	socket is bound, ask it what it's IP address is.
-	 */
-	if (src_ipaddr || src_port) {
-		fr_ipaddr_t		my_ipaddr;
-		uint16_t		my_port;
-
-		salen = sizeof(salocal);
-		memset(&salocal, 0, salen);
-		if (getsockname(sockfd, (struct sockaddr *) &salocal, &salen) < 0) {
-			close(sockfd);
-			fr_strerror_printf("Failed getting socket name: %s", fr_syserror(errno));
-			return -1;
-		}
-
-		/*
-		 *	Return these if the caller cared.
-		 */
-		if (!src_ipaddr) src_ipaddr = &my_ipaddr;
-		if (!src_port) src_port = &my_port;
-
-		if (fr_ipaddr_from_sockaddr(&salocal, salen, src_ipaddr, src_port) < 0) {
-			close(sockfd);
-			return -1;
-		}
-	}
+	if (unlikely(fr_socket_bind(sockfd, ifname, src_ipaddr, src_port) < 0)) goto error;
 
 	/*
 	 *	And now get our destination
 	 */
-	if (fr_ipaddr_to_sockaddr(dst_ipaddr, dst_port, &salocal, &salen) < 0) {
+	if (fr_ipaddr_to_sockaddr(&salocal, &salen, dst_ipaddr, dst_port) < 0) {
 		close(sockfd);
 		return -1;
 	}
@@ -480,10 +700,10 @@ int fr_socket_client_udp(fr_ipaddr_t *src_ipaddr, uint16_t *src_port, fr_ipaddr_
  *
  * The following code demonstrates using this function with a connection timeout:
  @code {.c}
-   sockfd = fr_socket_client_tcp(NULL, ipaddr, port, true);
+   sockfd = fr_socket_client_tcp(NULL, NULL, ipaddr, port, true);
    if (sockfd < 0) {
    	fr_perror();
-   	exit(1);
+   	fr_exit_now(1);
    }
    if ((errno == EINPROGRESS) && (fr_socket_wait_for_connect(sockfd, timeout) < 0)) {
    error:
@@ -495,6 +715,7 @@ int fr_socket_client_udp(fr_ipaddr_t *src_ipaddr, uint16_t *src_port, fr_ipaddr_
    if (fr_blocking(sockfd) < 0) goto error;
  @endcode
  *
+ * @param[in] ifname	If non-NULL, bind the socket to this interface.
  * @param src_ipaddr	to bind socket to, may be NULL if socket is not bound to any specific
  *			address.
  * @param dst_ipaddr	Where to connect to.
@@ -505,7 +726,8 @@ int fr_socket_client_udp(fr_ipaddr_t *src_ipaddr, uint16_t *src_port, fr_ipaddr_
  *	- FD on success
  *	- -1 on failure.
  */
-int fr_socket_client_tcp(fr_ipaddr_t const *src_ipaddr, fr_ipaddr_t const *dst_ipaddr, uint16_t dst_port, bool async)
+int fr_socket_client_tcp(char const *ifname, fr_ipaddr_t *src_ipaddr,
+			 fr_ipaddr_t const *dst_ipaddr, uint16_t dst_port, bool async)
 {
 	int			sockfd;
 	struct sockaddr_storage	salocal;
@@ -520,27 +742,14 @@ int fr_socket_client_tcp(fr_ipaddr_t const *src_ipaddr, fr_ipaddr_t const *dst_i
 	}
 
 	if (async && (fr_nonblock(sockfd) < 0)) {
+	error:
 		close(sockfd);
 		return -1;
 	}
 
-	/*
-	 *	Allow the caller to bind us to a specific source IP.
-	 */
-	if (src_ipaddr && (src_ipaddr->af != AF_UNSPEC)) {
-		if (fr_ipaddr_to_sockaddr(src_ipaddr, 0, &salocal, &salen) < 0) {
-			close(sockfd);
-			return -1;
-		}
+	if (unlikely(fr_socket_bind(sockfd, ifname, src_ipaddr, NULL) < 0)) goto error;
 
-		if (bind(sockfd, (struct sockaddr *) &salocal, salen) < 0) {
-			fr_strerror_printf("Failure binding to IP: %s", fr_syserror(errno));
-			close(sockfd);
-			return -1;
-		}
-	}
-
-	if (fr_ipaddr_to_sockaddr(dst_ipaddr, dst_port, &salocal, &salen) < 0) {
+	if (fr_ipaddr_to_sockaddr(&salocal, &salen, dst_ipaddr, dst_port) < 0) {
 		close(sockfd);
 		return -1;
 	}
@@ -591,10 +800,9 @@ int fr_socket_client_tcp(fr_ipaddr_t const *src_ipaddr, fr_ipaddr_t const *dst_i
  *	- -2 on timeout.
  *	- -3 on select error.
  */
-int fr_socket_wait_for_connect(int sockfd, struct timeval const *timeout)
+int fr_socket_wait_for_connect(int sockfd, fr_time_delta_t timeout)
 {
 	int	ret;
-	struct	timeval tv = *timeout;
 	fd_set	error_set;
 	fd_set	write_set;	/* POSIX says sockets are open when they become writable */
 
@@ -606,7 +814,7 @@ int fr_socket_wait_for_connect(int sockfd, struct timeval const *timeout)
 
 	/* Don't let signals mess up the select */
 	do {
-		ret = select(sockfd + 1, NULL, &write_set, &error_set, &tv);
+		ret = select(sockfd + 1, NULL, &write_set, &error_set, &fr_time_delta_to_timeval(timeout));
 	} while ((ret == -1) && (errno == EINTR));
 
 	switch (ret) {
@@ -621,16 +829,15 @@ int fr_socket_wait_for_connect(int sockfd, struct timeval const *timeout)
 		}
 
 		if (FD_ISSET(sockfd, &error_set)) {
-			fr_strerror_printf("Failed connecting socket: Unknown error");
+			fr_strerror_const("Failed connecting socket: Unknown error");
 			return -1;
 		}
 	}
 		return 0;
 
 	case 0: /* timeout */
-		if (!fr_cond_assert(timeout)) return -1;
-		fr_strerror_printf("Connection timed out after %" PRIu64"ms",
-				   (timeout->tv_sec * (uint64_t)1000) + (timeout->tv_usec / 1000));
+		if (!fr_cond_assert(fr_time_delta_ispos(timeout))) return -1;
+		fr_strerror_printf("Connection timed out after %pVs", fr_box_time_delta(timeout));
 		return -2;
 
 	case -1: /* select error */
@@ -668,7 +875,7 @@ int fr_socket_server_udp(fr_ipaddr_t const *src_ipaddr, uint16_t *src_port, char
 	 *	Check IP looks OK
 	 */
 	if (!src_ipaddr || ((src_ipaddr->af != AF_INET) && (src_ipaddr->af != AF_INET6))) {
-		fr_strerror_printf("No address specified");
+		fr_strerror_const("No address specified");
 		return -1;
 	}
 
@@ -707,15 +914,13 @@ int fr_socket_server_udp(fr_ipaddr_t const *src_ipaddr, uint16_t *src_port, char
 	 */
 	if (socket_dont_inherit(sockfd) < 0) goto error;
 
-#ifdef WITH_UDPFROMTO
 	/*
 	 *	Initialize udpfromto for UDP sockets.
 	 */
-	if (udpfromto_init(sockfd) != 0) {
+	if (udpfromto_init(sockfd, src_ipaddr->af) != 0) {
 		fr_strerror_printf("Failed initializing udpfromto: %s", fr_syserror(errno));
 		goto error;
 	}
-#endif
 
 	/*
 	 *	Make sure we don't get v4 and v6 packets on inaddr_any sockets.
@@ -772,7 +977,7 @@ int fr_socket_server_tcp(fr_ipaddr_t const *src_ipaddr, uint16_t *src_port, char
 	 *	Check IP looks OK
 	 */
 	if (!src_ipaddr || ((src_ipaddr->af != AF_INET) && (src_ipaddr->af != AF_INET6))) {
-		fr_strerror_printf("No address specified");
+		fr_strerror_const("No address specified");
 		return -1;
 	}
 
@@ -829,112 +1034,4 @@ int fr_socket_server_tcp(fr_ipaddr_t const *src_ipaddr, uint16_t *src_port, char
 	if (src_port) *src_port = my_port;
 
 	return sockfd;
-}
-
-/** Bind a UDP/TCP v4/v6 socket to a given ipaddr src port, and interface.
- *
- * Use one of:
- * - fr_socket_client_udp - for a connected socket.
- * - fr_socket_server_udp - for non-connected socket.
- * - fr_socket_server_tcp
- * ...to open a file descriptor, then call this function to bind the socket to an IP address.
- *
- * @param[in] sockfd		the socket which opened by fr_socket_server_*.
- * @param[in,out] src_ipaddr	The IP address to bind to.
- * @param[in] src_port		the port to bind to.  NULL if any port is allowed.
- * @param[in] interface		to bind to.
- * @return
- *	- 0 on success
- *	- -1 on failure.
- */
-int fr_socket_bind(int sockfd, fr_ipaddr_t const *src_ipaddr, uint16_t *src_port, char const *interface)
-{
-	int			rcode;
-	uint16_t		my_port = 0;
-	fr_ipaddr_t		my_ipaddr = *src_ipaddr;
-	struct sockaddr_storage	salocal;
-	socklen_t		salen;
-
-	if (src_port) my_port = *src_port;
-
-	/*
-	 *	Bind to a device BEFORE touching IP addresses.
-	 */
-	if (interface) {
-#ifdef SO_BINDTODEVICE
-		struct ifreq ifreq;
-
-		memset(&ifreq, 0, sizeof(ifreq));
-		strlcpy(ifreq.ifr_name, interface, sizeof(ifreq.ifr_name));
-
-		rcode = setsockopt(sockfd, SOL_SOCKET, SO_BINDTODEVICE, (char *)&ifreq, sizeof(ifreq));
-		if (rcode < 0) {
-			fr_strerror_printf("Failed binding to interface %s: %s", interface, fr_syserror(errno));
-			return -1;
-		} /* else it worked. */
-#else
-
-#  ifdef HAVE_STRUCT_SOCKADDR_IN6
-#  ifdef HAVE_NET_IF_H
-		/*
-		 *	Odds are that any system supporting "bind to
-		 *	device" also supports IPv6, so this next bit
-		 *	isn't necessary.  But it's here for
-		 *	completeness.
-		 *
-		 *	If we're doing IPv6, and the scope hasn't yet
-		 *	been defined, set the scope to the scope of
-		 *	the interface.
-		 */
-		if (my_ipaddr.af == AF_INET6) {
-			if (my_ipaddr.scope_id == 0) {
-				my_ipaddr.scope_id = if_nametoindex(interface);
-				if (my_ipaddr.scope_id == 0) {
-					fr_strerror_printf("Failed finding interface %s: %s",
-							   interface, fr_syserror(errno));
-					return -1;
-				}
-			} /* else scope was defined: we're OK. */
-		} else
-#  endif
-#endif
-		{
-			/*
-			 *	IPv4: no link local addresses,
-			 *	and no bind to device.
-			 */
-			fr_strerror_printf("Failed binding to interface %s: \"bind to device\" is unsupported",
-					   interface);
-			return -1;
-		}
-#endif
-	} /* else no interface */
-
-	/*
-	 *	Set up sockaddr stuff.
-	 */
-	if (fr_ipaddr_to_sockaddr(&my_ipaddr, my_port, &salocal, &salen) < 0) return -1;
-
-	rcode = bind(sockfd, (struct sockaddr *) &salocal, salen);
-	if (rcode < 0) {
-		fr_strerror_printf("Bind failed: %s", fr_syserror(errno));
-		return rcode;
-	}
-
-	/*
-	 *	FreeBSD jail issues.  We bind to 0.0.0.0, but the
-	 *	kernel instead binds us to a 1.2.3.4.  So once the
-	 *	socket is bound, ask it what it's IP address is.
-	 */
-	salen = sizeof(salocal);
-	memset(&salocal, 0, salen);
-	if (getsockname(sockfd, (struct sockaddr *) &salocal, &salen) < 0) {
-		fr_strerror_printf("Failed getting socket name: %s", fr_syserror(errno));
-		return -1;
-	}
-
-	if (fr_ipaddr_from_sockaddr(&salocal, salen, &my_ipaddr, &my_port) < 0) return -1;
-	if (src_port) *src_port = my_port;
-
-	return 0;
 }

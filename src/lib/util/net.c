@@ -13,169 +13,43 @@
  *   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
-/**
- * $Id$
- * @file net.c
- * @brief Functions to parse raw packets.
+/** Functions for parsing raw network packets
  *
- * @author Arran Cudbard-Bell <a.cudbardb@freeradius.org>
- * @copyright 2014-2015 Arran Cudbard-Bell <a.cudbardb@freeradius.org>
+ * @file src/lib/util/net.c
+ *
+ * @author Arran Cudbard-Bell (a.cudbardb@freeradius.org)
+ * @copyright 2014-2015 Arran Cudbard-Bell (a.cudbardb@freeradius.org)
  */
-#include <freeradius-devel/libradius.h>
-#include <freeradius-devel/net.h>
+#include <freeradius-devel/util/net.h>
 
 /** Strings for L4 protocols
  *
  */
-FR_NAME_NUMBER const fr_net_ip_proto_table[] = {
-	{ "UDP",	IPPROTO_UDP },
-	{ "TCP",	IPPROTO_TCP },
-	{ NULL, 0 }
+fr_table_num_sorted_t const fr_net_ip_proto_table[] = {
+	{ L("ICMP"),	IPPROTO_ICMP	},
+	{ L("ICMPv6"),	IPPROTO_ICMPV6	},
+	{ L("TCP"),	IPPROTO_TCP	},
+	{ L("UDP"),	IPPROTO_UDP	}
 };
+size_t fr_net_ip_proto_table_len = NUM_ELEMENTS(fr_net_ip_proto_table);
 
 /** Strings for socket types
  *
  */
-FR_NAME_NUMBER const fr_net_sock_type_table[] = {
-	{ "UDP",	SOCK_DGRAM },
-	{ "TCP",	SOCK_STREAM },
-	{ NULL, 0 }
+fr_table_num_sorted_t const fr_net_sock_type_table[] = {
+	{ L("TCP"),	SOCK_STREAM	},
+	{ L("UDP"),	SOCK_DGRAM	}
 };
+size_t fr_net_sock_type_table_len = NUM_ELEMENTS(fr_net_sock_type_table);
 
 /** Strings for address families
  *
  */
-FR_NAME_NUMBER const fr_net_af_table[] = {
-	{ "IPv4",	AF_INET },
-	{ "IPv6",	AF_INET6 },
-	{ NULL, 0 }
+fr_table_num_sorted_t const fr_net_af_table[] = {
+	{ L("IPv4"),	AF_INET		},
+	{ L("IPv6"),	AF_INET6	}
 };
-
-/** Check whether fr_link_layer_offset can process a link_layer
- *
- * @param link_layer to check.
- * @return
- *	- true if supported.
- *	- false if not supported.
- */
-bool fr_link_layer_supported(int link_layer)
-{
-	switch (link_layer) {
-	case DLT_EN10MB:
-	case DLT_RAW:
-	case DLT_NULL:
-	case DLT_LOOP:
-#ifdef DLT_LINUX_SLL
-	case DLT_LINUX_SLL:
-#endif
-	case DLT_PFLOG:
-		return true;
-
-	default:
-		return false;
-	}
-}
-
-/** Returns the length of the link layer header
- *
- * Libpcap does not include a decoding function to skip the L2 header, but it does
- * at least inform us of the type.
- *
- * Unfortunately some headers are of variable length (like ethernet), so additional
- * decoding logic is required.
- *
- * @note No header data is returned, this is only meant to be used to determine how
- * data to consume before attempting to parse the IP header.
- *
- * @param data start of packet data.
- * @param len caplen.
- * @param link_layer value returned from pcap_linktype.
- * @return
- *	- Length of the header.
- *	- -1 on failure.
- */
-ssize_t fr_link_layer_offset(uint8_t const *data, size_t len, int link_layer)
-{
-	uint8_t const *p = data;
-
-	switch (link_layer) {
-	case DLT_RAW:
-		break;
-
-	case DLT_NULL:
-	case DLT_LOOP:
-		p += 4;
-		if (((size_t)(p - data)) > len) {
-		ood:
-			fr_strerror_printf("Out of data, needed %zu bytes, have %zu bytes",
-					   (size_t)(p - data), len);
-			return -1;
-		}
-		break;
-
-	case DLT_EN10MB:
-	{
-		uint16_t ether_type;	/* Ethernet type */
-		int i;
-
-		p += 12;		/* SRC/DST Mac-Addresses */
-		if (((size_t)(p - data)) > len) {
-			goto ood;
-		}
-
-		for (i = 0; i < 3; i++) {
-			ether_type = ntohs(*((uint16_t const *) p));
-			switch (ether_type) {
-			/*
-			 *	There are a number of devices out there which
-			 *	double tag with 0x8100 *sigh*
-			 */
-			case 0x8100:	/* CVLAN */
-			case 0x9100:	/* SVLAN */
-			case 0x9200:	/* SVLAN */
-			case 0x9300:	/* SVLAN */
-				p += 4;
-				if (((size_t)(p - data)) > len) {
-					goto ood;
-				}
-				break;
-
-			default:
-				p += 2;
-				if (((size_t)(p - data)) > len) {
-					goto ood;
-				}
-				goto done;
-			}
-		}
-		fr_strerror_printf("Exceeded maximum level of VLAN tag nesting (2)");
-		return -1;
-	}
-
-#ifdef DLT_LINUX_SLL
-	case DLT_LINUX_SLL:
-		p += 16;
-		if (((size_t)(p - data)) > len) {
-			goto ood;
-		}
-		break;
-#endif
-
-	case DLT_PFLOG:
-		p += 28;
-		if (((size_t)(p - data)) > len) {
-			goto ood;
-		}
-		break;
-
-	default:
-		fr_strerror_printf("Unsupported link layer type %i", link_layer);
-		return -1;
-	}
-
-done:
-	return p - data;
-}
+size_t fr_net_af_table_len = NUM_ELEMENTS(fr_net_af_table);
 
 /** Check UDP header is valid
  *
@@ -195,30 +69,31 @@ done:
 	/*
 	 *	UDP header validation.
 	 */
-	udp = (udp_header_t const *)data;
 	uint16_t udp_len;
-	ssize_t diff;
+	ssize_t actual_len;
 	uint16_t expected;
 
+	udp = (udp_header_t const *)data;
 	udp_len = ntohs(udp->len);
-	diff = udp_len - remaining;
+	actual_len = remaining;
 	/* Truncated data */
-	if (diff > 0) {
+	if (udp_len > actual_len) {
 		fr_strerror_printf("packet too small by %zi bytes, UDP header + Payload should be %hu bytes",
-				   diff, udp_len);
+				   (udp_len - actual_len), udp_len);
 		return -1;
 	}
 	/* Trailing data */
-	else if (diff < 0) {
+	else if (udp_len < actual_len) {
 		fr_strerror_printf("Packet too big by %zi bytes, UDP header + Payload should be %hu bytes",
-				   diff * -1, udp_len);
+				   (actual_len - udp_len), udp_len);
 		return -1;
 	}
 
-	expected = fr_udp_checksum((uint8_t const *) udp, ntohs(udp->len), udp->checksum,
+	/* coverity[tainted_data] */
+	expected = fr_udp_checksum((uint8_t const *) udp, udp_len, udp->checksum,
 				   ip->ip_src, ip->ip_dst);
 	if (udp->checksum != expected) {
-		fr_strerror_printf("DHCP: UDP checksum invalid, packet: 0x%04hx calculated: 0x%04hx",
+		fr_strerror_printf("UDP checksum invalid, packet: 0x%04hx calculated: 0x%04hx",
 				   ntohs(udp->checksum), ntohs(expected));
 		/* Not a fatal error */
 		ret = 1;
@@ -285,6 +160,29 @@ uint16_t fr_ip_header_checksum(uint8_t const *data, uint8_t ihl)
 
 	for (sum = 0; nwords > 0; nwords--) {
 		sum += *p++;
+	}
+	sum = (sum >> 16) + (sum & 0xffff);
+	sum += (sum >> 16);
+	return ((uint16_t) ~sum);
+}
+
+uint16_t fr_ip6_pesudo_header_checksum(struct in6_addr const *src, struct in6_addr const *dst, uint16_t ip_len, uint8_t ip_next)
+{
+	uint64_t sum = 0;
+	ip_pseudo_header6_t ip6; /* Keep correct alignment for the pointer */
+	uint8_t const *p = (uint8_t const *) &ip6;
+	int8_t nwords = sizeof(ip6) >> 1; /* number of 16-bit words */
+
+	memcpy(&ip6.ip_src, src, sizeof(ip6.ip_src));
+	memcpy(&ip6.ip_dst, dst, sizeof(ip6.ip_dst));
+	ip6.ip_len = ip_len;
+	ip6.ip_next = ip_next;
+
+	for (sum = 0; nwords > 0; nwords--) {
+		uint16_t word;
+		memcpy(&word, p, sizeof(word)); /* Can't use a uint16_t * as GCC flags this for unaligned access */
+		sum += word;
+		p += sizeof(word);
 	}
 	sum = (sum >> 16) + (sum & 0xffff);
 	sum += (sum >> 16);

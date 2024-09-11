@@ -1,18 +1,21 @@
 #
 # PRE: update if
 #
-update {
-       control:Cleartext-Password := 'hello'
+
+Vendor-Specific.Cisco.AVPair := { 'foo=bar', 'bar=baz', 'baz=foo' }
+
+
+if (Vendor-Specific.Cisco.AVPair[1] =~ /bar=(.*)/) {
+	if (!("%{1}" == 'baz')) {
+		test_fail
+	}
+}
+else {
+	test_fail
 }
 
-update request {
-	Cisco-AVPair := 'foo=bar'
-	Cisco-AVPair += 'bar=baz'
-	Cisco-AVPair += 'baz=foo'
-}
-
-if (&Cisco-AVPair[*] =~ /bar=(.*)/) {
-	if ("%{1}" != 'baz') {
+if (Vendor-Specific.Cisco.AVPair[*] =~ /bar=(.*)/) {
+	if (!("%{1}" == 'baz')) {
 		test_fail
 	}
 }

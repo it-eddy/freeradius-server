@@ -1,5 +1,8 @@
-# -*- text -*-
+#  -*- text -*-
 ######################################################################
+##
+#  WARNING: This configuration file has not been updated for v4,
+#            and therefore WILL NOT WORK.  Please do not use it.
 #
 #	In 2.0.0, radrelay functionality is integrated into the
 #	server core.  This virtual server gives an example of
@@ -100,7 +103,7 @@ server copy-acct-to-home-server {
 
 		#
 		#  Track progress through the detail file.  When the detail
-		#  file is large, and the server is re-started, it will
+		#  file is large, and the server is restarted, it will
 		#  read from the START of the file.
 		#
 		#  Setting "track = yes" means it will skip packets which
@@ -125,9 +128,9 @@ server copy-acct-to-home-server {
 	#
 	send Accounting-Response {
 		   #
-		   # Since we're proxying, we don't log anything
-		   # locally.  Ensure that the accounting section
-		   # "succeeds" by forcing an "ok" return.
+		   #  Since we're proxying, we don't log anything
+		   #  locally.  Ensure that the accounting section
+		   #  "succeeds" by forcing an "ok" return.
 		   ok
 	}
 
@@ -143,7 +146,7 @@ server copy-acct-to-home-server {
 	pre-proxy {
 
 		#  If you want to have a log of packets proxied to a home
-		#  server, un-comment the following line, and the
+		#  server, uncomment the following line, and the
 		#  'detail pre_proxy_log' section in radiusd.conf.
 	#	pre_proxy_log
 	}
@@ -157,7 +160,7 @@ server copy-acct-to-home-server {
 		#
 
 		#  If you want to have a log of replies from a home
-		#  server, un-comment the following line, and the
+		#  server, uncomment the following line, and the
 		#  'detail post_proxy_log' section in radiusd.conf.
 	#	post_proxy_log
 

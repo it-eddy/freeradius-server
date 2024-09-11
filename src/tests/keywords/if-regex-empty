@@ -1,11 +1,8 @@
 #
-# PRE: update if if-regex-match
+# PRE: if if-regex-match
 #
-update {
-       control:Cleartext-Password := 'hello'
-}
 
-if (control:Cleartext-Password !~ /hell(o)(.*)/) {
+if !(control.Password.Cleartext =~ /hell(o)(.*)/) {
 	test_fail
 }
 
@@ -23,7 +20,7 @@ if ("%{2}") {
 	test_fail
 }
 
-if (control:Cleartext-Password !~ /hello(.*)/) {
+if !(control.Password.Cleartext =~ /hello(.*)/) {
 	test_fail
 }
 
@@ -31,6 +28,21 @@ if (control:Cleartext-Password !~ /hello(.*)/) {
 #  Check for stale capture group values
 #
 if ("%{1}") {
+	test_fail
+}
+
+#
+#  Check assignment of regex null-match
+#
+if (control.Password.Cleartext =~ /hell(o)(.*)/) {
+	control.Filter-Id := "%{2}"
+}
+
+if (!control.Filter-Id) {
+	test_fail
+}
+
+if (!(control.Filter-Id == "")) {
 	test_fail
 }
 

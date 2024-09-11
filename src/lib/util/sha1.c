@@ -1,16 +1,15 @@
-/*
- *  SHA-1 in C
- *  By Steve Reid <steve@edmweb.com>
- *  100% Public Domain
+/** Local implementation of the SHA1 hashing scheme
  *
- *  Version:	$Id$
+ * SHA-1 in C 100% Public Domain
+ *
+ * @file src/lib/util/sha1.c
+ *
+ * @author Steve Reid (steve@edmweb.com)
  */
-
 RCSID("$Id$")
 
-#include <freeradius-devel/libradius.h>
+#include <freeradius-devel/util/sha1.h>
 
-#include "../../include/sha1.h"
 
 #ifndef WITH_OPENSSL_SHA1
 #  define rol(value, bits) (((value) << (bits)) | ((value) >> (32 - (bits))))
@@ -24,16 +23,16 @@ RCSID("$Id$")
     ^block->l[(i+2)&15]^block->l[i&15],1))
 
 /* (R0+R1), R2, R3, R4 are the different operations used in SHA1 */
-#  define R0(v,w,x,y,z,i) z+=((w&(x^y))^y)+blk0(i)+0x5A827999+rol(v,5);w=rol(w,30);
-#  define R1(v,w,x,y,z,i) z+=((w&(x^y))^y)+blk(i)+0x5A827999+rol(v,5);w=rol(w,30);
-#  define R2(v,w,x,y,z,i) z+=(w^x^y)+blk(i)+0x6ED9EBA1+rol(v,5);w=rol(w,30);
-#  define R3(v,w,x,y,z,i) z+=(((w|x)&y)|(w&x))+blk(i)+0x8F1BBCDC+rol(v,5);w=rol(w,30);
-#  define R4(v,w,x,y,z,i) z+=(w^x^y)+blk(i)+0xCA62C1D6+rol(v,5);w=rol(w,30);
+#  define R0(v,w,x,y,z,i) do { z+=((w&(x^y))^y)+blk0(i)+0x5A827999+rol(v,5);w=rol(w,30); } while (0)
+#  define R1(v,w,x,y,z,i) do { z+=((w&(x^y))^y)+blk(i)+0x5A827999+rol(v,5);w=rol(w,30); } while (0)
+#  define R2(v,w,x,y,z,i) do { z+=(w^x^y)+blk(i)+0x6ED9EBA1+rol(v,5);w=rol(w,30); } while (0)
+#  define R3(v,w,x,y,z,i) do { z+=(((w|x)&y)|(w&x))+blk(i)+0x8F1BBCDC+rol(v,5);w=rol(w,30); } while (0)
+#  define R4(v,w,x,y,z,i) do { z+=(w^x^y)+blk(i)+0xCA62C1D6+rol(v,5);w=rol(w,30); } while (0)
 
 
 /* Hash a single 512-bit block. This is the core of the algorithm. */
 
-void fr_sha1_transform(uint32_t state[5], uint8_t const buffer[64])
+void fr_sha1_transform(uint32_t state[static 5], uint8_t const buffer[static 64])
 {
 	uint32_t a, b, c, d, e;
 	typedef union {
@@ -82,7 +81,7 @@ void fr_sha1_transform(uint32_t state[5], uint8_t const buffer[64])
 	state[3] += d;
 	state[4] += e;
 
-#  ifndef __clang_analyzer__
+#  ifndef STATIC_ANALYZER
 	/* Wipe variables */
 	a = b = c = d = e = 0;
 #  endif
@@ -103,9 +102,19 @@ void fr_sha1_init(fr_sha1_ctx* context)
 }
 
 /* Run your data through this. */
-void fr_sha1_update(fr_sha1_ctx *context,uint8_t const *data, size_t len)
+void fr_sha1_update(fr_sha1_ctx *context, uint8_t const *in, size_t len)
 {
 	unsigned int i, j;
+
+	/*
+	 *	If len == 0, there's nothing to do:
+	 *	First, len == 0 impolies len * 8 == 0, so the contents of
+	 *	context->count wouldn't change.
+	 *	j by construction is <= 63, so if len == 0, j + len == j <= 63, and
+	 *	i would be set to 0 and the final memcpy() would "copy" 0
+	 *	bytes, so the contents of context->buffer wouldn't change either.
+	 */
+	if (len == 0) return;
 
 	j = (context->count[0] >> 3) & 63;
 	if ((context->count[0] += len << 3) < (len << 3)) {
@@ -114,22 +123,22 @@ void fr_sha1_update(fr_sha1_ctx *context,uint8_t const *data, size_t len)
 
 	context->count[1] += (len >> 29);
 	if ((j + len) > 63) {
-		memcpy(&context->buffer[j], data, (i = 64-j));
+		memcpy(&context->buffer[j], in, (i = 64-j));
 		fr_sha1_transform(context->state, context->buffer);
 		for ( ; i + 63 < len; i += 64) {
-			fr_sha1_transform(context->state, &data[i]);
+			fr_sha1_transform(context->state, &in[i]);
 		}
 		j = 0;
 	} else {
 		i = 0;
 	}
-	memcpy(&context->buffer[j], &data[i], len - i);
+	memcpy(&context->buffer[j], &in[i], len - i);
 }
 
 
 /* Add padding and return the message digest. */
 
-void fr_sha1_final(uint8_t digest[20], fr_sha1_ctx *context)
+void fr_sha1_final(uint8_t digest[static SHA1_DIGEST_LENGTH], fr_sha1_ctx *context)
 {
 	uint32_t i, j;
 	uint8_t finalcount[8];
@@ -148,7 +157,7 @@ void fr_sha1_final(uint8_t digest[20], fr_sha1_ctx *context)
 		digest[i] = (uint8_t)((context->state[i>>2] >> ((3-(i & 3)) * 8) ) & 255);
 	}
 
-#  ifndef __clang_analyzer__
+#  ifndef STATIC_ANALYZER
 	/* Wipe variables */
 	i = j = 0;
 	memset(context->buffer, 0, 64);
@@ -162,7 +171,7 @@ void fr_sha1_final(uint8_t digest[20], fr_sha1_ctx *context)
 #  endif
 }
 
-void fr_sha1_final_no_len(uint8_t digest[20], fr_sha1_ctx *context)
+void fr_sha1_final_no_len(uint8_t digest[static SHA1_DIGEST_LENGTH], fr_sha1_ctx *context)
 {
 	uint32_t i, j;
 
@@ -170,7 +179,7 @@ void fr_sha1_final_no_len(uint8_t digest[20], fr_sha1_ctx *context)
 		digest[i] = (uint8_t)((context->state[i>>2] >> ((3-(i & 3)) * 8) ) & 255);
 	}
 
-#  ifndef __clang_analyzer__
+#  ifndef STATIC_ANALYZER
 	/* Wipe variables */
 	i = j = 0;
 	memset(context->buffer, 0, 64);

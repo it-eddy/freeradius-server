@@ -1,9 +1,11 @@
 #
 #  Input packet
 #
+Packet-Type = Access-Request
 User-Name = 'bob'
+NAS-Identifier = un'sa"fe;
 
 #
 #  Expected answer
 #
-Response-Packet-Type == Access-Accept
+Packet-Type == Access-Accept

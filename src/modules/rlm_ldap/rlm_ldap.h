@@ -1,3 +1,4 @@
+#pragma once
 /**
  * $Id$
  * @file rlm_ldap.h
@@ -7,45 +8,22 @@
  *	in stupid ways, where the configure script will use the local ldap.h
  *	file, instead of the one from libldap.
  *
- * @author Arran Cudbard-Bell <a.cudbardb@freeradius.org>
- * @copyright 2015 Arran Cudbard-Bell <a.cudbardb@freeradius.org>
- * @copyright 2013 Network RADIUS SARL<info@networkradius.com>
+ * @author Arran Cudbard-Bell (a.cudbardb@freeradius.org)
+ * @copyright 2015 Arran Cudbard-Bell (a.cudbardb@freeradius.org)
+ * @copyright 2013 Network RADIUS SAS (legal@networkradius.com)
  * @copyright 2013-2015 The FreeRADIUS Server Project.
  */
-#ifndef _RLM_LDAP_H
-#define _RLM_LDAP_H
-
-#include <freeradius-devel/radiusd.h>
-#include <freeradius-devel/modules.h>
-#include <freeradius-devel/ldap/libfreeradius-ldap.h>
-
-typedef struct ldap_inst_s rlm_ldap_t;
+#include <freeradius-devel/server/base.h>
+#include <freeradius-devel/server/module_rlm.h>
+#include <freeradius-devel/ldap/base.h>
 
 typedef struct {
-	vp_tmpl_t	*mech;				//!< SASL mech(s) to try.
-	vp_tmpl_t	*proxy;				//!< Identity to proxy.
-	vp_tmpl_t	*realm;				//!< Kerberos realm.
-} fr_ldap_sasl_t_dynamic_t;
-
-typedef struct ldap_acct_section {
 	CONF_SECTION	*cs;				//!< Section configuration.
 
 	char const	*reference;			//!< Configuration reference string.
 } ldap_acct_section_t;
 
-struct ldap_inst_s {
-	char const	*name;				//!< Instance name.
-
-	CONF_SECTION	*cs;				//!< Main configuration section for this instance.
-
-	bool		expect_password;		//!< True if the user_map included a mapping between an LDAP
-							//!< attribute and one of our password reference attributes.
-
-	/*
-	 *	RADIUS attribute to LDAP attribute maps
-	 */
-	vp_map_t	*user_map; 			//!< Attribute map applied to users and profiles.
-
+typedef struct {
 	/*
 	 *	Options
 	 */
@@ -54,73 +32,81 @@ struct ldap_inst_s {
 							//!< identify the autz or acct session the commands were
 							//!< issued for.
 #endif
+	struct {
+		/*
+		 *	User object attributes and filters
+		 */
+		char const	*obj_sort_by;			//!< List of attributes to sort by.
+		LDAPControl	*obj_sort_ctrl;			//!< Server side sort control.
 
-	/*
-	 *	User object attributes and filters
-	 */
-	vp_tmpl_t	*userobj_filter;		//!< Filter to retrieve only user objects.
-	vp_tmpl_t	*userobj_base_dn;		//!< DN to search for users under.
-	char const	*userobj_scope_str;		//!< Scope (sub, one, base).
-	char const	*userobj_sort_by;		//!< List of attributes to sort by.
-	LDAPControl	*userobj_sort_ctrl;		//!< Server side sort control.
+		int		obj_scope;			//!< Search scope.
 
-	int		userobj_scope;			//!< Search scope.
+		char const	*obj_access_attr;		//!< Attribute to check to see if the user should be locked out.
+		bool		access_positive;		//!< If true the presence of the attribute will allow access,
+								//!< else it will deny access.
 
-	char const	*userobj_membership_attr;	//!< Attribute that describes groups the user is a member of.
-	char const	*userobj_access_attr;		//!< Attribute to check to see if the user should be locked out.
-	bool		access_positive;		//!< If true the presence of the attribute will allow access,
-							//!< else it will deny access.
-
-	fr_ldap_sasl_t_dynamic_t user_sasl;			//!< SASL parameters used when binding as the user.
-
-	char const	*valuepair_attr;		//!< Generic dynamic mapping attribute, contains a RADIUS
-							//!< attribute and value.
-
+		char const	*access_value_negate;           //!< If the value of the access_attr matches this, the result
+								///< will be negated.
+		char const	*access_value_suspend;          //!< Value that indicates suspension.  Is not affected by
+								///< access_positive and will always allow access, but will apply
+								///< a different profile.
+		bool		expect_password;		//!< Allow the user to forcefully decide if a password should be
+								///< expected.  Controls whether warnings are issued.
+		bool		expect_password_is_set;		//!< Whether an expect password value was provided.
+	} user;
 
 	/*
 	 *	Group object attributes and filters
 	 */
-	char const	*groupobj_filter;		//!< Filter to retrieve only group objects.
-	vp_tmpl_t	*groupobj_base_dn;		//!< DN to search for users under.
-	char const	*groupobj_scope_str;		//!< Scope (sub, one, base).
-	int		groupobj_scope;			//!< Search scope.
+	struct {
+		char const	*userobj_membership_attr;	//!< Attribute that describes groups the user is a member of.
 
-	char const	*groupobj_name_attr;		//!< The name of the group.
-	char const	*groupobj_membership_filter;	//!< Filter to only retrieve groups which contain
-							//!< the user as a member.
+		char const	*obj_filter;			//!< Filter to retrieve only group objects.
+		int		obj_scope;			//!< Search scope.
 
-	bool		cacheable_group_name;		//!< If true the server will determine complete set of group
-							//!< memberships for the current user object, and perform any
-							//!< resolution necessary to determine the names of those
-							//!< groups, then right them to the control list (LDAP-Group).
+		char const	*obj_name_attr;			//!< The name of the group.
+		char const	*obj_membership_filter;		//!< Filter to only retrieve groups which contain
+								//!< the user as a member.
 
-	bool		cacheable_group_dn;		//!< If true the server will determine complete set of group
-							//!< memberships for the current user object, and perform any
-							//!< resolution necessary to determine the DNs of those groups,
-							//!< then right them to the control list (LDAP-GroupDN).
+		bool		cacheable_name;			//!< If true the server will determine complete set of group
+								//!< memberships for the current user object, and perform any
+								//!< resolution necessary to determine the names of those
+								//!< groups, then right them to the control list (LDAP-Group).
 
-	char const	*cache_attribute;		//!< Sets the attribute we use when creating and retrieving
-							//!< cached group memberships.
+		bool		cacheable_dn;			//!< If true the server will determine complete set of group
+								//!< memberships for the current user object, and perform any
+								//!< resolution necessary to determine the DNs of those groups,
+								//!< then right them to the control list (LDAP-GroupDN).
 
-	fr_dict_attr_t const	*cache_da;		//!< The DA associated with this specific instance of the
-							//!< rlm_ldap module.
+		char const	*cache_attribute;		//!< Sets the attribute we use when creating and retrieving
+								//!< cached group memberships.
 
-	char const	*group_attribute;		//!< Sets the attribute we use when comparing group
-							//!< group memberships.
+		fr_dict_attr_t const	*cache_da;		//!< The DA associated with this specific instance of the
+								//!< rlm_ldap module.
 
-	fr_dict_attr_t const	*group_da;		//!< The DA associated with this specific instance of the
-							//!< rlm_ldap module.
+		char const	*attribute;			//!< Sets the attribute we use when comparing group
+								//!< group memberships.
+
+		fr_dict_attr_t const	*da;			//!< The DA associated with this specific instance of the
+								//!< rlm_ldap module.
+
+		bool		allow_dangling_refs;		//!< Don't error if we fail to resolve a group DN referenced
+								///< from a user object.
+
+		bool		skip_on_suspend;		//!< Don't process groups if the user is suspended.
+	} group;
+
+	char const	*valuepair_attr;		//!< Generic dynamic mapping attribute, contains a RADIUS
+							//!< attribute and value.
 
 	/*
 	 *	Profiles
 	 */
-	vp_tmpl_t	*default_profile;		//!< If this is set, we will search for a profile object
-							//!< with this name, and map any attributes it contains.
-							//!< No value should be set if profiles are not being used
-							//!< as there is an associated performance penalty.
+	int		profile_scope;			//!< Search scope.
 	char const	*profile_attr;			//!< Attribute that identifies profiles to apply. May appear
 							//!< in userobj or groupobj.
-	vp_tmpl_t	*profile_filter;		//!< Filter to retrieve only retrieve group objects.
+	char const	*profile_attr_suspend;		//!< Attribute that identifies profiles to apply when the user's
+							///< account is suspended. May appear in userobj or groupobj.
 
 	/*
 	 *	Accounting
@@ -138,51 +124,164 @@ struct ldap_inst_s {
 							//!< to perform additional authorisation checks.
 #endif
 
-	fr_pool_t	*pool;				//!< Connection pool instance.
 	fr_ldap_config_t handle_config;			//!< Connection configuration instance.
+	trunk_conf_t	trunk_conf;			//!< Trunk configuration
+	trunk_conf_t	bind_trunk_conf;		//!< Trunk configuration for trunk used for bind auths
 
-	/*
-	 *	Global config
-	 */
-	char const	*tls_random_file;		//!< Path to the random file if /dev/random and /dev/urandom
-							//!< are unavailable.
+	module_instance_t const *mi;			//!< Module instance data for thread lookups.
+} rlm_ldap_t;
 
-	uint32_t	ldap_debug;			//!< Debug flag for the SDK.
-};
+/** Call environment used in LDAP authorization
+ *
+ */
+typedef struct {
+	fr_value_box_t	user_base;			//!< Base DN in which to search for users.
+	fr_value_box_t	user_filter;			//!< Filter to use when searching for users.
+	fr_value_box_t 	group_base;			//!< Base DN in which to search for groups.
+	tmpl_t		*group_filter;			//!< tmpl to expand as group membership filter.
+	fr_value_box_t	default_profile;		//!< If this is set, we will search for a profile object
+							//!< with this name, and map any attributes it contains.
+							//!< No value should be set if profiles are not being used
+							//!< as there is an associated performance penalty.
+	fr_value_box_t	profile_filter;			//!< Filter to use when searching for profiles.
+
+	map_list_t	*user_map;			//!< Attribute map applied to users and profiles.
+
+	fr_value_box_t 	const *expect_password;		//!< True if the user_map included a mapping between an LDAP
+							//!< attribute and one of our password reference attributes.
+} ldap_autz_call_env_t;
+
+/** Call environment used in group membership xlat
+ *
+ */
+typedef struct {
+	fr_value_box_t	user_base;			//!< Base DN in which to search for users.
+	fr_value_box_t	user_filter;			//!< Filter to use when searching for users.
+	fr_value_box_t	group_base;			//!< Base DN in which to search for groups.
+	tmpl_t		*group_filter;			//!< tmpl to expand as group membership filter.
+} ldap_xlat_memberof_call_env_t;
+
+/** State list for resumption of authorization
+ *
+ */
+typedef enum {
+	LDAP_AUTZ_FIND = 0,
+	LDAP_AUTZ_GROUP,
+	LDAP_AUTZ_POST_GROUP,
+#ifdef WITH_EDIR
+	LDAP_AUTZ_EDIR_BIND,
+	LDAP_AUTZ_POST_EDIR,
+#endif
+	LDAP_AUTZ_MAP,
+	LDAP_AUTZ_DEFAULT_PROFILE,
+	LDAP_AUTZ_POST_DEFAULT_PROFILE,
+	LDAP_AUTZ_USER_PROFILE,
+} ldap_autz_status_t;
+
+/** User's access state
+ *
+ */
+typedef enum {
+	LDAP_ACCESS_ALLOWED = 0,			//!< User is allowed to login.
+	LDAP_ACCESS_DISALLOWED,				//!< User it not allow to login (disabled)
+	LDAP_ACCESS_SUSPENDED				//!< User account has been suspended.
+} ldap_access_state_t;
+
+/** Holds state of in progress async authorization
+ *
+ */
+typedef struct {
+	module_instance_t const	*dlinst;
+	rlm_ldap_t const	*inst;
+	fr_ldap_map_exp_t	expanded;
+	fr_ldap_query_t		*query;
+	fr_ldap_thread_trunk_t	*ttrunk;
+	ldap_autz_call_env_t	*call_env;
+	LDAPMessage		*entry;
+	ldap_autz_status_t	status;
+	struct berval		**profile_values;
+	int			value_idx;
+	char			*profile_value;
+	char const		*dn;
+	ldap_access_state_t	access_state;		//!< What state a user's account is in.
+} ldap_autz_ctx_t;
+
+/** State list for xlat evaluation of LDAP group membership
+ */
+typedef enum {
+	GROUP_XLAT_FIND_USER = 0,
+	GROUP_XLAT_MEMB_FILTER,
+	GROUP_XLAT_MEMB_ATTR
+} ldap_group_xlat_status_t;
+
+/** Holds state of in progress group membership check xlat
+ *
+ */
+typedef struct {
+	rlm_ldap_t const		*inst;
+	fr_value_box_t			*group;
+	ldap_xlat_memberof_call_env_t	*env_data;
+	bool				group_is_dn;
+	char const			*dn;
+	char const			*attrs[2];
+	fr_value_box_t			*filter;
+	fr_value_box_t			*basedn;
+	fr_ldap_thread_trunk_t		*ttrunk;
+	fr_ldap_query_t			*query;
+	ldap_group_xlat_status_t	status;
+	bool				found;
+} ldap_group_xlat_ctx_t;
+
+extern HIDDEN fr_dict_attr_t const *attr_password;
+extern HIDDEN fr_dict_attr_t const *attr_cleartext_password;
+extern HIDDEN fr_dict_attr_t const *attr_crypt_password;
+extern HIDDEN fr_dict_attr_t const *attr_ldap_userdn;
+extern HIDDEN fr_dict_attr_t const *attr_nt_password;
+extern HIDDEN fr_dict_attr_t const *attr_password_with_header;
+
+extern HIDDEN fr_dict_attr_t const *attr_user_password;
+extern HIDDEN fr_dict_attr_t const *attr_user_name;
 
 /*
  *	user.c - User lookup functions
  */
-char const *rlm_ldap_find_user(rlm_ldap_t const *inst, REQUEST *request, fr_ldap_connection_t **pconn,
-			       char const *attrs[], bool force, LDAPMessage **result, rlm_rcode_t *rcode);
+static inline char const *rlm_find_user_dn_cached(request_t *request)
+{
+	fr_pair_t	*vp;
 
-rlm_rcode_t rlm_ldap_check_access(rlm_ldap_t const *inst, REQUEST *request,
-				  fr_ldap_connection_t const *conn, LDAPMessage *entry);
+	vp = fr_pair_find_by_da(&request->control_pairs, NULL, attr_ldap_userdn);
+	if (!vp) return NULL;
 
-void rlm_ldap_check_reply(rlm_ldap_t const *inst, REQUEST *request, fr_ldap_connection_t const *conn);
+	RDEBUG2("Using user DN from request \"%pV\"", &vp->data);
+	return vp->vp_strvalue;
+}
+
+unlang_action_t rlm_ldap_find_user_async(TALLOC_CTX *ctx, rlm_ldap_t const *inst, request_t *request,
+					 fr_value_box_t *base, fr_value_box_t *filter_box,
+					 fr_ldap_thread_trunk_t *ttrunk, char const *attrs[],
+					 fr_ldap_query_t **query_out);
+
+ldap_access_state_t rlm_ldap_check_access(rlm_ldap_t const *inst, request_t *request, LDAPMessage *entry);
+
+void rlm_ldap_check_reply(request_t *request, rlm_ldap_t const *inst, char const *inst_name, bool expect_password, fr_ldap_thread_trunk_t const *ttrunk);
 
 /*
  *	groups.c - Group membership functions.
  */
-rlm_rcode_t rlm_ldap_cacheable_userobj(rlm_ldap_t const *inst, REQUEST *request, fr_ldap_connection_t **pconn,
-				       LDAPMessage *entry, char const *attr);
+unlang_action_t rlm_ldap_cacheable_userobj(rlm_rcode_t *p_result, request_t *request, ldap_autz_ctx_t *autz_ctx,
+					   char const *attr);
 
-rlm_rcode_t rlm_ldap_cacheable_groupobj(rlm_ldap_t const *inst, REQUEST *request, fr_ldap_connection_t **pconn);
+unlang_action_t rlm_ldap_cacheable_groupobj(rlm_rcode_t *p_result, request_t *request, ldap_autz_ctx_t *autz_ctx);
 
-rlm_rcode_t rlm_ldap_check_groupobj_dynamic(rlm_ldap_t const *inst, REQUEST *request, fr_ldap_connection_t **pconn,
-					    VALUE_PAIR *check);
+unlang_action_t rlm_ldap_check_groupobj_dynamic(rlm_rcode_t *p_result, request_t *request,
+						ldap_group_xlat_ctx_t *xlat_ctx);
 
-rlm_rcode_t rlm_ldap_check_userobj_dynamic(rlm_ldap_t const *inst, REQUEST *request, fr_ldap_connection_t **pconn,
-					   char const *dn, VALUE_PAIR *check);
+unlang_action_t rlm_ldap_check_userobj_dynamic(rlm_rcode_t *p_result, request_t *request,
+					       ldap_group_xlat_ctx_t *xlat_ctx);
 
-rlm_rcode_t rlm_ldap_check_cached(rlm_ldap_t const *inst, REQUEST *request, VALUE_PAIR *check);
+unlang_action_t rlm_ldap_check_cached(rlm_rcode_t *p_result,
+				      rlm_ldap_t const *inst, request_t *request, fr_value_box_t const *check);
 
-/*
- *	conn.c - Connection wrappers.
- */
-fr_ldap_connection_t	*mod_conn_get(rlm_ldap_t const *inst, REQUEST *request);
-
-void		mod_conn_release(rlm_ldap_t const *inst, REQUEST *request, fr_ldap_connection_t *conn);
-
-void		*mod_conn_create(TALLOC_CTX *ctx, void *instance, struct timeval const *timeout);
-#endif
+unlang_action_t rlm_ldap_map_profile(fr_ldap_result_code_t *ret,
+				     rlm_ldap_t const *inst, request_t *request, fr_ldap_thread_trunk_t *ttrunk,
+				     char const *dn, int scope, char const *filter, fr_ldap_map_exp_t const *expanded);

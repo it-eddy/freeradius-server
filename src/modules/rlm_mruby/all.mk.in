@@ -1,7 +1,7 @@
 TARGETNAME	:= @targetname@
 
 ifneq "$(TARGETNAME)" ""
-TARGET		:= $(TARGETNAME).a
+TARGET		:= $(TARGETNAME)$(L)
 endif
 
 SOURCES		:= $(TARGETNAME).c mruby.c
@@ -20,3 +20,4 @@ $(R)$(modconfdir)/mruby/example.rb: src/modules/rlm_mruby/example.rb | $(R)$(mod
 	@$(ECHO) INSTALL $(notdir $<)
 	@$(INSTALL) -m 755 $< $(R)$(modconfdir)/mruby
 endif
+LOG_ID_LIB	= 31

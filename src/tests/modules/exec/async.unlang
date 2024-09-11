@@ -1,25 +1,33 @@
+string test_string
+
 #
 #  Async calls should always return a zero length string
 #  because we don't wait for the response.
 #
-update request {
-	Tmp-String-0 := "%{exec_async:/bin/bash -c 'echo hello'}"
-}
-if (&Tmp-String-0 != '') {
+&test_string := %exec_async('/bin/sh','-c',"'echo -n hello'")
+if &test_string {
 	test_fail
-} else {
+}
+
+exec_async_mod
+
+if (ok) {
 	test_pass
 }
 
 #
 #  Async calls should not have their output added to the request
 #
-update request {
-	Tmp-String-0 := "%{exec_async:/bin/bash -c \"echo 'reply:Reply-Message = \'hello\''\"}"
+
+if (&reply.Reply-Message == 'hello') {
+	test_fail
 }
 
-if (&reply:Reply-Message == 'hello') {
+#
+#  Smoke test - Setup an async process that'll keep running after
+#  after the test exits.
+#
+&test_string := %exec_async('/bin/sh','-c',"'sleep 1'")
+if &test_string {
 	test_fail
-} else {
-	test_pass
 }

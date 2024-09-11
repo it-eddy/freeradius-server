@@ -1,5 +1,8 @@
-# -*- text -*-
+#  -*- text -*-
 ######################################################################
+#
+#  WARNING: This configuration file has not been updated for v4,
+#            and therefore WILL NOT WORK.  Please do not use it.
 #
 #	This is a virtual server that handles *only* inner tunnel
 #	requests for EAP-TTLS and PEAP types.
@@ -22,10 +25,8 @@ recv Access-Request {
 	#  the inner tunnel request.
 	#
 
-	update control {
-		#  You should update this to be one of your realms.
-		&Proxy-To-Realm := "example.com"
-	}
+	#  You should update this to be one of your realms.
+	&control.Proxy-To-Realm := "example.com"
 }
 
 authenticate eap {
@@ -37,11 +38,5 @@ authenticate eap {
 }
 
 post-proxy {
-	#
-	#  This is necessary for LEAP, or if you set:
-	#
-	#  proxy_tunneled_request_as_eap = no
-	#
-	eap
 }
 }

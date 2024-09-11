@@ -1,8 +1,4 @@
 /*
- * print.c	Routines to print stuff.
- *
- * Version:	$Id$
- *
  *   This library is free software; you can redistribute it and/or
  *   modify it under the terms of the GNU Lesser General Public
  *   License as published by the Free Software Foundation; either
@@ -16,15 +12,20 @@
  *   You should have received a copy of the GNU Lesser General Public
  *   License along with this library; if not, write to the Free Software
  *   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
- *
- * Copyright 2000,2006  The FreeRADIUS server project
  */
 
+/** Functions to produce and parse the FreeRADIUS presentation format
+ *
+ * @file src/lib/util/print.c
+ *
+ * @copyright 2000,2006 The FreeRADIUS server project
+ */
 RCSID("$Id$")
 
-#include	<freeradius-devel/libradius.h>
+#include <freeradius-devel/util/debug.h>
+#include <freeradius-devel/util/base16.h>
+#include <freeradius-devel/util/pair.h>
 
-#include	<ctype.h>
 
 /** Checks for utf-8, taken from http://www.w3.org/International/questions/qa-forms-utf-8
  *
@@ -41,9 +42,7 @@ inline size_t fr_utf8_char(uint8_t const *str, ssize_t inlen)
 
 	if (inlen < 0) inlen = 4;	/* longest char */
 
-	if (*str < 0x20) return 0;
-
-	if (*str <= 0x7e) return 1;	/* 1 */
+	if (*str <= 0x7f) return 1;	/* 1 */
 
 	if (*str <= 0xc1) return 0;
 
@@ -105,7 +104,7 @@ inline size_t fr_utf8_char(uint8_t const *str, ssize_t inlen)
 	}
 
 	if ((str[0] >= 0xf1) &&		/* 6 */
-	    (str[1] <= 0xf3) &&
+	    (str[0] <= 0xf3) &&
 	    (str[1] >= 0x80) &&
 	    (str[1] <= 0xbf) &&
 	    (str[2] >= 0x80) &&
@@ -138,10 +137,10 @@ inline size_t fr_utf8_char(uint8_t const *str, ssize_t inlen)
  * @param[in] inlen	length of input string.  May be -1 if str
  *			is \0 terminated.
  * @return The number of bytes validated.  If ret == inlen the entire
- *	   string is valid.  Else ret gives the offset at which the
- *	   first invalid byte sequence was found.
+ *	   string is valid.  Else ret gives the negative offset at
+ *	   which the first invalid byte sequence was found.
  */
-ssize_t fr_utf8_str(uint8_t const *str, ssize_t inlen)
+fr_slen_t fr_utf8_str(uint8_t const *str, ssize_t inlen)
 {
 	uint8_t const *p, *end;
 	size_t len;
@@ -155,7 +154,7 @@ ssize_t fr_utf8_str(uint8_t const *str, ssize_t inlen)
 		size_t clen;
 
 		clen = fr_utf8_char(p, end - p);
-		if (clen == 0) return end - p;
+		if (clen == 0) return p - end;
 		p += clen;
 	} while (p < end);
 
@@ -164,33 +163,48 @@ ssize_t fr_utf8_str(uint8_t const *str, ssize_t inlen)
 
 /** Return a pointer to the first UTF8 char in a string.
  *
- * @param[out] chr_len Where to write the length of the multibyte char passed in chr (may be NULL).
- * @param[in] str Haystack.
- * @param[in] chr Multibyte needle.
+ * @param[out] out_chr_len	Where to write the length of the multibyte char passed in chr (may be NULL).
+ * @param[in] str		Haystack.
+ * @param[in] inlen		Length of string (in bytes).  Pass -1 to determine the length of the string.
+ * @param[in] chr		Multibyte needle.
  * @return
  *	- Position of chr in str.
  *	- NULL if not found.
  */
-char const *fr_utf8_strchr(int *chr_len, char const *str, char const *chr)
+char const *fr_utf8_strchr(int *out_chr_len, char const *str, ssize_t inlen, char const *chr)
 {
-	int cchr;
+	char const	*p = str, *end;
+	int		needle_len;
 
-	cchr = fr_utf8_char((uint8_t const *)chr, -1);
-	if (cchr == 0) cchr = 1;
-	if (chr_len) *chr_len = cchr;
+	if (inlen < 0) inlen = strlen(str);
 
-	while (*str) {
-		int schr;
+	end = str + inlen;
 
-		schr = fr_utf8_char((uint8_t const *) str, -1);
-		if (schr == 0) schr = 1;
-		if (schr != cchr) goto next;
+	/*
+	 *	Figure out how big the multibyte sequence
+	 *	we're looking for is.
+	 */
+	needle_len = fr_utf8_char((uint8_t const *)chr, -1);
+	if (needle_len == 0) needle_len = 1;	/* Invalid UTF8 sequence - ignore - needle is one byte */
+	if (out_chr_len) *out_chr_len = needle_len;
 
-		if (memcmp(str, chr, schr) == 0) {
-			return (char const *) str;
-		}
+	/*
+	 *	Loop over the input sequence, advancing
+	 *      UTF8 sequence by utf8 seqnce.
+	 */
+	while (p < end) {
+		int schr_len;
+
+		schr_len = fr_utf8_char((uint8_t const *)p, end - p);
+		if (schr_len == 0) schr_len = 1;	/* Invalid UTF8 sequence - ignore - advance by 1 */
+		if (schr_len != needle_len) goto next;
+
+		/*
+		 *	See if this matches out multibyte needle
+		 */
+		if (memcmp(p, chr, schr_len) == 0) return p;
 	next:
-		str += schr;
+		p += schr_len;
 	}
 
 	return NULL;
@@ -201,11 +215,11 @@ char const *fr_utf8_strchr(int *chr_len, char const *str, char const *chr)
  * @note Return value should be checked with is_truncated
  * @note Will always \0 terminate unless outlen == 0.
  *
- * @param[in] in string to escape.
- * @param[in] inlen length of string to escape (lets us deal with embedded NULs)
- * @param[out] out where to write the escaped string.
- * @param[out] outlen the length of the buffer pointed to by out.
- * @param[in] quote the quotation character
+ * @param[out] out	where to write the escaped string.
+ * @param[out] outlen	the length of the buffer pointed to by out.
+ * @param[in] in	string to escape.
+ * @param[in] inlen	length of string to escape (lets us deal with embedded NULs)
+ * @param[in] quote	the quotation character
  * @return
  *	- The number of bytes written to the out buffer.
  *	- A number >= outlen if truncation has occurred.
@@ -403,13 +417,13 @@ size_t fr_snprint_len(char const *in, ssize_t inlen, char quote)
  * but under some conditions may get binary data. A good example is libldap
  * and the arrays of struct berval ldap_get_values_len returns.
  *
- * @param[in] ctx To allocate new buffer in.
- * @param[in] in String to escape.
- * @param[in] inlen Length of string. Should be >= 0 if the data may contain
- *	embedded \0s. Must be >= 0 if data may not be \0 terminated.
- *	If < 0 inlen will be calculated using strlen.
- * @param[in] quote the quotation character.
- * @return new buffer holding the escaped string.
+ * @param[in] ctx	To allocate new buffer in.
+ * @param[in] in	String to escape.
+ * @param[in] inlen	Length of string. Should be >= 0 if the data may contain
+ *			embedded \0s. Must be >= 0 if data may not be \0 terminated.
+ *			If < 0 inlen will be calculated using strlen.
+ * @param[in] quote	the quotation character.
+ * @return new		buffer holding the escaped string.
  */
 char *fr_asprint(TALLOC_CTX *ctx, char const *in, ssize_t inlen, char quote)
 {
@@ -438,12 +452,10 @@ DIAG_OFF(format-nonliteral)
  * @todo Do something sensible with 'n$', though it's probably not actually used
  *	anywhere in our code base.
  *
- * - %pH takes a buffer and prints it as hex. The length of the
- *	 buffer is determined with a call to talloc_array_length().
- *
  * - %pV prints a value box as a string.
- * - %pS prints a string with FreeRADIUS style escaping, and '"' as the quote char.
- *	 The length of the buffer is determined with a call to talloc_array_length() - 1.
+ * - %pM prints a list of value boxes, concatenating them.
+ * - %pH prints a value box as a hex string.
+ * - %pP prints a fr_pair_t.
  *
  * This breaks strict compatibility with printf but allows us to continue using
  * the static format string and argument type validation.
@@ -453,15 +465,17 @@ DIAG_OFF(format-nonliteral)
  * @param[in] ctx	to allocate buffer in.
  * @param[in] fmt	string.
  * @param[in] ap	variadic argument list.
+ * @param[in] suppress_secrets as described
  * @return
  *	- The result of string interpolation.
  *	- NULL if OOM.
  */
-char *fr_vasprintf(TALLOC_CTX *ctx, char const *fmt, va_list ap)
+static char *fr_vasprintf_internal(TALLOC_CTX *ctx, char const *fmt, va_list ap, bool suppress_secrets)
 {
 	char const	*p = fmt, *end = p + strlen(fmt), *fmt_p = p, *fmt_q = p;
 	char		*out = NULL, *out_tmp;
 	va_list		ap_p, ap_q;
+	char		*subst;
 
 	out = talloc_strdup(ctx, "");
 	va_copy(ap_p, ap);
@@ -470,8 +484,8 @@ char *fr_vasprintf(TALLOC_CTX *ctx, char const *fmt, va_list ap)
 	do {
 		char const	*q;
 		char		len[2] = { '\0', '\0' };
-		long		precision = 0;
-		char		*subst = NULL;
+
+		subst = NULL;
 
 		if ((*p != '%') || (*++p == '%')) {
 			fmt_q = p + 1;
@@ -481,7 +495,7 @@ char *fr_vasprintf(TALLOC_CTX *ctx, char const *fmt, va_list ap)
 		/*
 		 *	Check for parameter field
 		 */
-		for (q = p; isdigit(*q); q++);
+		for (q = p; isdigit((uint8_t) *q); q++);
 		if ((q != p) && (*q == '$')) {
 			p = q + 1;
 		}
@@ -513,13 +527,17 @@ char *fr_vasprintf(TALLOC_CTX *ctx, char const *fmt, va_list ap)
 	done_flags:
 
 		/*
-		 *	Check for width field
+		 *	Check for width field.  First for strings, and
+		 *	then for other parameters.
 		 */
-		if (*p == '*') {
+		if ((*p == '.') && (*(p + 1) == '*') && (*(p + 2) == 's')) {
+			(void) va_arg(ap_q, int);
+			p += 2;
+		} else if (*p == '*') {
 			(void) va_arg(ap_q, int);
 			p++;
 		} else {
-			for (q = p; isdigit(*q); q++);
+			for (q = p; isdigit((uint8_t) *q); q++);
 			p = q;
 		}
 
@@ -530,7 +548,7 @@ char *fr_vasprintf(TALLOC_CTX *ctx, char const *fmt, va_list ap)
 			char *r;
 
 			p++;
-			precision = strtoul(p, &r, 10);
+			(void) strtoul(p, &r, 10);
 			p = r;
 		}
 
@@ -641,23 +659,39 @@ char *fr_vasprintf(TALLOC_CTX *ctx, char const *fmt, va_list ap)
 			 */
 			switch (*(p + 1)) {
 			case 'V':
+			case 'R':
 			{
 				fr_value_box_t const *in = va_arg(ap_q, fr_value_box_t const *);
+				fr_sbuff_escape_rules_t const *e_rules = NULL;
+
+				/*
+				 *	Value boxes get escaped as double-quoted strings, unless the value-box
+				 *	in question is secret, AND we've been asked to hide secrets.
+				 *
+				 *	Note that the secret_rules only hides secrets of data type "string",
+				 *	which should be good enough for most purposes.
+				 */
+				if (*(p + 1) == 'V') {
+					e_rules = &fr_value_escape_double;
+				}
 
 				/*
 				 *	Allocations that are not part of the output
 				 *	string need to occur in the NULL ctx so we don't fragment
 				 *	any pool associated with it.
 				 */
-				subst = fr_value_box_asprint(NULL, in, '"');
-				if (!subst) {
-					talloc_free(out);
-					va_end(ap_p);
-					va_end(ap_q);
-					return NULL;
+				if (unlikely(in && in->secret && suppress_secrets)) {
+					subst = talloc_typed_strdup(NULL, "<<< secret >>>");
+
+				} else if (in) {
+					fr_value_box_aprint(NULL, &subst, in, e_rules);
+				} else {
+					subst = talloc_typed_strdup(NULL, "(null)");
 				}
 
 			do_splice:
+				if (!subst) goto oom;
+
 				p++;
 
 				/*
@@ -671,9 +705,9 @@ char *fr_vasprintf(TALLOC_CTX *ctx, char const *fmt, va_list ap)
 					talloc_free(sub_fmt);
 					if (!out_tmp) {
 					oom:
-						fr_strerror_printf("Out of memory");
+						fr_strerror_const("Out of memory");
 						talloc_free(out);
-						talloc_free(subst);
+						TALLOC_FREE(subst);
 						va_end(ap_p);
 						va_end(ap_q);
 						return NULL;
@@ -681,92 +715,104 @@ char *fr_vasprintf(TALLOC_CTX *ctx, char const *fmt, va_list ap)
 					out = out_tmp;
 
 					out_tmp = talloc_strdup_append_buffer(out, subst);
-					TALLOC_FREE(subst);
 					if (!out_tmp) goto oom;
+					TALLOC_FREE(subst);
 					out = out_tmp;
 
 					va_end(ap_p);		/* one time use only */
-					va_copy(ap_p, ap_q);	/* already advanced to the next argument */
+				} else {
+					out_tmp = talloc_strdup_append_buffer(out, subst);
+					if (!out_tmp) goto oom;
+					TALLOC_FREE(subst);
+					out = out_tmp;
 				}
+
+				va_copy(ap_p, ap_q);	/* already advanced to the next argument */
 
 				fmt_p = p + 1;
 			}
 				break;
 
-			case 'M':
-			{
-				fr_value_box_t const *in = va_arg(ap_q, fr_value_box_t const *);
-				char *tmp, *n;
-
-				subst = talloc_strdup(NULL, "");
-				do {
-					/*
-					 *	Allocations that are not part of the output
-					 *	string need to occur in the NULL ctx so we don't fragment
-					 *	any pool associated with it.
-					 */
-					tmp = fr_value_box_asprint(NULL, in, '"');
-					if (!tmp) {
-					merror:
-						talloc_free(subst);
-						talloc_free(out);
-						va_end(ap_p);
-						va_end(ap_q);
-						return NULL;
-					}
-					n = talloc_buffer_append_buffer(subst, tmp);
-					talloc_free(tmp);
-					if (!n) goto merror;
-					subst = n;
-				} while ((in = in->next));
-
-				goto do_splice;
-			}
-
 			case 'H':
 			{
-				uint8_t const *in = va_arg(ap_q, uint8_t const *);
+				fr_value_box_t const *in = va_arg(ap_q, fr_value_box_t const *);
 
-				/*
-				 *	Only automagically figure out the length
-				 *	if it's not specified.
-				 *
-				 *	This allows %b to be used with stack buffers,
-				 *	so long as the length is specified in the format string.
-				 */
-				if (precision == 0) precision = talloc_array_length(in);
+				if (!in) {
+					subst = talloc_strdup(NULL, "(null)");
+					goto do_splice;
+				}
 
-				subst = talloc_array(NULL, char, (precision * 2) + 1);
-				if (!subst) goto oom;
-				fr_bin2hex(subst, in, precision);
+				switch (in->type) {
+				case FR_TYPE_OCTETS:
+					if (in->vb_octets) {
+						fr_base16_aencode(NULL, &subst, &FR_DBUFF_TMP(in->vb_octets, in->vb_length));
+					} else {
+						subst = talloc_strdup(NULL, "");
+					}
+					break;
 
-				goto do_splice;
+				case FR_TYPE_STRING:
+					fr_base16_aencode(NULL, &subst, &FR_DBUFF_TMP((uint8_t const *)in->vb_strvalue, in->vb_length));
+					break;
+
+				default:
+				{
+					fr_value_box_t dst;
+
+					/*
+					 *	Convert the boxed value into a octets buffer
+					 */
+					if (fr_value_box_cast(NULL, &dst, FR_TYPE_OCTETS, NULL, in) < 0) {
+						subst = talloc_strdup(NULL, fr_strerror()); /* splice in the error */
+						if (!subst) goto oom;
+					}
+
+					fr_base16_aencode(NULL, &subst, &FR_DBUFF_TMP((uint8_t const *)dst.vb_octets, dst.vb_length));
+					fr_value_box_clear(&dst);
+					break;
+				}
+				}
 			}
+				goto do_splice;
 
-			case 'S':
+			case 'M':
 			{
-				char const *in = va_arg(ap_q, char const *);
+				fr_value_box_list_t const *in = va_arg(ap_q, fr_value_box_list_t const *);
 
-				subst = fr_asprint(NULL, in, talloc_array_length(in) - 1, '"');
-				if (!subst) goto oom;
+				if (!in) {
+					subst = talloc_strdup(NULL, "(null)");
+					goto do_splice;
+				}
 
-				goto do_splice;
+				if (suppress_secrets) {
+					subst = fr_value_box_list_aprint_secure(NULL, in, NULL, &fr_value_escape_double);
+				} else {
+					subst = fr_value_box_list_aprint(NULL, in, NULL, &fr_value_escape_double);
+				}
 			}
+				goto do_splice;
 
-			case 'T':
+			case 'P':
 			{
-				struct timeval *in = va_arg(ap_q, struct timeval *);
+				fr_pair_t const *in = va_arg(ap_q, fr_pair_t const *);
 
-				subst = talloc_typed_asprintf(NULL, "%" PRIu64 ".%06" PRIu64,
-						        (uint64_t)in->tv_sec,
-							(uint64_t)in->tv_usec);
-				if (!subst) goto oom;
+				if (!in) {
+					subst = talloc_strdup(NULL, "(null)");
+					goto do_splice;
+				}
 
-				goto do_splice;
+				PAIR_VERIFY(in);
+
+				if (unlikely(in && in->data.secret && suppress_secrets)) {
+					fr_pair_aprint_secure(NULL, &subst, NULL, in);
+				} else {
+					fr_pair_aprint(NULL, &subst, NULL, in);
+				}
 			}
+				goto do_splice;
 
 			default:
-				(void) va_arg(ap_q, void *);					/* void * */
+				(void) va_arg(ap_q, void *);				/* void * */
 			}
 			break;
 
@@ -792,8 +838,27 @@ char *fr_vasprintf(TALLOC_CTX *ctx, char const *fmt, va_list ap)
 	va_end(ap_p);
 	va_end(ap_q);
 
+	/*
+	 *	One of the above talloc calls sets the type to
+	 *	be the string.  We correct this here so we
+	 *	don't trigger talloc_aborts later...
+	 */
+	talloc_set_type(out, char);
+
 	return out;
 }
+
+char *fr_vasprintf(TALLOC_CTX *ctx, char const *fmt, va_list ap)
+{
+	return fr_vasprintf_internal(ctx, fmt, ap, false);
+}
+
+char *fr_vasprintf_secure(TALLOC_CTX *ctx, char const *fmt, va_list ap)
+{
+	return fr_vasprintf_internal(ctx, fmt, ap, true);
+}
+
+
 DIAG_ON(format-nonliteral)
 
 /** Special version of asprintf which implements custom format specifiers
@@ -814,6 +879,39 @@ char *fr_asprintf(TALLOC_CTX *ctx, char const *fmt, ...)
 	va_start(ap, fmt);
 	ret = fr_vasprintf(ctx, fmt, ap);
 	va_end(ap);
+
+	return ret;
+}
+
+/** Special version of fprintf which implements custom format specifiers
+ *
+ * @copybrief fr_vasprintf
+ *
+ * @param[in] fp	to write the result of fmt string.
+ * @param[in] fmt	string.
+ * @param[in] ...	variadic argument list.
+ * @return
+ *   - On success, the number of bytes written is returned (zero indicates nothing was written).
+ *   - On error, -1 is returned, and errno is set appropriately
+ */
+ssize_t fr_fprintf(FILE *fp, char const *fmt, ...)
+{
+	va_list ap;
+	char *buf;
+	int ret;
+
+	if (!fp) {
+		fr_strerror_const("Invalid 'fp'");
+		return -1;
+	}
+
+	va_start(ap, fmt);
+	buf = fr_vasprintf(NULL, fmt, ap);
+	va_end(ap);
+
+	ret = fputs(buf, fp);
+
+	TALLOC_FREE(buf);
 
 	return ret;
 }

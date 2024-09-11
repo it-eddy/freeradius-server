@@ -1,45 +1,53 @@
 #
-# PRE: update if
+# PRE: if
 #
-update {
-       control:Cleartext-Password := 'hello'
-       request:Tmp-String-0 := "This is a string\n"
-       request:Tmp-Octets-0 := 0x000504030201
-       request:Tmp-String-1 := "what do ya want for nothing?"
-       request:Tmp-String-2 := "Jefe"
-}
+string test_string
+string test_hmac_key
+string test_hmac_data
+string dummy_string
+
+octets result_octets
+
+test_string := "This is a string\n"
+test_hmac_key := "what do ya want for nothing?"
+test_hmac_data := "Jefe"
 
 #
 #  Put "This is a string" into a file and call "sha1sum" on it.
 #  You should get this string.
 #
-if ("%{sha1:This is a string\n}" != 'cc7edf1ccc4bdf1e0ec8f72b95388b65218ecf0c') {
+result_octets := %sha1("This is a string\n")
+if (!(result_octets == 0xcc7edf1ccc4bdf1e0ec8f72b95388b65218ecf0c)) {
 	test_fail
 }
 
-if ("%{sha1:&Tmp-String-0}" != 'cc7edf1ccc4bdf1e0ec8f72b95388b65218ecf0c') {
-	test_fail
-}
-
-if ("%{sha1:&request:Tmp-String-0}" != 'cc7edf1ccc4bdf1e0ec8f72b95388b65218ecf0c') {
-	test_fail
-}
-
-if ("%{sha1:%{Tmp-String-0}}" != 'cc7edf1ccc4bdf1e0ec8f72b95388b65218ecf0c') {
+result_octets := %sha1("%{test_string}")
+if (!(result_octets == 0xcc7edf1ccc4bdf1e0ec8f72b95388b65218ecf0c)) {
 	test_fail
 }
 
 #
-#  SHA1 should also be able to cope with references to octet attributes
+# SHA1 of empty string
 #
-if ("%{sha1:&request:Tmp-Octets-0}" != '365b244645fe7294dff062174996572319d5a82c') {
+result_octets := %sha1("%{dummy_string}")
+if (!(result_octets == 0xda39a3ee5e6b4b0d3255bfef95601890afd80709)) {
 	test_fail
 }
 
 #
 #  SHA1 HMAC with attribute references
 #
-if ("%{hmacsha1:&Tmp-String-1 &Tmp-String-2}" != 'effcdf6ae5eb2fa2d27416d5f184df9c259a7c79') {
+result_octets := %hmacsha1("%{test_hmac_key}", "%{test_hmac_data}")
+if (!(result_octets == 0xeffcdf6ae5eb2fa2d27416d5f184df9c259a7c79)) {
+	test_fail
+}
+
+#
+#  SHA1 HMAC with empty key and data
+#
+dummy_string := ''
+result_octets := %hmacsha1("%{dummy_string}", "%{dummy_string}")
+if (!(result_octets == 0xfbdb1d1b18aa6c08324b7d64b71fb76370690e1d)) {
 	test_fail
 }
 

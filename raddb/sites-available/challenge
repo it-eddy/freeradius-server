@@ -1,3 +1,8 @@
+#  -*- text -*-
+#  $Id$
+
+#######################################################################
+
 #
 #	This file gives an example of using Challenge-Response
 #
@@ -6,28 +11,32 @@
 #	consisting of a random number 0..9.  The user has to respond
 #	with that number.
 #
-#
-#	$Id$
-#
-listen {
-	type = auth
-	ipaddr = *
-	port = 2000
-	virtual_server = challenge
-}
-
 server challenge {
+	namespace = radius
+
+	dictionary {
+		uint32 challenge-string
+	}
+
+	listen {
+		type = Access-Request
+		transport = udp
+
+		udp {
+			ipaddr = *
+			port = 2000
+		}
+	}
+
 recv Access-Request {
 
 	#
-	#  If ther's no State attribute, then this is the request from
+	#  If there's no State attribute, then this is the request from
 	#  the user.
 	#
-	if (!State) {
-		update control {
-			Auth-Type := Step1
-			Cleartext-Password := "hello"
-		}
+	if (!&State) {
+		&control.Auth-Type := ::Step1
+		&control.Password.Cleartext := "hello"
 	}
 	else {
 		#
@@ -35,15 +44,13 @@ recv Access-Request {
 		#  Set the "known good" password to the number
 		#  saved in the session-state list.
 		#
-		update control {
-			Auth-Type := Step2
-			Cleartext-Password := &session-state:Tmp-Integer-0
-		}
+		&control.Auth-Type := ::Step2
+		&control.Password.Cleartext := &session-state.challenge-string
 	}
 }
 
 
-authenticate Step1 {
+authenticate step1 {
 	#  If the password doesn't match, the user is rejected
 	#  immediately.
 	pap
@@ -51,12 +58,8 @@ authenticate Step1 {
 	#
 	#  Set the random number to save.
 	#
-	update session-state {
-		Tmp-Integer-0 := "%{randstr:n}"
-	}
-	update reply {
-		Reply-Message := &session-state:Tmp-Integer-0
-	}
+	&session-state.challenge-string := "%randstr(n)"
+	&reply.Reply-Message := "Please enter %{session-state.challenge-string}: "
 
 	#
 	#  Send an Access-Challenge.
@@ -66,7 +69,7 @@ authenticate Step1 {
 	challenge
 }
 
-authenticate Step2 {
+authenticate step2 {
 	#
 	#  Do PAP authentication with the password.
 	#

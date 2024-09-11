@@ -23,13 +23,15 @@
  */
 RCSID("$Id$")
 
-#include "libfreeradius-ldap.h"
+USES_APPLE_DEPRECATED_API
+
+#include <freeradius-devel/ldap/base.h>
 
 #define STATE_TRANSITION(_new) \
 do { \
 	DEBUG4("Changed state %s -> %s", \
-	       fr_int2str(fr_ldap_connection_states, c->state, "<INVALID>"), \
-	       fr_int2str(fr_ldap_connection_states, _new, "<INVALID>")); \
+	       fr_table_str_by_value(fr_ldap_connection_states, c->state, "<INVALID>"), \
+	       fr_table_str_by_value(fr_ldap_connection_states, _new, "<INVALID>")); \
 	c->state = _new; \
 } while (0)
 
@@ -60,7 +62,7 @@ again:
 			STATE_TRANSITION(FR_LDAP_STATE_START_TLS);
 			break;
 		}
-		/* FALL-THROUGH */
+		FALL_THROUGH;
 
 	/*
 	 *	If we're successful in negotiating TLS,
@@ -107,12 +109,7 @@ again:
 	 */
 	case FR_LDAP_STATE_BIND:
 		STATE_TRANSITION(FR_LDAP_STATE_RUN);
-	/*
-		if (fr_ldap_mux_async(c) < 0) {
-			STATE_TRANSITION(FR_LDAP_STATE_ERROR);
-			goto again;
-		}
-	 */
+		connection_signal_connected(c->conn);
 		break;
 
 	/*
@@ -121,8 +118,11 @@ again:
 	case FR_LDAP_STATE_RUN:		/* There's no next state for run, so this an error */
 	case FR_LDAP_STATE_ERROR:
 		STATE_TRANSITION(FR_LDAP_STATE_INIT);
-		fr_connection_signal_reconnect(c->conn);
-		break;
+		connection_signal_reconnect(c->conn, CONNECTION_FAILED);
+		/*
+		 *	The old connection has been freed, so specifically return the INIT state
+		 */
+		return FR_LDAP_STATE_INIT;
 	}
 
 	return c->state;
@@ -136,4 +136,3 @@ void fr_ldap_state_error(fr_ldap_connection_t *c)
 	STATE_TRANSITION(FR_LDAP_STATE_ERROR);
 	fr_ldap_state_next(c);
 }
-

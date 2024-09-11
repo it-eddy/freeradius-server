@@ -1,5 +1,5 @@
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -19,14 +19,14 @@
  * @file rlm_eap_sim/eap_sim.h
  * @brief Declarations for EAP-SIM
  *
- * @author Arran Cudbard-Bell <a.cudbardb@freeradius.org>
+ * @author Arran Cudbard-Bell (a.cudbardb@freeradius.org)
  *
- * @copyright 2016 Arran Cudbard-Bell <a.cudbardb@freeradius.org>
+ * @copyright 2016 Arran Cudbard-Bell (a.cudbardb@freeradius.org)
  * @copyright 2016 The FreeRADIUS server project
  */
 RCSIDH(rlm_eap_sim_eap_sim_h, "$Id$")
 
-#include "sim_proto.h"
+#include <freeradius-devel/sim/base.h>
 
 /** Server states
  *

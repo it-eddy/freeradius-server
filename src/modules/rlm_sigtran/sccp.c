@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, Network RADIUS SARL <license@networkradius.com>
+ * @copyright (c) 2016, Network RADIUS SAS (license@networkradius.com)
  *  All rights reserved.
  *
  *  Redistribution and use in source and binary forms, with or without
@@ -9,7 +9,7 @@
  *    * Redistributions in binary form must reproduce the above copyright
  *      notice, this list of conditions and the following disclaimer in the
  *      documentation and/or other materials provided with the distribution.
- *    * Neither the name of Network RADIUS SARL nor the
+ *    * Neither the name of Network RADIUS SAS nor the
  *      names of its contributors may be used to endorse or promote products
  *      derived from this software without specific prior written permission.
  *
@@ -32,12 +32,14 @@
  *
  * @author Arran Cudbard-Bell
  *
- * @copyright 2016 Network RADIUS SARL <license@networkradius.com>
+ * @copyright 2016 Network RADIUS SAS (license@networkradius.com)
  */
+#define LOG_PREFIX "sigtran - osmocom thread"
+
 #include <osmocom/core/talloc.h>
 
-#include <freeradius-devel/radiusd.h>
-#include <freeradius-devel/rad_assert.h>
+#include <freeradius-devel/server/base.h>
+#include <freeradius-devel/util/debug.h>
 #include <osmocom/core/msgb.h>
 #include <osmocom/core/utils.h>
 
@@ -47,41 +49,35 @@
 
 #include "libosmo-m3ua/include/cellmgr_debug.h"
 #include "libosmo-m3ua/include/mtp_data.h"
+#include "libosmo-m3ua/include/sctp_m3ua.h"
 
 static uint32_t	last_txn_id = 0;	//!< Global transaction ID
-static rbtree_t *txn_tree = NULL;	//!< Global transaction tree... Should really be per module.
+static fr_rb_tree_t *txn_tree = NULL;	//!< Global transaction tree... Should really be per module.
 static uint32_t	txn_tree_inst = 0;
 
 /** Compare rounds of a transaction
  *
  */
-static int sigtran_txn_cmp(void const *a, void const *b)
+static int sigtran_txn_cmp(void const *one, void const *two)
 {
-	sigtran_transaction_t const *a_tx = a;	/* May be stack allocated */
-	sigtran_transaction_t const *b_tx = b;	/* May be stack allocated */
+	sigtran_transaction_t const *a = one;	/* May be stack allocated */
+	sigtran_transaction_t const *b = two;	/* May be stack allocated */
 
-	if (a_tx->ctx.otid > b_tx->ctx.otid) return +1;
-	if (a_tx->ctx.otid < b_tx->ctx.otid) return -1;
+	CMP_RETURN(a, b, ctx.otid);
 
-	if (a_tx->ctx.invoke_id > b_tx->ctx.invoke_id) return +1;
-	if (a_tx->ctx.invoke_id < b_tx->ctx.invoke_id) return -1;
-
-	return 0;
+	return CMP(a->ctx.invoke_id, b->ctx.invoke_id);
 }
 
 static void sigtran_tcap_timeout(void *data)
 {
-	REQUEST *request;
 	sigtran_transaction_t *txn = talloc_get_type_abort(data, sigtran_transaction_t);
 
-	request = txn->ctx.request;
-
-	REDEBUG("OTID %u Invoke ID %u timeout", txn->ctx.otid, txn->ctx.invoke_id);
+	ERROR("OTID %u Invoke ID %u timeout", txn->ctx.otid, txn->ctx.invoke_id);
 
 	/*
 	 *	Remove the outstanding transaction
 	 */
-	if (!rbtree_deletebydata(txn_tree, txn)) ERROR("Transaction removed before timeout");
+	if (!fr_rb_delete(txn_tree, txn)) ERROR("Transaction removed before timeout");
 
 	txn->response.type = SIGTRAN_RESPONSE_FAIL;
 
@@ -124,7 +120,6 @@ int sigtran_tcap_outgoing(UNUSED struct msgb *msg_in, void *ctx, sigtran_transac
 		0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x01, 0x01, /* 0x40 */
 		0x00, 0x00 };					/* 0x48 */
 
-	REQUEST	*request = txn->ctx.request;
 	sigtran_map_send_auth_info_req_t *req =
 		talloc_get_type_abort(txn->request.data, sigtran_map_send_auth_info_req_t);
 
@@ -134,47 +129,48 @@ int sigtran_tcap_outgoing(UNUSED struct msgb *msg_in, void *ctx, sigtran_transac
 	struct mtp_m3ua_client_link 	*m3ua_client = talloc_get_type_abort(conn->mtp3_link->data,
 									     struct mtp_m3ua_client_link);
 
-	rad_assert(req->imsi);
+	fr_assert(req->imsi);
 
 	if (!mtp_m3ua_link_is_up(m3ua_client)) {
-		REDEBUG("Link not yet active, dropping the request");
+		ERROR("Link not yet active, dropping the request");
 
 		return -1;
 	}
 
-	if (rbtree_num_elements(txn_tree) > UINT8_MAX) {
-		REDEBUG("Too many outstanding requests, dropping the request");
+	if (fr_rb_num_elements(txn_tree) > UINT8_MAX) {
+		ERROR("Too many outstanding requests, dropping the request");
 
 		return -1;
 	}
 
 	switch (req->version) {
 	case 2:
-		RDEBUG4("Allocating buffer for MAP v2, %zu bytes", sizeof(tcap_map_raw_v2));
+		DEBUG4("Allocating buffer for MAP v2, %zu bytes", sizeof(tcap_map_raw_v2));
 		msg = msgb_alloc(sizeof(tcap_map_raw_v2), "sccp: tcap_map");
 		msg->l3h = msgb_put(msg, sizeof(tcap_map_raw_v2));
 		memcpy(msg->l3h, tcap_map_raw_v2, sizeof(tcap_map_raw_v2));
 
 		*(msg->l3h + 0x3a) = talloc_array_length(req->imsi);
 		memcpy(msg->l3h + 0x3b, req->imsi, talloc_array_length(req->imsi));
-		RHEXDUMP(0, msg->l3h, sizeof(tcap_map_raw_v2), "MAPv2 Request");
+//		RHEXDUMP(0, msg->l3h, sizeof(tcap_map_raw_v2), "MAPv2 Request");
 
 		break;
 
 	case 3:
-		RDEBUG4("Allocating buffer for MAP v3, %zu bytes", sizeof(tcap_map_raw_v3));
+		DEBUG4("Allocating buffer for MAP v3, %zu bytes", sizeof(tcap_map_raw_v3));
 		msg = msgb_alloc(sizeof(tcap_map_raw_v3), "sccp: tcap_map");
 		msg->l3h = msgb_put(msg, sizeof(tcap_map_raw_v3));
 		memcpy(msg->l3h, tcap_map_raw_v3, sizeof(tcap_map_raw_v3));
 
 		*(msg->l3h + 0x3c) = talloc_array_length(req->imsi);
 		memcpy(msg->l3h + 0x3d, req->imsi, talloc_array_length(req->imsi));
-		RHEXDUMP(0, msg->l3h, sizeof(tcap_map_raw_v3), "MAPv3 Request");
+//		RHEXDUMP(0, msg->l3h, sizeof(tcap_map_raw_v3), "MAPv3 Request");
 
 		break;
 
 	default:
-		if (!fr_cond_assert(0)) return -1;
+		fr_assert_fail(NULL);
+		return -1;
 	}
 
 	/*
@@ -184,19 +180,12 @@ int sigtran_tcap_outgoing(UNUSED struct msgb *msg_in, void *ctx, sigtran_transac
 
 	txn->ctx.invoke_id++;						/* Needs to be two operations */
 	txn->ctx.invoke_id &= 0x7f;					/* Invoke ID is 7bits */
-	RDEBUG2("Sending request with OTID %u Invoke ID %u", txn->ctx.otid, txn->ctx.invoke_id);
+	DEBUG2("Sending request with OTID %u Invoke ID %u", txn->ctx.otid, txn->ctx.invoke_id);
 
-	if (!rbtree_insert(txn_tree, txn)) {
-		RERROR("Failed inserting transaction, maybe at txn limit?");
+	if (!fr_rb_insert(txn_tree, txn)) {
+		ERROR("Failed inserting transaction, maybe at txn limit?");
 
 		msgb_free(msg);
-
-		txn->response.type = SIGTRAN_RESPONSE_FAIL;
-
-		if (sigtran_event_submit(ofd, txn) < 0) {
-			ERROR("Failed informing event client of result: %s", fr_syserror(errno));
-			return -1;
-		}
 		return -1;
 	}
 
@@ -236,7 +225,6 @@ static int sigtran_tcap_incoming(struct msgb *msg, UNUSED unsigned int length, U
 	sigtran_map_send_auth_info_req_t *req;
 	sigtran_map_send_auth_info_res_t *res;
 
-	REQUEST			*request;
 	struct osmo_fd		*ofd;
 	sigtran_vector_t	**last;
 
@@ -245,7 +233,7 @@ static int sigtran_tcap_incoming(struct msgb *msg, UNUSED unsigned int length, U
 //	sigtran_conn_t *conn = talloc_get_type_abort(ctx, sigtran_conn_t);
 
 	DEBUG3("Got %zu bytes of L4 data", (size_t)msgb_l3len(msg));
-//	radlog_request_hex(L_DBG, L_DBG_LVL_3, request, msg->l3h, (size_t)msgb_l3len(msg));
+//	log_request_hex(L_DBG, L_DBG_LVL_3, request, msg->l3h, (size_t)msgb_l3len(msg));
 
 	find.ctx.otid = *(msg->l3h + 0x5);
 
@@ -256,7 +244,7 @@ static int sigtran_tcap_incoming(struct msgb *msg, UNUSED unsigned int length, U
 	/*
 	 *	Lookup the transaction in our tree of outstanding transactions
 	 */
-	found = rbtree_finddata(txn_tree, &find);
+	found = fr_rb_find(txn_tree, &find);
 	if (!found) {
 		/*
 		 *	Not an error, could be a retransmission
@@ -264,14 +252,13 @@ static int sigtran_tcap_incoming(struct msgb *msg, UNUSED unsigned int length, U
 		ERROR("No outstanding transaction with DTID %u Invoke ID %u", find.ctx.otid, find.ctx.invoke_id);
 		return 0;
 	}
-	if (!rbtree_deletebydata(txn_tree, found)) {		/* Remove the outstanding transaction */
+	if (!fr_rb_delete(txn_tree, found)) {		/* Remove the outstanding transaction */
 		ERROR("Failed removing transaction");
-		rad_assert(0);
+		fr_assert(0);
 	}
 
 	txn = talloc_get_type_abort(found, sigtran_transaction_t);
 	req = talloc_get_type_abort(txn->request.data, sigtran_map_send_auth_info_req_t);
-	request = txn->ctx.request;
 	ofd = txn->ctx.ofd;
 	osmo_timer_del(&txn->ctx.timer);			/* Remove the timeout timer */
 
@@ -283,12 +270,13 @@ static int sigtran_tcap_incoming(struct msgb *msg, UNUSED unsigned int length, U
 #define sigtran_memdup(_x) \
 	do { \
 		p++; \
-		RDEBUG4("Start 0x%02x len %u", (unsigned int)(tcap - p), p[0]); \
+		DEBUG4("Start 0x%02x len %u", (unsigned int)(tcap - p), p[0]); \
 		if (p[0] >= (len - (p - tcap))) { \
-			REDEBUG("Invalid length %u specified for vector component", p[0]); \
+			ERROR("Invalid length %u specified for vector component", p[0]); \
 			return -1; \
 		} \
 		vec->_x = talloc_memdup(vec, p + 1, p[0]); \
+		talloc_set_type(vec->_x, uint8_t); \
 		p += p[0] + 1; \
 	} while (0)
 
@@ -304,7 +292,7 @@ static int sigtran_tcap_incoming(struct msgb *msg, UNUSED unsigned int length, U
 		p = tcap + 0x40;
 		while (p < end) {
 			if ((p[0] != 0x30) || (p[1] != 0x22)) {
-				RDEBUG4("Breaking out of parsing loop at %x", (uint32_t)(p - tcap));
+				DEBUG4("Breaking out of parsing loop at %x", (uint32_t)(p - tcap));
 				break;
 			}
 			p += 2;
@@ -351,6 +339,8 @@ static void sigtran_sccp_outgoing(UNUSED struct sccp_connection *sscp_conn,
 	sigtran_conn_t *conn = talloc_get_type_abort(ctx, sigtran_conn_t);
 
 	mtp_link_set_submit_sccp_data(conn->mtp3_link_set, -1, msg->l2h, msgb_l2len(msg));
+
+	msgb_free(msg);	/* Apparently our responsibility to free this message */
 }
 
 /** Wrapper to pass data off to libsccp for processing
@@ -385,7 +375,7 @@ int sigtran_sccp_global_init(void)
 		return 0;
 	}
 
-	txn_tree = rbtree_create(NULL, sigtran_txn_cmp, false, 0);
+	txn_tree = fr_rb_inline_talloc_alloc(NULL, sigtran_transaction_t, node, sigtran_txn_cmp, false);
 	if (!txn_tree) return -1;
 
 	txn_tree_inst++;

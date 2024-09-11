@@ -1,17 +1,20 @@
-# Returns the current epoch time in ms
 #
-# Sets Tmp-Integer64-0 with the current epoch time in ms
-time_current_ms {
-	update request {
-		Tmp-Integer64-0 := "%{expr:(%c*1000) + (%C/1000)}"
-	}
-}
+# Handles the Expiration attribute
+#
+expiration {
+	if (&control.Expiration) {
+		time_delta when
 
-# Returns elapsed time in ms since time_current_ms
-#
-# Sets Tmp-Integer64-1 with number of milliseconds
-time_elapsed_ms {
-	update request {
-		Tmp-Integer64-1 := "%{expr:(%c*1000) + (%C/1000) - %{Tmp-Integer64-0}}"
+		#
+		#  %l is "when the server received the request"
+		#
+		if (&control.Expiration < %l) {
+			disallow
+			return
+		}
+
+		&when = &control.Expiration - %l
+
+		&reply.Session-Timeout <= &when
 	}
 }

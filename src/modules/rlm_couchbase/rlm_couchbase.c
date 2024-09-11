@@ -20,21 +20,20 @@
  * @brief Integrate FreeRADIUS with the Couchbase document database.
  * @file rlm_couchbase.c
  *
- * @author Aaron Hurt <ahurt@anbcs.com>
+ * @author Aaron Hurt (ahurt@anbcs.com)
  * @copyright 2013-2014 The FreeRADIUS Server Project.
  */
 
 RCSID("$Id$")
 
-#define LOG_PREFIX "rlm_couchbase - "
+#define LOG_PREFIX "couchbase - "
 
-#include <freeradius-devel/radiusd.h>
-#include <freeradius-devel/libradius.h>
-#include <freeradius-devel/modules.h>
-#include <freeradius-devel/rad_assert.h>
+#include <freeradius-devel/server/base.h>
+#include <freeradius-devel/server/map.h>
+#include <freeradius-devel/server/module_rlm.h>
+#include <freeradius-devel/radius/defs.h>
 
-#include <libcouchbase/couchbase.h>
-#include "../rlm_json/json.h"
+#include <freeradius-devel/json/base.h>
 
 #include "mod.h"
 #include "couchbase.h"
@@ -42,67 +41,87 @@ RCSID("$Id$")
 /**
  * Client Configuration
  */
-static const CONF_PARSER client_config[] = {
-	{ FR_CONF_OFFSET("view", FR_TYPE_STRING, rlm_couchbase_t, client_view), .dflt = "_design/client/_view/by_name" },
+static const conf_parser_t client_config[] = {
+	{ FR_CONF_OFFSET("view", rlm_couchbase_t, client_view), .dflt = "_design/client/_view/by_name" },
 	CONF_PARSER_TERMINATOR
 };
 
 /**
  * Module Configuration
  */
-static const CONF_PARSER module_config[] = {
-	{ FR_CONF_OFFSET("server", FR_TYPE_STRING | FR_TYPE_REQUIRED, rlm_couchbase_t, server_raw) },
-	{ FR_CONF_OFFSET("bucket", FR_TYPE_STRING | FR_TYPE_REQUIRED, rlm_couchbase_t, bucket) },
-	{ FR_CONF_OFFSET("password", FR_TYPE_STRING, rlm_couchbase_t, password) },
-#ifdef WITH_ACCOUNTING
-	{ FR_CONF_OFFSET("acct_key", FR_TYPE_TMPL, rlm_couchbase_t, acct_key), .dflt = "radacct_%{%{Acct-Unique-Session-Id}:-%{Acct-Session-Id}}", .quote = T_DOUBLE_QUOTED_STRING },
-	{ FR_CONF_OFFSET("doctype", FR_TYPE_STRING, rlm_couchbase_t, doctype), .dflt = "radacct" },
-	{ FR_CONF_OFFSET("expire", FR_TYPE_UINT32, rlm_couchbase_t, expire), .dflt = 0 },
-#endif
-	{ FR_CONF_OFFSET("user_key", FR_TYPE_TMPL, rlm_couchbase_t, user_key), .dflt = "raduser_%{md5:%{tolower:%{%{Stripped-User-Name}:-%{User-Name}}}}", .quote = T_DOUBLE_QUOTED_STRING },
-	{ FR_CONF_OFFSET("read_clients", FR_TYPE_BOOL, rlm_couchbase_t, read_clients) }, /* NULL defaults to "no" */
-	{ FR_CONF_POINTER("client", FR_TYPE_SUBSECTION, NULL), .subcs = (void const *) client_config },
+static const conf_parser_t module_config[] = {
+	{ FR_CONF_OFFSET_FLAGS("server", CONF_FLAG_REQUIRED, rlm_couchbase_t, server_raw) },
+	{ FR_CONF_OFFSET_FLAGS("bucket", CONF_FLAG_REQUIRED, rlm_couchbase_t, bucket) },
+	{ FR_CONF_OFFSET("username", rlm_couchbase_t, username) },
+	{ FR_CONF_OFFSET("password", rlm_couchbase_t, password) },
+
+	{ FR_CONF_OFFSET("acct_key", rlm_couchbase_t, acct_key), .dflt = "radacct_%{%{Acct-Unique-Session-Id} || %{Acct-Session-Id}}", .quote = T_DOUBLE_QUOTED_STRING },
+	{ FR_CONF_OFFSET("doctype", rlm_couchbase_t, doctype), .dflt = "radacct" },
+	{ FR_CONF_OFFSET("expire", rlm_couchbase_t, expire), .dflt = 0 },
+
+	{ FR_CONF_OFFSET("user_key", rlm_couchbase_t, user_key), .dflt = "raduser_%md5(%tolower(%{Stripped-User-Name} || %{User-Name}))", .quote = T_DOUBLE_QUOTED_STRING },
+	{ FR_CONF_OFFSET("read_clients", rlm_couchbase_t, read_clients) }, /* NULL defaults to "no" */
+	{ FR_CONF_POINTER("client", 0, CONF_FLAG_SUBSECTION, NULL), .subcs = (void const *) client_config },
 	CONF_PARSER_TERMINATOR
+};
+
+static fr_dict_t const *dict_radius;
+
+extern fr_dict_autoload_t rlm_couchbase_dict[];
+fr_dict_autoload_t rlm_couchbase_dict[] = {
+	{ .out = &dict_radius, .proto = "radius" },
+	{ NULL }
+};
+
+fr_dict_attr_t const *attr_acct_status_type;
+fr_dict_attr_t const *attr_acct_session_time;
+fr_dict_attr_t const *attr_event_timestamp;
+
+extern fr_dict_attr_autoload_t rlm_couchbase_dict_attr[];
+fr_dict_attr_autoload_t rlm_couchbase_dict_attr[] = {
+	{ .out = &attr_acct_status_type, .name = "Acct-Status-Type", .type = FR_TYPE_UINT32, .dict = &dict_radius },
+	{ .out = &attr_acct_session_time, .name = "Acct-Session-Time", .type = FR_TYPE_UINT32, .dict = &dict_radius },
+	{ .out = &attr_event_timestamp, .name = "Event-Timestamp", .type = FR_TYPE_DATE, .dict = &dict_radius },
+	{ NULL }
 };
 
 /** Handle authorization requests using Couchbase document data
  *
- * Attempt to fetch the document assocaited with the requested user by
+ * Attempt to fetch the document associated with the requested user by
  * using the deterministic key defined in the configuration.  When a valid
  * document is found it will be parsed and the containing value pairs will be
  * injected into the request.
  *
- * @param instance	The module instance.
- * @param thread	specific data.
- * @param request	The authorization request.
- * @return Operation status (#rlm_rcode_t).
+ * @param[out] p_result		Operation status (#rlm_rcode_t).
+ * @param[in] mctx		module calling context.
+ * @param[in] request		The authorization request.
  */
-static rlm_rcode_t mod_authorize(void *instance, UNUSED void *thread, REQUEST *request)
+static unlang_action_t mod_authorize(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request)
 {
-	rlm_couchbase_t const *inst = instance;       /* our module instance */
-	rlm_couchbase_handle_t *handle = NULL;  /* connection pool handle */
-	char buffer[MAX_KEY_SIZE];
-	char const *dockey;            		/* our document key */
-	lcb_error_t cb_error = LCB_SUCCESS;     /* couchbase error holder */
-	rlm_rcode_t rcode = RLM_MODULE_OK;      /* return code */
-	ssize_t slen;
+	rlm_couchbase_t const	*inst = talloc_get_type_abort_const(mctx->mi->data, rlm_couchbase_t);		/* our module instance */
+	rlm_couchbase_handle_t	*handle = NULL;			/* connection pool handle */
+	char			buffer[MAX_KEY_SIZE];
+	char const		*dockey;			/* our document key */
+	lcb_error_t		cb_error = LCB_SUCCESS;		/* couchbase error holder */
+	rlm_rcode_t		rcode = RLM_MODULE_OK;		/* return code */
+	ssize_t			slen;
 
 	/* assert packet as not null */
-	rad_assert(request->packet != NULL);
+	fr_assert(request->packet != NULL);
 
 	/* attempt to build document key */
 	slen = tmpl_expand(&dockey, buffer, sizeof(buffer), request, inst->user_key, NULL, NULL);
-	if (slen < 0) return RLM_MODULE_FAIL;
+	if (slen < 0) RETURN_MODULE_FAIL;
 	if ((dockey == buffer) && is_truncated((size_t)slen, sizeof(buffer))) {
 		REDEBUG("Key too long, expected < " STRINGIFY(sizeof(buffer)) " bytes, got %zi bytes", slen);
-		return RLM_MODULE_FAIL;
+		RETURN_MODULE_FAIL;
 	}
 
 	/* get handle */
 	handle = fr_pool_connection_get(inst->pool, request);
 
 	/* check handle */
-	if (!handle) return RLM_MODULE_FAIL;
+	if (!handle) RETURN_MODULE_FAIL;
 
 	/* set couchbase instance */
 	lcb_t cb_inst = handle->handle;
@@ -126,14 +145,65 @@ static rlm_rcode_t mod_authorize(void *instance, UNUSED void *thread, REQUEST *r
 	/* debugging */
 	RDEBUG3("parsed user document == %s", json_object_to_json_string(cookie->jobj));
 
-	/* inject config value pairs defined in this json oblect */
-	mod_json_object_to_value_pairs(cookie->jobj, "config", request);
+	{
+		TALLOC_CTX	*pool = talloc_pool(request, 1024);	/* We need to do lots of allocs */
+		fr_dcursor_t	maps;
+		map_t		*map = NULL;
+		fr_dlist_head_t	map_head;
+		vp_list_mod_t	*vlm;
+		fr_dlist_head_t	vlm_head;
 
-	/* inject reply value pairs defined in this json oblect */
-	mod_json_object_to_value_pairs(cookie->jobj, "reply", request);
+		fr_dcursor_init(&maps, &map_head);
 
-	finish:
+		/*
+		 *	Convert JSON data into maps
+		 */
+		if ((mod_json_object_to_map(pool, &maps, request, cookie->jobj, request_attr_control) < 0) ||
+		    (mod_json_object_to_map(pool, &maps, request, cookie->jobj, request_attr_reply) < 0) ||
+		    (mod_json_object_to_map(pool, &maps, request, cookie->jobj, request_attr_request) < 0) ||
+		    (mod_json_object_to_map(pool, &maps, request, cookie->jobj, request_attr_state) < 0)) {
+		invalid:
+			talloc_free(pool);
+			rcode = RLM_MODULE_INVALID;
+			goto finish;
+		}
 
+		fr_dlist_init(&vlm_head, vp_list_mod_t, entry);
+
+		/*
+		 *	Convert all the maps into list modifications,
+		 *	which are guaranteed to succeed.
+		 */
+		while ((map = fr_dlist_next(&map_head, map))) {
+			if (map_to_list_mod(pool, &vlm, request, map, NULL, NULL) < 0) goto invalid;
+			fr_dlist_insert_tail(&vlm_head, vlm);
+		}
+
+		if (fr_dlist_empty(&vlm_head)) {
+			RDEBUG2("Nothing to update");
+			talloc_free(pool);
+			rcode = RLM_MODULE_NOOP;
+			goto finish;
+		}
+
+		/*
+		 *	Apply the list of modifications
+		 */
+		while ((vlm = fr_dlist_next(&vlm_head, vlm))) {
+			int ret;
+
+			ret = map_list_mod_apply(request, vlm);	/* SHOULD NOT FAIL */
+			if (!fr_cond_assert(ret == 0)) {
+				talloc_free(pool);
+				rcode = RLM_MODULE_FAIL;
+				goto finish;
+			}
+		}
+
+		talloc_free(pool);
+	}
+
+finish:
 	/* free json object */
 	if (cookie->jobj) {
 		json_object_put(cookie->jobj);
@@ -141,15 +211,12 @@ static rlm_rcode_t mod_authorize(void *instance, UNUSED void *thread, REQUEST *r
 	}
 
 	/* release handle */
-	if (handle) {
-		fr_pool_connection_release(inst->pool, request, handle);
-	}
+	if (handle) fr_pool_connection_release(inst->pool, request, handle);
 
 	/* return */
-	return rcode;
+	RETURN_MODULE_RCODE(rcode);
 }
 
-#ifdef WITH_ACCOUNTING
 /** Write accounting data to Couchbase documents
  *
  * Handle accounting requests and store the associated data into JSON documents
@@ -159,17 +226,16 @@ static rlm_rcode_t mod_authorize(void *instance, UNUSED void *thread, REQUEST *r
  * will be merged with the currently existing data.  When conflicts arrise the new attribute
  * value will replace or be added to the existing value.
  *
- * @param instance	The module instance.
- * @param thread	specific data.
- * @param request	The accounting request object.
- * @return Operation status (#rlm_rcode_t).
+ * @param[out] p_result		Result of calling the module.
+ * @param mctx			module calling context.
+ * @param request		The accounting request object.
  */
-static rlm_rcode_t mod_accounting(void *instance, UNUSED void *thread, REQUEST *request)
+static unlang_action_t mod_accounting(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request)
 {
-	rlm_couchbase_t const *inst = instance;       /* our module instance */
+	rlm_couchbase_t const *inst = talloc_get_type_abort_const(mctx->mi->data, rlm_couchbase_t);       /* our module instance */
 	rlm_couchbase_handle_t *handle = NULL;  /* connection pool handle */
 	rlm_rcode_t rcode = RLM_MODULE_OK;      /* return code */
-	VALUE_PAIR *vp;                         /* radius value pair linked list */
+	fr_pair_t *vp;                         /* radius value pair linked list */
 	char buffer[MAX_KEY_SIZE];
 	char const *dockey;			/* our document key */
 	char document[MAX_VALUE_SIZE];          /* our document body */
@@ -179,15 +245,16 @@ static rlm_rcode_t mod_accounting(void *instance, UNUSED void *thread, REQUEST *
 	lcb_error_t cb_error = LCB_SUCCESS;     /* couchbase error holder */
 	ssize_t slen;
 
+
 	/* assert packet as not null */
-	rad_assert(request->packet != NULL);
+	fr_assert(request->packet != NULL);
 
 	/* sanity check */
-	if ((vp = fr_pair_find_by_num(request->packet->vps, 0, FR_ACCT_STATUS_TYPE, TAG_ANY)) == NULL) {
+	if ((vp = fr_pair_find_by_da(&request->request_pairs, NULL, attr_acct_status_type)) == NULL) {
 		/* log debug */
-		RDEBUG("could not find status type in packet");
+		RDEBUG2("could not find status type in packet");
 		/* return */
-		return RLM_MODULE_NOOP;
+		RETURN_MODULE_NOOP;
 	}
 
 	/* set status */
@@ -196,16 +263,16 @@ static rlm_rcode_t mod_accounting(void *instance, UNUSED void *thread, REQUEST *
 	/* acknowledge the request but take no action */
 	if (status == FR_STATUS_ACCOUNTING_ON || status == FR_STATUS_ACCOUNTING_OFF) {
 		/* log debug */
-		RDEBUG("handling accounting on/off request without action");
+		RDEBUG2("handling accounting on/off request without action");
 		/* return */
-		return RLM_MODULE_OK;
+		RETURN_MODULE_OK;
 	}
 
 	/* get handle */
 	handle = fr_pool_connection_get(inst->pool, request);
 
 	/* check handle */
-	if (!handle) return RLM_MODULE_FAIL;
+	if (!handle) RETURN_MODULE_FAIL;
 
 	/* set couchbase instance */
 	lcb_t cb_inst = handle->handle;
@@ -249,41 +316,44 @@ static rlm_rcode_t mod_accounting(void *instance, UNUSED void *thread, REQUEST *
 	/* start json document if needed */
 	if (docfound != 1) {
 		/* debugging */
-		RDEBUG("no existing document found - creating new json document");
+		RDEBUG2("no existing document found - creating new json document");
 		/* create new json object */
 		cookie->jobj = json_object_new_object();
 		/* set 'docType' element for new document */
-		json_object_object_add(cookie->jobj, "docType", json_object_new_string(inst->doctype));
+		json_object_object_add_ex(cookie->jobj, "docType", json_object_new_string(inst->doctype),
+					  JSON_C_OBJECT_KEY_IS_CONSTANT);
 		/* default startTimestamp and stopTimestamp to null values */
-		json_object_object_add(cookie->jobj, "startTimestamp", NULL);
-		json_object_object_add(cookie->jobj, "stopTimestamp", NULL);
+		json_object_object_add_ex(cookie->jobj, "startTimestamp", NULL, JSON_C_OBJECT_KEY_IS_CONSTANT);
+		json_object_object_add_ex(cookie->jobj, "stopTimestamp", NULL, JSON_C_OBJECT_KEY_IS_CONSTANT);
 	}
 
 	/* status specific replacements for start/stop time */
 	switch (status) {
 	case FR_STATUS_START:
 		/* add start time */
-		if ((vp = fr_pair_find_by_num(request->packet->vps, 0, FR_EVENT_TIMESTAMP, TAG_ANY)) != NULL) {
+		if ((vp = fr_pair_find_by_da(&request->request_pairs, NULL, attr_acct_status_type)) != NULL) {
 			/* add to json object */
-			json_object_object_add(cookie->jobj, "startTimestamp",
-					       mod_value_pair_to_json_object(request, vp));
+			json_object_object_add_ex(cookie->jobj, "startTimestamp",
+						  mod_value_pair_to_json_object(request, vp),
+						  JSON_C_OBJECT_KEY_IS_CONSTANT);
 		}
 		break;
 
 	case FR_STATUS_STOP:
 		/* add stop time */
-		if ((vp = fr_pair_find_by_num(request->packet->vps, 0, FR_EVENT_TIMESTAMP, TAG_ANY)) != NULL) {
+		if ((vp = fr_pair_find_by_da(&request->request_pairs, NULL, attr_event_timestamp)) != NULL) {
 			/* add to json object */
-			json_object_object_add(cookie->jobj, "stopTimestamp",
-					       mod_value_pair_to_json_object(request, vp));
+			json_object_object_add_ex(cookie->jobj, "stopTimestamp",
+						  mod_value_pair_to_json_object(request, vp),
+						  JSON_C_OBJECT_KEY_IS_CONSTANT);
 		}
 		/* check start timestamp and adjust if needed */
-		mod_ensure_start_timestamp(cookie->jobj, request->packet->vps);
+		mod_ensure_start_timestamp(cookie->jobj, &request->request_pairs);
 		break;
 
 	case FR_STATUS_ALIVE:
 		/* check start timestamp and adjust if needed */
-		mod_ensure_start_timestamp(cookie->jobj, request->packet->vps);
+		mod_ensure_start_timestamp(cookie->jobj, &request->request_pairs);
 		break;
 
 	default:
@@ -294,7 +364,9 @@ static rlm_rcode_t mod_accounting(void *instance, UNUSED void *thread, REQUEST *
 	}
 
 	/* loop through pairs and add to json document */
-	for (vp = request->packet->vps; vp; vp = vp->next) {
+	for (vp = fr_pair_list_head(&request->request_pairs);
+	     vp;
+	     vp = fr_pair_list_next(&request->request_pairs, vp)) {
 		/* map attribute to element */
 		if (mod_attribute_to_element(vp->da->name, inst->map, &element) == 0) {
 			/* debug */
@@ -338,49 +410,49 @@ finish:
 	}
 
 	/* return */
-	return rcode;
+	RETURN_MODULE_RCODE(rcode);
 }
-#endif
 
 
 /** Detach the module
  *
  * Detach the module instance and free any allocated resources.
  *
- * @param  instance The module instance.
+ * @param  mctx The module instance.
  * @return Returns 0 (success) in all conditions.
  */
-static int mod_detach(void *instance)
+static int mod_detach(module_detach_ctx_t const *mctx)
 {
-	rlm_couchbase_t *inst = instance;
+	rlm_couchbase_t *inst = talloc_get_type_abort(mctx->mi->data, rlm_couchbase_t);
 
 	if (inst->map) json_object_put(inst->map);
 	if (inst->pool) fr_pool_free(inst->pool);
+	if (inst->api_opts) mod_free_api_opts(inst);
 
 	return 0;
 }
 
 /** Initialize the rlm_couchbase module
  *
- * Intialize the module and create the initial Couchbase connection pool.
+ * Initialize the module and create the initial Couchbase connection pool.
  *
- * @param  conf     The module configuration.
- * @param  instance The module instance.
+ * @param  mctx     The module instance.
  * @return
  *	- 0 on success.
  *	- -1 on failure.
  */
-static int mod_instantiate(void *instance, CONF_SECTION *conf)
+static int mod_instantiate(module_inst_ctx_t const *mctx)
 {
-	rlm_couchbase_t *inst = instance;   /* our module instance */
+	rlm_couchbase_t *inst = talloc_get_type_abort(mctx->mi->data, rlm_couchbase_t);   /* our module instance */
+	CONF_SECTION	*conf = mctx->mi->conf;
 
 	{
 		char *server, *p;
 		size_t len, i;
 		bool sep = false;
 
-		len = talloc_array_length(inst->server_raw);
-		server = p = talloc_array(inst, char, len);
+		len = talloc_array_length(inst->server_raw) - 1;
+		server = p = talloc_array(inst, char, len + 1);
 		for (i = 0; i < len; i++) {
 			switch (inst->server_raw[i]) {
 			case '\t':
@@ -410,8 +482,14 @@ static int mod_instantiate(void *instance, CONF_SECTION *conf)
 		return -1;
 	}
 
+	/* setup libcouchbase extra options */
+	if (mod_build_api_opts(conf, inst) != 0) {
+		/* fail */
+		return -1;
+	}
+
 	/* initiate connection pool */
-	inst->pool = module_connection_pool_init(conf, inst, mod_conn_create, mod_conn_alive, NULL, NULL, NULL);
+	inst->pool = module_rlm_connection_pool_init(conf, inst, mod_conn_create, mod_conn_alive, NULL, NULL, NULL);
 
 	/* check connection pool */
 	if (!inst->pool) {
@@ -466,20 +544,22 @@ static int mod_load(void)
 /*
  * Hook into the FreeRADIUS module system.
  */
-extern rad_module_t rlm_couchbase;
-rad_module_t rlm_couchbase = {
-	.magic		= RLM_MODULE_INIT,
-	.name		= "couchbase",
-	.type		= RLM_TYPE_THREAD_SAFE,
-	.inst_size	= sizeof(rlm_couchbase_t),
-	.config		= module_config,
-	.load		= mod_load,
-	.instantiate	= mod_instantiate,
-	.detach		= mod_detach,
-	.methods = {
-		[MOD_AUTHORIZE]		= mod_authorize,
-#ifdef WITH_ACCOUNTING
-		[MOD_ACCOUNTING]	= mod_accounting,
-#endif
+extern module_rlm_t rlm_couchbase;
+module_rlm_t rlm_couchbase = {
+	.common = {
+		.magic		= MODULE_MAGIC_INIT,
+		.name		= "couchbase",
+		.inst_size	= sizeof(rlm_couchbase_t),
+		.config		= module_config,
+		.onload		= mod_load,
+		.instantiate	= mod_instantiate,
+		.detach		= mod_detach
 	},
+	.method_group = {
+		.bindings = (module_method_binding_t[]){
+			{ .section = SECTION_NAME("accounting", CF_IDENT_ANY), .method = mod_accounting },
+			{ .section = SECTION_NAME("recv", CF_IDENT_ANY), .method = mod_authorize },
+			MODULE_BINDING_TERMINATOR
+		}
+	}
 };

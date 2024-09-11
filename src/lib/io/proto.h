@@ -1,3 +1,4 @@
+#pragma once
 /*
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -13,11 +14,6 @@
  *  along with this program; if not, write to the Free Software
  *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
-#ifndef _FR_IO_PROTO_H
-#define _FR_IO_PROTO_H
-
-#include <freeradius-devel/dl.h>
-#include <freeradius-devel/value.h>
 
 /**
  * $Id$
@@ -27,6 +23,8 @@
  *
  * @copyright 2017 The FreeRADIUS project
  */
+#include <freeradius-devel/server/dl_module.h>
+#include <freeradius-devel/util/value.h>
 
 #define FR_PROTO_STACK_MAX	10
 
@@ -157,7 +155,7 @@ typedef int (*fr_proto_set_option_t)(void *proto_ctx, fr_proto_opt_group_t opt_g
  *
  */
 typedef struct {
-	RAD_MODULE_COMMON;					//!< Common fields to all loadable modules.
+	DL_MODULE_COMMON;					//!< Common fields to all loadable modules.
 
 	size_t				proto_ctx_size;		//!< Size required for the packet ctx structure.
 
@@ -188,5 +186,3 @@ typedef struct {
 	fr_proto_stack_frame_t	frame[FR_PROTO_STACK_MAX + 1];
 	int			depth;
 } fr_proto_stack_t;
-#endif /* _FR_IO_PROTO_H */
-

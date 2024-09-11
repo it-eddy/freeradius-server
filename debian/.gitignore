@@ -7,7 +7,7 @@ freeradius-mysql
 freeradius-postgresql
 freeradius-rest
 freeradius-utils
-freeradius-dhcp
+freeradius-unixodbc
 freeradius-memcached
 freeradius-redis
 freeradius-yubikey
@@ -18,3 +18,5 @@ stamp-patched
 tmp
 files
 control
+freeradius.postinst.debhelper
+freeradius.postrm.debhelper

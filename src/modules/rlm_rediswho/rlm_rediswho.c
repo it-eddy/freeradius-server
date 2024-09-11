@@ -21,27 +21,25 @@
  *
  * @author Gabriel Blanchard
  *
- * @copyright 2015 Arran Cudbard-Bell <a.cudbardb@freeradius.org>
- * @copyright 2011  TekSavvy Solutions <gabe@teksavvy.com>
- * @copyright 2000,2006  The FreeRADIUS server project
+ * @copyright 2015 Arran Cudbard-Bell (a.cudbardb@freeradius.org)
+ * @copyright 2011 TekSavvy Solutions (gabe@teksavvy.com)
+ * @copyright 2000,2006 The FreeRADIUS server project
  */
 
 RCSID("$Id$")
 
-#include <freeradius-devel/radiusd.h>
-#include <freeradius-devel/modules.h>
-#include <freeradius-devel/modpriv.h>
-#include <freeradius-devel/rad_assert.h>
+#include <freeradius-devel/server/base.h>
+#include <freeradius-devel/server/module_rlm.h>
+#include <freeradius-devel/server/modpriv.h>
+#include <freeradius-devel/util/debug.h>
 
-#include "../rlm_redis/redis.h"
-#include "../rlm_redis/cluster.h"
+#include <freeradius-devel/redis/base.h>
+#include <freeradius-devel/redis/cluster.h>
 
-typedef struct rlm_rediswho {
-	fr_redis_conf_t		*conf;		//!< Connection parameters for the Redis server.
+typedef struct {
+	fr_redis_conf_t		conf;		//!< Connection parameters for the Redis server.
 						//!< Must be first field in this struct.
 
-	char const		*name;		//!< Instance name.
-	CONF_SECTION		*cs;
 	fr_redis_cluster_t	*cluster;	//!< Pool O pools
 
 	int			expiry_time;	//!< Expiry time in seconds if no updates are received for a user
@@ -53,33 +51,52 @@ typedef struct rlm_rediswho {
 	char const		*expire;	//!< Command for expiring entries.
 } rlm_rediswho_t;
 
-static CONF_PARSER section_config[] = {
-	{ FR_CONF_OFFSET("insert", FR_TYPE_STRING | FR_TYPE_REQUIRED | FR_TYPE_XLAT, rlm_rediswho_t, insert) },
-	{ FR_CONF_OFFSET("trim", FR_TYPE_STRING | FR_TYPE_XLAT, rlm_rediswho_t, trim) }, /* required only if trim_count > 0 */
-	{ FR_CONF_OFFSET("expire", FR_TYPE_STRING | FR_TYPE_REQUIRED | FR_TYPE_XLAT, rlm_rediswho_t, expire) },
+static conf_parser_t section_config[] = {
+	{ FR_CONF_OFFSET_FLAGS("insert", CONF_FLAG_REQUIRED | CONF_FLAG_XLAT, rlm_rediswho_t, insert) },
+	{ FR_CONF_OFFSET_FLAGS("trim", CONF_FLAG_XLAT, rlm_rediswho_t, trim) }, /* required only if trim_count > 0 */
+	{ FR_CONF_OFFSET_FLAGS("expire", CONF_FLAG_REQUIRED, rlm_rediswho_t, expire) },
 	CONF_PARSER_TERMINATOR
 };
 
-static CONF_PARSER module_config[] = {
+static conf_parser_t module_config[] = {
 	REDIS_COMMON_CONFIG,
 
-	{ FR_CONF_OFFSET("trim_count", FR_TYPE_INT32, rlm_rediswho_t, trim_count), .dflt = "-1" },
+	{ FR_CONF_OFFSET("trim_count", rlm_rediswho_t, trim_count), .dflt = "-1" },
 
 	/*
 	 *	These all smash the same variables, because we don't care about them right now.
 	 *	In 3.1, we should have a way of saying "parse a set of sub-sections according to a template"
 	 */
-	{ FR_CONF_POINTER("Start", FR_TYPE_SUBSECTION, NULL), .subcs = section_config },
-	{ FR_CONF_POINTER("Interim-Update", FR_TYPE_SUBSECTION, NULL), .subcs = section_config },
-	{ FR_CONF_POINTER("Stop", FR_TYPE_SUBSECTION, NULL), .subcs = section_config },
+	{ FR_CONF_POINTER("Start", 0, CONF_FLAG_SUBSECTION, NULL), .subcs = section_config },
+	{ FR_CONF_POINTER("Interim-Update", 0, CONF_FLAG_SUBSECTION, NULL), .subcs = section_config },
+	{ FR_CONF_POINTER("Stop", 0, CONF_FLAG_SUBSECTION, NULL), .subcs = section_config },
+	{ FR_CONF_POINTER("Accounting-On", 0, CONF_FLAG_SUBSECTION, NULL), .subcs = section_config },
+	{ FR_CONF_POINTER("Accounting-Off", 0, CONF_FLAG_SUBSECTION, NULL), .subcs = section_config },
+	{ FR_CONF_POINTER("Failed", 0, CONF_FLAG_SUBSECTION, NULL), .subcs = section_config },
 
 	CONF_PARSER_TERMINATOR
+};
+
+static fr_dict_t const *dict_radius;
+
+extern fr_dict_autoload_t rlm_rediswho_dict[];
+fr_dict_autoload_t rlm_rediswho_dict[] = {
+	{ .out = &dict_radius, .proto = "radius" },
+	{ NULL }
+};
+
+static fr_dict_attr_t const *attr_acct_status_type;
+
+extern fr_dict_attr_autoload_t rlm_rediswho_dict_attr[];
+fr_dict_attr_autoload_t rlm_rediswho_dict_attr[] = {
+	{ .out = &attr_acct_status_type, .name = "Acct-Status-Type", .type = FR_TYPE_UINT32, .dict = &dict_radius },
+	{ NULL }
 };
 
 /*
  *	Query the database executing a command with no result rows
  */
-static int rediswho_command(rlm_rediswho_t const *inst, REQUEST *request, char const *fmt)
+static int rediswho_command(rlm_rediswho_t const *inst, request_t *request, char const *fmt)
 {
 	fr_redis_conn_t		*conn;
 
@@ -100,7 +117,10 @@ static int rediswho_command(rlm_rediswho_t const *inst, REQUEST *request, char c
 	if (!fmt || !*fmt) return 0;
 
 	argc = rad_expand_xlat(request, fmt, MAX_REDIS_ARGS, argv, false, sizeof(argv_buf), argv_buf);
- 	if (argc < 0) return -1;
+	if (argc < 0) {
+		RPEDEBUG("Invalid command: %s", fmt);
+		return -1;
+	}
 
 	/*
 	 *	If we've got multiple arguments, the second one is usually the key.
@@ -123,100 +143,98 @@ static int rediswho_command(rlm_rediswho_t const *inst, REQUEST *request, char c
 	if (s_ret != REDIS_RCODE_SUCCESS) {
 		RERROR("Failed inserting accounting data");
 	error:
-		fr_redis_reply_free(reply);
+		fr_redis_reply_free(&reply);
 		return -1;
 	}
-	if (!rad_cond_assert(reply)) goto error;
+	if (!fr_cond_assert(reply)) goto error;
+
+	/*
+	 *	Write the response to the debug log
+	 */
+	fr_redis_reply_print(L_DBG_LVL_2, reply, request, 0);
 
 	switch (reply->type) {
+	case REDIS_REPLY_ERROR:
+		break;
+
 	case REDIS_REPLY_INTEGER:
-		RDEBUG2("Query response %lld", reply->integer);
 		if (reply->integer > 0) ret = reply->integer;
 		break;
 
-	case REDIS_REPLY_STRING:
-		REDEBUG2("Query response %s", reply->str);
-		break;
-
+	/*
+	 *	We don't know to interpret this, the user has probably messed
+	 *	up the queries, so print an error message and fail.
+	 */
 	default:
+		REDEBUG("Expected type \"integer\" got type \"%s\"",
+			fr_table_str_by_value(redis_reply_types, reply->type, "<UNKNOWN>"));
 		break;
 	}
-	fr_redis_reply_free(reply);
+	fr_redis_reply_free(&reply);
 
 	return ret;
 }
 
-static rlm_rcode_t mod_accounting_all(rlm_rediswho_t const *inst, REQUEST *request,
-				      char const *insert,
-				      char const *trim,
-				      char const *expire)
+static unlang_action_t mod_accounting_all(rlm_rcode_t *p_result, rlm_rediswho_t const *inst, request_t *request,
+					  char const *insert,
+					  char const *trim,
+					  char const *expire)
 {
 	int ret;
 
 	ret = rediswho_command(inst, request, insert);
-	if (ret < 0) return RLM_MODULE_FAIL;
+	if (ret < 0) RETURN_MODULE_FAIL;
 
 	/* Only trim if necessary */
 	if ((inst->trim_count >= 0) && (ret > inst->trim_count)) {
-		if (rediswho_command(inst, request, trim) < 0) return RLM_MODULE_FAIL;
+		if (rediswho_command(inst, request, trim) < 0) RETURN_MODULE_FAIL;
 	}
 
-	if (rediswho_command(inst, request, expire) < 0) return RLM_MODULE_FAIL;
-	return RLM_MODULE_OK;
+	if (rediswho_command(inst, request, expire) < 0) RETURN_MODULE_FAIL;
+	RETURN_MODULE_OK;
 }
 
-static rlm_rcode_t CC_HINT(nonnull) mod_accounting(void *instance, UNUSED void *thread, REQUEST *request)
+static unlang_action_t CC_HINT(nonnull) mod_accounting(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request)
 {
-	rlm_rediswho_t const	*inst = instance;
+	rlm_rediswho_t const	*inst = talloc_get_type_abort_const(mctx->mi->data, rlm_rediswho_t);
+	CONF_SECTION		*conf = mctx->mi->conf;
 	rlm_rcode_t		rcode;
-	VALUE_PAIR		*vp;
-	fr_dict_enum_t		*dv;
+	fr_pair_t		*vp;
+	fr_dict_enum_value_t	*dv;
 	CONF_SECTION		*cs;
 	char const		*insert, *trim, *expire;
 
-	vp = fr_pair_find_by_num(request->packet->vps, 0, FR_ACCT_STATUS_TYPE, TAG_ANY);
+	vp = fr_pair_find_by_da(&request->request_pairs, NULL, attr_acct_status_type);
 	if (!vp) {
-		RDEBUG("Could not find account status type in packet");
-		return RLM_MODULE_NOOP;
+		RDEBUG2("Could not find account status type in packet");
+		RETURN_MODULE_NOOP;
 	}
 
-	dv = fr_dict_enum_by_value(NULL, vp->da, &vp->data);
+	dv = fr_dict_enum_by_value(vp->da, &vp->data);
 	if (!dv) {
-		RDEBUG("Unknown Acct-Status-Type %u", vp->vp_uint32);
-		return RLM_MODULE_NOOP;
+		RDEBUG2("Unknown Acct-Status-Type %u", vp->vp_uint32);
+		RETURN_MODULE_NOOP;
 	}
 
-	cs = cf_section_find(inst->cs, dv->alias, NULL);
+	cs = cf_section_find(conf, dv->name, NULL);
 	if (!cs) {
-		RDEBUG("No subsection %s", dv->alias);
-		return RLM_MODULE_NOOP;
+		RDEBUG2("No subsection %s", dv->name);
+		RETURN_MODULE_NOOP;
 	}
 
 	insert = cf_pair_value(cf_pair_find(cs, "insert"));
 	trim = cf_pair_value(cf_pair_find(cs, "trim"));
 	expire = cf_pair_value(cf_pair_find(cs, "expire"));
 
-	rcode = mod_accounting_all(inst, request, insert, trim, expire);
-
-	return rcode;
+	return mod_accounting_all(&rcode, inst, request, insert, trim, expire);
 }
 
-static int mod_bootstrap(void *instance, CONF_SECTION *conf)
+static int mod_instantiate(module_inst_ctx_t const *mctx)
 {
-	rlm_rediswho_t *inst = instance;
+	rlm_rediswho_t	*inst = talloc_get_type_abort(mctx->mi->data, rlm_rediswho_t);
+	CONF_SECTION	*conf = mctx->mi->conf;
 
-	inst->cs = conf;
-	inst->name = cf_section_name2(conf);
-	if (!inst->name) inst->name = cf_section_name1(conf);
-
-	return 0;
-}
-
-static int mod_instantiate(void *instance, CONF_SECTION *conf)
-{
-	rlm_rediswho_t *inst = instance;
-
-	inst->cluster = fr_redis_cluster_alloc(inst, conf, inst->conf, true, NULL, NULL, NULL);
+	inst->cluster = fr_redis_cluster_alloc(inst, conf, &inst->conf, true, NULL, NULL, NULL);
 	if (!inst->cluster) return -1;
 
 	return 0;
@@ -229,17 +247,20 @@ static int mod_load(void)
 	return 0;
 }
 
-extern rad_module_t rlm_rediswho;
-rad_module_t rlm_rediswho = {
-	.magic		= RLM_MODULE_INIT,
-	.name		= "rediswho",
-	.type		= RLM_TYPE_THREAD_SAFE,
-	.inst_size	= sizeof(rlm_rediswho_t),
-	.config		= module_config,
-	.load		= mod_load,
-	.instantiate	= mod_instantiate,
-	.bootstrap	= mod_bootstrap,
-	.methods = {
-		[MOD_ACCOUNTING]	= mod_accounting
+extern module_rlm_t rlm_rediswho;
+module_rlm_t rlm_rediswho = {
+	.common = {
+		.magic		= MODULE_MAGIC_INIT,
+		.name		= "rediswho",
+		.inst_size	= sizeof(rlm_rediswho_t),
+		.config		= module_config,
+		.onload		= mod_load,
+		.instantiate	= mod_instantiate
 	},
+	.method_group = {
+		.bindings = (module_method_binding_t[]){
+			{ .section = SECTION_NAME("accounting", CF_IDENT_ANY), .method = mod_accounting },
+			MODULE_BINDING_TERMINATOR
+		}
+	}
 };

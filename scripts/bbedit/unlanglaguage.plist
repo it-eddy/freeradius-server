@@ -8,7 +8,7 @@
 		Copyright Arran Cudbard-Bell <a.cudbardb@freeradius.org>, 2012.
 		
 		This work is licensed under a Creative Commons Attribution-Share Alike 3.0 License.
-		http://creativecommons.org/licenses/by-sa/3.0/
+		https://creativecommons.org/licenses/by-sa/3.0/
 		
 		Version 1.0
 
@@ -43,7 +43,7 @@
 		<string>ok</string>
 		<string>updated</string>
 		<string>fail</string>
-		<string>userlock</string>
+		<string>disallow</string>
 		<string>invalid</string>
 		<string>handled</string>
 		<string>return</string>

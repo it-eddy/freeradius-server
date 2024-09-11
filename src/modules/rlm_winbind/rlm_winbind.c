@@ -19,55 +19,76 @@
  * @file rlm_winbind.c
  * @brief Authenticates against Active Directory or Samba using winbind
  *
- * @author Matthew Newton <matthew@newtoncomputing.co.uk>
+ * @author Matthew Newton (matthew@newtoncomputing.co.uk)
  *
  * @copyright 2016 The FreeRADIUS server project
- * @copyright 2016 Matthew Newton <matthew@newtoncomputing.co.uk>
+ * @copyright 2016 Matthew Newton (matthew@newtoncomputing.co.uk)
  */
-
 RCSID("$Id$")
 
-#include <freeradius-devel/radiusd.h>
-#include <freeradius-devel/modules.h>
-#include <freeradius-devel/rad_assert.h>
+#include <freeradius-devel/server/base.h>
+#include <freeradius-devel/server/module_rlm.h>
+#include <freeradius-devel/unlang/call_env.h>
+#include <freeradius-devel/unlang/xlat_func.h>
+#include <freeradius-devel/util/debug.h>
 
 #include "rlm_winbind.h"
 #include "auth_wbclient_pap.h"
 #include <grp.h>
 #include <wbclient.h>
 
-static const CONF_PARSER group_config[] = {
-	{ FR_CONF_OFFSET("group_search_username", FR_TYPE_TMPL, rlm_winbind_t, group_username) },
-	{ FR_CONF_OFFSET("group_add_domain", FR_TYPE_BOOL, rlm_winbind_t, group_add_domain), .dflt = "yes" },
-	{ FR_CONF_OFFSET("group_attribute", FR_TYPE_STRING, rlm_winbind_t, group_attribute) },
+static const conf_parser_t group_config[] = {
+	{ FR_CONF_OFFSET("add_domain", rlm_winbind_t, group_add_domain), .dflt = "yes" },
 	CONF_PARSER_TERMINATOR
 };
 
-static const CONF_PARSER module_config[] = {
-	{ FR_CONF_OFFSET("winbind_username", FR_TYPE_TMPL, rlm_winbind_t, wb_username) },
-	{ FR_CONF_OFFSET("winbind_domain", FR_TYPE_TMPL, rlm_winbind_t, wb_domain) },
-	{ FR_CONF_POINTER("group", FR_TYPE_SUBSECTION, NULL), .subcs = (void const *) group_config },
+static const conf_parser_t module_config[] = {
+	{ FR_CONF_POINTER("group", 0, CONF_FLAG_SUBSECTION, NULL), .subcs = (void const *) group_config },
 	CONF_PARSER_TERMINATOR
 };
+
+static fr_dict_t const *dict_freeradius;
+
+extern fr_dict_autoload_t rlm_winbind_dict[];
+fr_dict_autoload_t rlm_winbind_dict[] = {
+	{ .out = &dict_freeradius, .proto = "freeradius" },
+	{ NULL }
+};
+
+static fr_dict_attr_t const *attr_auth_type;
+static fr_dict_attr_t const *attr_expr_bool_enum;
+
+extern fr_dict_attr_autoload_t rlm_winbind_dict_attr[];
+fr_dict_attr_autoload_t rlm_winbind_dict_attr[] = {
+	{ .out = &attr_auth_type, .name = "Auth-Type", .type = FR_TYPE_UINT32, .dict = &dict_freeradius },
+	{ .out = &attr_expr_bool_enum, .name = "Expr-Bool-Enum", .type = FR_TYPE_BOOL, .dict = &dict_freeradius },
+	{ NULL }
+};
+
+typedef struct {
+	tmpl_t	*password;
+} winbind_autz_call_env_t;
+
+typedef struct {
+	fr_value_box_t	username;
+	fr_value_box_t	domain;
+} winbind_group_xlat_call_env_t;
 
 /** Group comparison for Winbind-Group
  *
- * @param instance	Instance of this module
+ * @param inst		Instance of this module
  * @param request	The current request
- * @param attr		Attribute to look up in group
- * @param check		Value pair containing group to be searched
- * @param check_pairs	Unknown
- * @param reply_pairs	Unknown
+ * @param name		Group name to be searched
+ * @param env		Group check xlat call_env
  *
  * @return
  *	- 0 user is in group
  *	- 1 failure or user is not in group
  */
-static int winbind_group_cmp(void *instance, REQUEST *request, VALUE_PAIR *attr, VALUE_PAIR *check,
-			     UNUSED VALUE_PAIR *check_pairs, UNUSED VALUE_PAIR **reply_pairs)
+static bool winbind_check_group(rlm_winbind_t const *inst, request_t *request, char const *name,
+				winbind_group_xlat_call_env_t *env)
 {
-	rlm_winbind_t		*inst = instance;
-	rlm_rcode_t		rcode = 1;
+	bool			rcode = false;
 	struct wbcContext	*wb_ctx;
 	wbcErr			err;
 	uint32_t		num_groups, i;
@@ -75,20 +96,11 @@ static int winbind_group_cmp(void *instance, REQUEST *request, VALUE_PAIR *attr,
 
 	char const		*domain = NULL;
 	size_t			domain_len = 0;
-	char const		*user = NULL;
-	char			*user_buff = NULL;
 	char const		*username;
 	char			*username_buff = NULL;
-
-	ssize_t			slen;
 	size_t			backslash = 0;
 
 	RINDENT();
-
-	if (check->vp_length == 0) {
-		REDEBUG("Group name is empty, nothing to check!");
-		goto error;
-	}
 
 	/*
 	 *	Work out what username to check groups for, made up from
@@ -99,41 +111,17 @@ static int winbind_group_cmp(void *instance, REQUEST *request, VALUE_PAIR *attr,
 	/*
 	 *	Include the domain in the username?
 	 */
-	if (inst->group_add_domain && inst->wb_domain) {
-		slen = tmpl_aexpand(request, &domain, request, inst->wb_domain, NULL, NULL);
-		if (slen < 0) {
-			REDEBUG("Unable to expand group_search_username");
-			goto error;
-		}
-		domain_len = (size_t)slen;
-	}
-
-	/*
-	 *	Sort out what User-Name we are going to use.
-	 */
-	if (inst->group_username) {
-		slen = tmpl_aexpand(request, &user_buff, request, inst->group_username, NULL, NULL);
-		if (slen < 0) {
-			REDEBUG("Unable to expand group_search_username");
-			goto error;
-		}
-		user = user_buff;
-	} else {
-		/*
-		 *	This is quite unlikely to work without a domain, but
-		 *	we've not been given much else to work on.
-		 */
-		if (!domain) {
-			RWDEBUG("Searching group with plain username, this will probably fail");
-			RWDEBUG("Ensure winbind_domain and group_search_username are both correctly set");
-		}
-		user = attr->vp_strvalue;
+	if (inst->group_add_domain && env->domain.type == FR_TYPE_STRING){
+		domain = env->domain.vb_strvalue;
+		domain_len = env->domain.vb_length;
 	}
 
 	if (domain) {
-		username = username_buff = talloc_typed_asprintf(request, "%s\\%s", domain, user);
+		username = username_buff = talloc_typed_asprintf(request, "%s\\%s", domain, env->username.vb_strvalue);
 	} else {
-		username = user;
+		username = env->username.vb_strvalue;
+		RWDEBUG("Searching group with plain username, this will probably fail");
+		RWDEBUG("Ensure winbind domain is correctly set");
 	}
 
 	/*
@@ -145,37 +133,36 @@ static int winbind_group_cmp(void *instance, REQUEST *request, VALUE_PAIR *attr,
 		goto error;
 	}
 
-	RDEBUG2("Trying to find user \"%s\" in group \"%s\"", username, check->vp_strvalue);
+	RDEBUG2("Trying to find user \"%s\" in group \"%s\"", username, name);
 
 	err = wbcCtxGetGroups(wb_ctx, username, &num_groups, &wb_groups);
 	switch (err) {
 	case WBC_ERR_SUCCESS:
-		rcode = 0;
+		if (!num_groups) {
+			RWDEBUG2("No groups returned");
+			goto finish;
+		}
+
 		RDEBUG2("Successfully retrieved user's groups");
 		break;
 
 	case WBC_ERR_WINBIND_NOT_AVAILABLE:
 		RERROR("Failed retrieving groups: Unable to contact winbindd");	/* Global error */
-		break;
+		goto finish;
 
 	case WBC_ERR_DOMAIN_NOT_FOUND:
 		/* Yeah, weird. libwbclient returns this if the username is unknown */
 		REDEBUG("Failed retrieving groups: User or Domain not found");
-		break;
+		goto finish;
 
 	case WBC_ERR_UNKNOWN_USER:
 		REDEBUG("Failed retrieving groups: User cannot be found");
-		break;
+		goto finish;
 
 	default:
 		REDEBUG("Failed retrieving groups: %s", wbcErrorString(err));
-		break;
+		goto finish;
 	}
-
-	if (!num_groups) RDEBUG("No groups returned");
-
-	if (rcode) goto finish;
-	rcode = 1;
 
 	/*
 	 *	See if any of the groups match
@@ -195,8 +182,6 @@ static int winbind_group_cmp(void *instance, REQUEST *request, VALUE_PAIR *attr,
 	for (i = 0; i < num_groups; i++) {
 		struct group	*group;
 		char		*group_name;
-
-		bool		found = false;
 
 		/* Get the group name from the (fake winbind) gid */
 		err = wbcCtxGetgrgid(wb_ctx, wb_groups[i], &group);
@@ -222,30 +207,55 @@ static int winbind_group_cmp(void *instance, REQUEST *request, VALUE_PAIR *attr,
 
 		/* See if the group matches */
 		RDEBUG3("Checking plain group name \"%s\"", group_name);
-		if (!strcasecmp(group_name, check->vp_strvalue)) {
-			RDEBUG("Found matching group: %s", group_name);
-			found = true;
-			rcode = 0;
+		if (!strcasecmp(group_name, name)) {
+			RDEBUG2("Found matching group: %s", group_name);
+			rcode = true;
 		}
 		wbcFreeMemory(group);
 
 		/* Short-circuit to save unnecessary enumeration */
-		if (found) break;
+		if (rcode) break;
 	}
 
-	if (rcode) RDEBUG2("No groups found that match");
+	if (!rcode) RWDEBUG2("No groups found that match");
 
 finish:
 	wbcFreeMemory(wb_groups);
 	fr_pool_connection_release(inst->wb_pool, request, wb_ctx);
 
 error:
-	talloc_free(user_buff);
 	talloc_free(username_buff);
-	talloc_const_free(domain);
 	REXDENT();
 
 	return rcode;
+}
+
+
+/** Check if the user is a member of a particular winbind group
+ *
+@verbatim
+%winbind.group(<name>)
+@endverbatim
+ *
+ * @ingroup xlat_functions
+ */
+static xlat_action_t winbind_group_xlat(TALLOC_CTX *ctx, fr_dcursor_t *out,
+				     xlat_ctx_t const *xctx,
+				     request_t *request, fr_value_box_list_t *in)
+{
+	rlm_winbind_t const	*inst = talloc_get_type_abort(xctx->mctx->mi->data, rlm_winbind_t);
+	winbind_group_xlat_call_env_t	*env = talloc_get_type_abort(xctx->env_data, winbind_group_xlat_call_env_t);
+	fr_value_box_t		*arg = fr_value_box_list_head(in);
+	char const		*p = arg->vb_strvalue;
+	fr_value_box_t		*vb;
+
+	fr_skip_whitespace(p);
+
+	MEM(vb = fr_value_box_alloc(ctx, FR_TYPE_BOOL, attr_expr_bool_enum));
+	vb->vb_bool = winbind_check_group(inst, request, p, env);
+	fr_dcursor_append(out, vb);
+
+	return XLAT_ACTION_DONE;
 }
 
 
@@ -270,7 +280,7 @@ static int _mod_conn_free(struct wbcContext **wb_ctx)
  *
  * @return pointer to libwbclient context
  */
-static void *mod_conn_create(TALLOC_CTX *ctx, UNUSED void *instance, UNUSED struct timeval const *timeout)
+static void *mod_conn_create(TALLOC_CTX *ctx, UNUSED void *instance, UNUSED fr_time_delta_t timeout)
 {
 	struct wbcContext **wb_ctx;
 
@@ -289,117 +299,35 @@ static void *mod_conn_create(TALLOC_CTX *ctx, UNUSED void *instance, UNUSED stru
 }
 
 
-/** Bootstrap this module
- *
- * Register pair compare function for Winbind-Group fake attribute
- *
- * @param[in] conf	Module configuration
- * @param[in] instance	This module's instance
- *
- * @return
- *	- 0	success
- *	- -1	failure
- */
-static int mod_bootstrap(void *instance, CONF_SECTION *conf)
-{
-	rlm_winbind_t		*inst = instance;
-	fr_dict_attr_t const	*user_name_da;
-	char const		*group_attribute;
-	char			buffer[256];
-
-	user_name_da = fr_dict_attr_by_num(NULL, 0, FR_USER_NAME);
-	if (!user_name_da) {
-		ERROR("Unable to find User-Name attribute in dictionary");
-		return -1;
-	}
-
-	inst->name = cf_section_name2(conf);
-	if (!inst->name) inst->name = cf_section_name1(conf);
-
-	if (inst->group_attribute) {
-		group_attribute = inst->group_attribute;
-	} else if (cf_section_name2(conf)) {
-		snprintf(buffer, sizeof(buffer), "%s-Winbind-Group", inst->name);
-		group_attribute = buffer;
-	} else {
-		group_attribute = "Winbind-Group";
-	}
-
-	if (paircompare_register_byname(group_attribute, user_name_da, false,
-					winbind_group_cmp, inst) < 0) {
-		PERROR("Error registering group comparison");
-		return -1;
-	}
-
-	return 0;
-}
+static xlat_arg_parser_t const winbind_group_xlat_arg[] = {
+	{ .required = true, .type = FR_TYPE_STRING, .concat = true },
+	XLAT_ARG_PARSER_TERMINATOR
+};
 
 
 /** Instantiate this module
  *
- * @param[in] conf	Module configuration
- * @param[in] instance	This module's instance
+ * @param[in] mctx	data for this module
  *
  * @return
  *	- 0	instantiation succeeded
  *	- -1	instantiation failed
  */
-static int mod_instantiate(void *instance, CONF_SECTION *conf)
+static int mod_instantiate(module_inst_ctx_t const *mctx)
 {
-	rlm_winbind_t			*inst = instance;
-	struct wbcInterfaceDetails	*wb_info = NULL;
+	rlm_winbind_t			*inst = talloc_get_type_abort(mctx->mi->data, rlm_winbind_t);
+	CONF_SECTION			*conf = mctx->mi->conf;
 
-	if (!inst->wb_username) {
-		cf_log_err(conf, "winbind_username must be defined to use rlm_winbind");
-		return -1;
-	}
-
-	inst->wb_pool = module_connection_pool_init(conf, inst, mod_conn_create, NULL, NULL, NULL, NULL);
+	inst->wb_pool = module_rlm_connection_pool_init(conf, inst, mod_conn_create, NULL, NULL, NULL, NULL);
 	if (!inst->wb_pool) {
 		cf_log_err(conf, "Unable to initialise winbind connection pool");
 		return -1;
 	}
 
-	/*
-	 *	If the domain has not been specified, try and find
-	 *	out what it is from winbind.
-	 */
-	if (!inst->wb_domain) {
-		wbcErr			err;
-		struct wbcContext	*wb_ctx;
-
-		cf_log_err(conf, "winbind_domain unspecified; trying to get it from winbind");
-
-		wb_ctx = wbcCtxCreate();
-		if (!wb_ctx) {
-			/* this should be very unusual */
-			cf_log_err(conf, "Unable to get libwbclient context, cannot get domain");
-			goto no_domain;
-		}
-
-		err = wbcCtxInterfaceDetails(wb_ctx, &wb_info);
-		wbcCtxFree(wb_ctx);
-
-		if (err != WBC_ERR_SUCCESS) {
-			cf_log_err(conf, "libwbclient returned wbcErr code %d; unable to get domain name.", err);
-			cf_log_err(conf, "Is winbind running and does the winbind_privileged socket have");
-			cf_log_err(conf, "the correct permissions?");
-			goto no_domain;
-		}
-
-		if (!wb_info->netbios_domain) {
-			cf_log_err(conf, "winbind returned blank domain name");
-			goto no_domain;
-		}
-
-		tmpl_afrom_str(instance, &inst->wb_domain, wb_info->netbios_domain,
-			       strlen(wb_info->netbios_domain), T_SINGLE_QUOTED_STRING,
-			       REQUEST_CURRENT, PAIR_LIST_REQUEST, false);
-
-		cf_log_err(conf, "Using winbind_domain '%s'", inst->wb_domain->name);
-
-no_domain:
-		wbcFreeMemory(wb_info);
+	inst->auth_type = fr_dict_enum_by_name(attr_auth_type, mctx->mi->name, -1);
+	if (!inst->auth_type) {
+		WARN("Failed to find 'authenticate %s {...}' section.  Winbind authentication will likely not work",
+		     mctx->mi->name);
 	}
 
 	return 0;
@@ -410,14 +338,15 @@ no_domain:
  *
  * Frees up the libwbclient connection pool.
  *
- * @param[in] instance This module's instance (unused)
+ * @param[in] mctx	data for this module
  * @return 0
  */
-static int mod_detach(UNUSED void *instance)
+static int mod_detach(module_detach_ctx_t const *mctx)
 {
-	rlm_winbind_t *inst = instance;
+	rlm_winbind_t *inst = talloc_get_type_abort(mctx->mi->data, rlm_winbind_t);
 
 	fr_pool_free(inst->wb_pool);
+
 	return 0;
 }
 
@@ -427,71 +356,63 @@ static int mod_detach(UNUSED void *instance)
  * Checks there is a password available so we can authenticate
  * against winbind and, if so, sets Auth-Type to ourself.
  *
- * @param[in] instance	Module instance.
- * @param[in] thread	Thread specific data.
- * @param[in] request	The current request.
- *
- * @return
- *	- #RLM_MODULE_NOOP unable to use winbind authentication
- *	- #RLM_MODULE_OK Auth-Type has been set to winbind
+ * @param[out] p_result		The result of the module call:
+ *				- #RLM_MODULE_NOOP unable to use winbind authentication
+ *				- #RLM_MODULE_OK Auth-Type has been set to winbind
+ * @param[in] mctx		Module instance data.
+ * @param[in] request		The current request.
  */
-static rlm_rcode_t CC_HINT(nonnull) mod_authorize(UNUSED void *instance, UNUSED void *thread, REQUEST *request)
+static unlang_action_t CC_HINT(nonnull) mod_authorize(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request)
 {
-	if (!request->password || (request->password->da->attr != FR_USER_PASSWORD)) {
-		RDEBUG("No User-Password found in the request; not doing winbind authentication.");
-		return RLM_MODULE_NOOP;
+	rlm_winbind_t const	*inst = talloc_get_type_abort_const(mctx->mi->data, rlm_winbind_t);
+	winbind_autz_call_env_t	*env = talloc_get_type_abort(mctx->env_data, winbind_autz_call_env_t);
+	fr_pair_t		*vp;
+
+	vp = fr_pair_find_by_da(&request->request_pairs, NULL, tmpl_attr_tail_da(env->password));
+	if (!vp) {
+		REDEBUG2("No %s found in the request; not doing winbind authentication.",
+			 tmpl_attr_tail_da(env->password)->name);
+		RETURN_MODULE_NOOP;
 	}
 
-	if (fr_pair_find_by_num(request->control, 0, FR_AUTH_TYPE, TAG_ANY) != NULL) {
-		RWDEBUG2("Auth-type already set, not setting to winbind");
-		return RLM_MODULE_NOOP;
+	if (!inst->auth_type) {
+		WARN("No 'authenticate %s {...}' section or 'Auth-Type = %s' set.  Cannot setup Winbind authentication",
+		     mctx->mi->name, mctx->mi->name);
+		RETURN_MODULE_NOOP;
 	}
 
-	RDEBUG("Setting Auth-Type to winbind");
-	pair_make_config("Auth-Type", "winbind", T_OP_EQ);
+	if (!module_rlm_section_type_set(request, attr_auth_type, inst->auth_type)) RETURN_MODULE_NOOP;
 
-	return RLM_MODULE_OK;
+	RETURN_MODULE_OK;
 }
 
 
 /** Authenticate the user via libwbclient and winbind
  *
- * @param[in] instance	Module instance
- * @param[in] thread	Thread specific data.
- * @param[in] request	The current request
- *
- * @return One of the RLM_MODULE_* values
+ * @param[out] p_result		The result of the module call.
+ * @param[in] mctx		Module instance data.
+ * @param[in] request		The current request
  */
-static rlm_rcode_t CC_HINT(nonnull) mod_authenticate(void *instance, UNUSED void *thread, REQUEST *request)
+static unlang_action_t CC_HINT(nonnull) mod_authenticate(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request)
 {
-	rlm_winbind_t const *inst = instance;
-
-	/*
-	 *	Check the admin hasn't been silly
-	 */
-	if (!request->password ||
-	    (request->password->da->vendor != 0) ||
-	    (request->password->da->attr != FR_USER_PASSWORD)) {
-		REDEBUG("You set 'Auth-Type = winbind' for a request that does not contain a User-Password attribute!");
-		return RLM_MODULE_INVALID;
-	}
+	rlm_winbind_t const	*inst = talloc_get_type_abort_const(mctx->mi->data, rlm_winbind_t);
+	winbind_auth_call_env_t	*env = talloc_get_type_abort(mctx->env_data, winbind_auth_call_env_t);
 
 	/*
 	 *	Make sure the supplied password isn't empty
 	 */
-	if (request->password->vp_length == 0) {
-		REDEBUG("Password must not be empty");
-		return RLM_MODULE_INVALID;
+	if (env->password.vb_length == 0) {
+		REDEBUG("User-Password must not be empty");
+		RETURN_MODULE_INVALID;
 	}
 
 	/*
 	 *	Log the password
 	 */
 	if (RDEBUG_ENABLED3) {
-		RDEBUG3("Login attempt with password \"%s\" (%zd)", request->password->vp_strvalue,
-			request->password->vp_length);
+		RDEBUG("Login attempt with password \"%pV\"", &env->password);
 	} else {
-		RDEBUG("Login attempt with password");
+		RDEBUG2("Login attempt with password");
 	}
 
 	/*
@@ -499,35 +420,167 @@ static rlm_rcode_t CC_HINT(nonnull) mod_authenticate(void *instance, UNUSED void
 	 *	many debug outputs or errors as the auth function is
 	 *	chatty enough.
 	 */
-	if (do_auth_wbclient_pap(inst, request) == 0) {
-		RDEBUG("User authenticated successfully using winbind");
-		return RLM_MODULE_OK;
+	if (do_auth_wbclient_pap(inst, request, env) == 0) {
+		RDEBUG2("User authenticated successfully using winbind");
+		RETURN_MODULE_OK;
 	}
 
-	return RLM_MODULE_REJECT;
+	RETURN_MODULE_REJECT;
 }
 
+static const call_env_method_t winbind_autz_method_env = {
+	FR_CALL_ENV_METHOD_OUT(winbind_autz_call_env_t),
+	.env = (call_env_parser_t[]) {
+		{ FR_CALL_ENV_PARSE_ONLY_OFFSET("password", FR_TYPE_STRING, CALL_ENV_FLAG_ATTRIBUTE | CALL_ENV_FLAG_PARSE_ONLY, winbind_autz_call_env_t, password),
+			.pair.dflt = "&User-Password", .pair.dflt_quote = T_BARE_WORD },
+		CALL_ENV_TERMINATOR
+	}
+};
+
+static int domain_call_env_parse(TALLOC_CTX *ctx, void *out, tmpl_rules_t const *t_rules, CONF_ITEM *ci,
+				 UNUSED call_env_ctx_t const *cec, UNUSED call_env_parser_t const *rule)
+{
+	CONF_PAIR const			*to_parse = cf_item_to_pair(ci);
+	tmpl_t				*parsed_tmpl = NULL;
+	struct wbcInterfaceDetails	*wb_info = NULL;
+
+	if (strlen(cf_pair_value(to_parse)) > 0) {
+		if (tmpl_afrom_substr(ctx, &parsed_tmpl,
+				      &FR_SBUFF_IN(cf_pair_value(to_parse), talloc_array_length(cf_pair_value(to_parse)) - 1),
+				      cf_pair_value_quote(to_parse),
+				      NULL, t_rules) < 0) return -1;
+	} else {
+		/*
+		 *	If the domain has not been specified, try and find
+		 *	out what it is from winbind.
+		 */
+		wbcErr			err;
+		struct wbcContext	*wb_ctx;
+
+		cf_log_warn(ci, "winbind domain unspecified; trying to get it from winbind");
+
+		wb_ctx = wbcCtxCreate();
+		if (!wb_ctx) {
+			/* this should be very unusual */
+			cf_log_err(ci, "Unable to get libwbclient context, cannot get domain");
+			goto no_domain;
+		}
+
+		err = wbcCtxInterfaceDetails(wb_ctx, &wb_info);
+		wbcCtxFree(wb_ctx);
+
+		if (err != WBC_ERR_SUCCESS) {
+			cf_log_err(ci, "libwbclient returned wbcErr code %d; unable to get domain name.", err);
+			cf_log_err(ci, "Is winbind running and does the winbind_privileged socket have");
+			cf_log_err(ci, "the correct permissions?");
+			goto no_domain;
+		}
+
+		if (!wb_info->netbios_domain) {
+			cf_log_err(ci, "winbind returned blank domain name");
+			goto no_domain;
+		}
+
+		tmpl_afrom_substr(ctx, &parsed_tmpl,
+			          &FR_SBUFF_IN(wb_info->netbios_domain, strlen(wb_info->netbios_domain)),
+			          T_SINGLE_QUOTED_STRING, NULL, t_rules);
+		if (!parsed_tmpl) {
+			cf_log_perr(ci, "Bad domain");
+			wbcFreeMemory(wb_info);
+			return -1;
+		}
+
+		cf_log_info(ci, "Using winbind_domain '%s'", parsed_tmpl->name);
+
+	no_domain:
+		wbcFreeMemory(wb_info);
+	}
+
+	*(void **)out = parsed_tmpl;
+	return parsed_tmpl ? 0 : -1;
+}
+
+static const call_env_method_t winbind_auth_method_env = {
+	FR_CALL_ENV_METHOD_OUT(winbind_auth_call_env_t),
+	.env = (call_env_parser_t[]) {
+		{ FR_CALL_ENV_OFFSET("username", FR_TYPE_STRING, CALL_ENV_FLAG_REQUIRED, winbind_auth_call_env_t, username) },
+		{ FR_CALL_ENV_OFFSET("domain", FR_TYPE_STRING, CALL_ENV_FLAG_NONE, winbind_auth_call_env_t, domain),
+			.pair.dflt = "", .pair.dflt_quote = T_SINGLE_QUOTED_STRING, .pair.func = domain_call_env_parse },
+		{ FR_CALL_ENV_OFFSET("password", FR_TYPE_STRING, CALL_ENV_FLAG_SECRET, winbind_auth_call_env_t, password),
+			.pair.dflt = "&User-Password", .pair.dflt_quote = T_BARE_WORD },
+		CALL_ENV_TERMINATOR
+	}
+};
+
+static const call_env_method_t winbind_group_xlat_call_env = {
+	FR_CALL_ENV_METHOD_OUT(winbind_group_xlat_call_env_t),
+	.env = (call_env_parser_t[]) {
+		{ FR_CALL_ENV_OFFSET("domain", FR_TYPE_STRING, CALL_ENV_FLAG_NONE, winbind_group_xlat_call_env_t, domain),
+			.pair.dflt = "", .pair.dflt_quote = T_SINGLE_QUOTED_STRING, .pair.func = domain_call_env_parse },
+		{ FR_CALL_ENV_SUBSECTION("group", CF_IDENT_ANY, CALL_ENV_FLAG_NONE,
+			((call_env_parser_t[]) {
+				{FR_CALL_ENV_OFFSET("search_username", FR_TYPE_STRING, CALL_ENV_FLAG_REQUIRED, winbind_group_xlat_call_env_t, username) },
+				CALL_ENV_TERMINATOR
+			}))},
+		CALL_ENV_TERMINATOR
+	}
+};
+
+/** Bootstrap this module
+ *
+ * @param[in] mctx	data for this module
+ *
+ * @return
+ *	- 0	success
+ *	- -1	failure
+ */
+static int mod_bootstrap(module_inst_ctx_t const *mctx)
+{
+	CONF_SECTION		*conf = mctx->mi->conf;
+	xlat_t			*xlat;
+
+	/*
+	 *	Define the %winbind.group(name) xlat.  The register
+	 *	function automatically adds the module instance name
+	 *	as a prefix.
+	 */
+	xlat = module_rlm_xlat_register(mctx->mi->boot, mctx, "group", winbind_group_xlat, FR_TYPE_BOOL);
+	if (!xlat) {
+		cf_log_err(conf, "Failed registering group expansion");
+		return -1;
+	}
+
+	xlat_func_args_set(xlat, winbind_group_xlat_arg);
+	xlat_func_call_env_set(xlat, &winbind_group_xlat_call_env);
+
+	return 0;
+}
 
 /*
  *	The module name should be the only globally exported symbol.
  *	That is, everything else should be 'static'.
  *
  *	If the module needs to temporarily modify it's instantiation
- *	data, the type should be changed to RLM_TYPE_THREAD_UNSAFE.
+ *	data, the type should be changed to MODULE_TYPE_THREAD_UNSAFE.
  *	The server will then take care of ensuring that the module
  *	is single-threaded.
  */
-extern rad_module_t rlm_winbind;
-rad_module_t rlm_winbind = {
-	.magic		= RLM_MODULE_INIT,
-	.name		= "winbind",
-	.inst_size	= sizeof(rlm_winbind_t),
-	.config		= module_config,
-	.instantiate	= mod_instantiate,
-	.bootstrap	= mod_bootstrap,
-	.detach		= mod_detach,
-	.methods = {
-		[MOD_AUTHENTICATE]	= mod_authenticate,
-		[MOD_AUTHORIZE]		= mod_authorize
+extern module_rlm_t rlm_winbind;
+module_rlm_t rlm_winbind = {
+	.common = {
+		.magic		= MODULE_MAGIC_INIT,
+		.name		= "winbind",
+		.inst_size	= sizeof(rlm_winbind_t),
+		.config		= module_config,
+		.instantiate	= mod_instantiate,
+		.bootstrap	= mod_bootstrap,
+		.detach		= mod_detach
 	},
+	.method_group = {
+		.bindings = (module_method_binding_t[]){
+			{ .section = SECTION_NAME("authenticate", CF_IDENT_ANY), .method = mod_authenticate, .method_env = &winbind_auth_method_env },
+			{ .section = SECTION_NAME("recv", CF_IDENT_ANY), .method = mod_authorize, .method_env = &winbind_autz_method_env },
+			MODULE_BINDING_TERMINATOR
+		}
+	}
 };

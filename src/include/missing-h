@@ -1,3 +1,4 @@
+#pragma once
 /*
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -13,8 +14,7 @@
  *  along with this program; if not, write to the Free Software
  *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
-#ifndef _FR_MISSING_H
-#define _FR_MISSING_H
+
 /**
  * $Id$
  *
@@ -84,6 +84,8 @@ RCSIDH(missing_h, "$Id$")
 #  include <errno.h>
 #endif
 
+#include <limits.h>
+
 /*
  *  Check for inclusion of <time.h>, versus <sys/time.h>
  *  Taken verbatim from the autoconf manual.
@@ -115,6 +117,10 @@ RCSIDH(missing_h, "$Id$")
 extern "C" {
 #endif
 
+#ifndef HAVE_SIG_T
+typedef void (*sig_t)(int);
+#endif
+
 /*
  *	Functions from missing.c
  */
@@ -124,6 +130,10 @@ int strncasecmp(char *s1, char *s2, int n);
 
 #ifndef HAVE_STRCASECMP
 int strcasecmp(char *s1, char *s2);
+#endif
+
+#ifndef HAVE_MEMRCHR
+void *memrchr(const void *s, int c, size_t n);
 #endif
 
 #ifndef HAVE_STRSEP
@@ -142,11 +152,25 @@ char *ctime_r(time_t const *l_clock, char *l_buf);
 #ifndef HAVE_INET_PTON
 int		inet_pton(int af, char const *src, void *dst);
 #endif
+
 #ifndef HAVE_INET_NTOP
 char const	*inet_ntop(int af, void const *src, char *dst, size_t cnt);
 #endif
+
+#ifndef HAVE_SENDMMSG
+struct mmsghdr {
+	struct msghdr msg_hdr;  /* Message header */
+	unsigned int  msg_len;  /* Number of bytes transmitted */
+};
+int sendmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags);
+#endif
+
 #ifndef HAVE_CLOSEFROM
-int		closefrom(int fd);
+void		closefrom(int fd);
+#endif
+
+#ifndef HAVE_MEMSET_EXPLICIT
+void *memset_explicit(void *ptr, int ch, size_t len);
 #endif
 
 #ifndef HAVE_SETLINEBUF
@@ -348,8 +372,10 @@ int vsnprintf(char *str, size_t count, char const *fmt, va_list arg);
 int snprintf(char *str, size_t count, char const *fmt, ...);
 #endif
 
-/*
+/**
  *	Functions from strl{cat,cpy}.c
+ *
+ * @hidecallergraph
  */
 #ifndef HAVE_STRLCPY
 size_t strlcpy(char *dst, char const *src, size_t siz);
@@ -369,10 +395,6 @@ struct tm *gmtime_r(time_t const *l_clock, struct tm *result);
 
 #ifndef HAVE_VDPRINTF
 int vdprintf (int fd, char const *format, va_list args);
-#endif
-
-#ifndef HAVE_GETTIMEOFDAY
-int gettimeofday (struct timeval *tv, void *tz);
 #endif
 
 #ifndef HAVE_CLOCK_GETTIME
@@ -419,8 +441,9 @@ int clock_gettime(int clk_id, struct timespec *t);
 #  define offsetof(TYPE, MEMBER) ((size_t) &((TYPE *)0)->MEMBER)
 #endif
 
-void timeval2ntp(struct  timeval const *tv, uint8_t *ntp);
-void ntp2timeval(struct timeval *tv, char const *ntp);
+#ifndef SSIZE_MIN
+#  define SSIZE_MIN LONG_MIN
+#endif
 
 /*
  *	This is really hacky. Any code needing to perform operations on 128bit integers,
@@ -432,7 +455,7 @@ void ntp2timeval(struct timeval *tv, char const *ntp);
 #    define uint128_t __uint128_t
 #    define int128_t __int128_t
 #  else
-typedef struct uint128_t {
+typedef struct {
 	union {
 		uint8_t v[16];
 		struct {
@@ -446,7 +469,7 @@ typedef struct uint128_t {
 		};
 	};
 } uint128_t;
-typedef struct int128_t {
+typedef struct {
 	union {
 		uint8_t v[16];
 		struct {
@@ -469,7 +492,7 @@ typedef struct int128_t {
 #ifndef HAVE_HTONLL
 #  ifndef WORDS_BIGENDIAN
 #    ifdef HAVE_BUILTIN_BSWAP64
-#      define ntohll(x) __builtin_bswap64(x)
+#      define ntohll(x) ((uint64_t)__builtin_bswap64(x))
 #    else
 #      define ntohll(x) (((uint64_t)ntohl((uint32_t)(x >> 32))) | (((uint64_t)ntohl(((uint32_t) x)) << 32)))
 #    endif
@@ -484,7 +507,17 @@ typedef struct int128_t {
 #    ifdef HAVE_128BIT_INTEGERS
 #      define ntohlll(x) (((uint128_t)ntohll((uint64_t)(x >> 64))) | (((uint128_t)ntohll(((uint64_t) x)) << 64)))
 #    else
-uint128_t ntohlll(uint128_t num);
+static inline uint128_t ntohlll(uint128_t const num)
+{
+	uint64_t const *p = (uint64_t const *) &num;
+	uint64_t ret[2];
+
+	/* swapsies */
+	ret[1] = ntohll(p[0]);
+	ret[0] = ntohll(p[1]);
+
+	return *(uint128_t *)ret;
+}
 #    endif
 #  else
 #    define ntohlll(x) (x)
@@ -499,5 +532,3 @@ typedef void(*sig_t)(int);
 #ifdef __cplusplus
 }
 #endif
-
-#endif /* _FR_MISSING_H */

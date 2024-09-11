@@ -1,69 +1,49 @@
 #
 #  Include from Redis cluster tests to get clusters back into a known state
 #
+string clusterctrl
+string redisserver
+string data1
+string data2
+string data3
+string cmdresult
 
 # Some values we need for startup
-update control {
-	Tmp-Integer-0 := 0
-	Tmp-Integer-0 += 1
-	Tmp-Integer-0 += 2
-	Tmp-Integer-0 += 3
-	Tmp-Integer-0 += 4
-	Tmp-Integer-0 += 5
-	Tmp-Integer-0 += 6
-	Tmp-Integer-0 += 7
-	Tmp-Integer-0 += 8
-	Tmp-Integer-0 += 9
-	Tmp-Integer-0 += 10
-	Tmp-String-0 := "1-%{randstr:aaaaaaaa}"
-	Tmp-String-1 := "2-%{randstr:aaaaaaaa}"
-	Tmp-String-2 := "3-%{randstr:aaaaaaaa}"
-}
+&control.Filter-Id := { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21 }
+
+&data1 := "1-%randstr('aaaaaaaa')"
+&data2 := "2-%randstr('aaaaaaaa')"
+&data3 := "3-%randstr('aaaaaaaa')"
 
 if ("$ENV{REDIS_CLUSTER_CONTROL}" == '') {
-    update control {
-        Tmp-String-8 := '/tmp/redis/create-cluster'
-    }
+	&clusterctrl := 'scripts/ci/redis-setup.sh'
 } else {
-    update control {
-        Tmp-String-8 := "$ENV{REDIS_CLUSTER_CONTROL}"
-    }
+	&clusterctrl := $ENV{REDIS_CLUSTER_CONTROL}
 }
 
 #
 #  Reset the cluster
 #
-update control {
-    Tmp-String-0 = `%{control:Tmp-String-8} stop`
-    Tmp-String-0 = `%{control:Tmp-String-8} clean`
-    Tmp-String-0 = `%{control:Tmp-String-8} start`
-    Tmp-String-0 = `%{control:Tmp-String-8} create`
-}
+%exec(%{clusterctrl}, stop)
+%exec(%{clusterctrl}, clean)
+%exec(%{clusterctrl}, start)
 
-#  Hashes to Redis cluster node master 0 (1)
-if ("%{redis:SET b '%{control:Tmp-String-0}'}" == 'OK') {
+# Sometimes redis just fails to start - without it we can't run
+# the tests - so just exit early.
+&cmdresult = %exec(%{clusterctrl}, create)
+if (&cmdresult == '') {
 	test_pass
-} else {
-	test_fail
-}
-
-#  Hashes to Redis cluster node master 1 (2)
-if ("%{redis:SET c '%{control:Tmp-String-1}'}" == 'OK') {
-	test_pass
-} else {
-	test_fail
-}
-
-#  Hashes to Redis cluster node master 2 (3)
-if ("%{redis:SET d '%{control:Tmp-String-2}'}" == 'OK') {
-	test_pass
-} else {
-	test_fail
+	handled
 }
 
 #
 #  Determine when initial synchronisation has been completed
 #
+&redisserver := $ENV{REDIS_TEST_SERVER}
+
+if (!&redisserver || (&redisserver == '')) {
+	&redisserver := "$ENV{REDIS_IPPOOL_TEST_SERVER}"
+}
 
 #  Test nodes should be running on
 #  - 127.0.0.1:30001 - master [0-5460]
@@ -72,23 +52,42 @@ if ("%{redis:SET d '%{control:Tmp-String-2}'}" == 'OK') {
 #  - 127.0.0.1:30005 - slave
 #  - 127.0.0.1:30003 - master [10923-16383]
 #  - 127.0.0.1:30006 - slave
-foreach &control:Tmp-Integer-0 {
-	if (("%{redis:-@$ENV{REDIS_TEST_SERVER}:30004 GET b}" == "%{control:Tmp-String-0}") && \
-	    ("%{redis:-@$ENV{REDIS_TEST_SERVER}:30005 GET c}" == "%{control:Tmp-String-1}") && \
-	    ("%{redis:-@$ENV{REDIS_TEST_SERVER}:30006 GET d}" == "%{control:Tmp-String-2}")) {
-		break
+foreach &control.Filter-Id {
+	#
+	#  Force a remap as the slaves don't show up in the cluster immediately
+	#
+	if (%redis.remap(%{redisserver}:30001) == 'success') {
+		#  Hashes to Redis cluster node master 0 (1)
+		if ((%redis(SET, b, %{data1}) == 'OK') && \
+		    (%redis(SET, c, %{data2}) == 'OK') && \
+		    (%redis(SET, d, %{data3}) == 'OK')) {
+			#
+			#  The actual node to keyslot mapping seems to be somewhat random
+			#  so we now need to figure out which slave each of those keys
+			#  ended up on.
+			#
+			if ((%redis("-@%redis.node(b, 1)", GET, b) == %{data1}) && \
+			    (%redis("-@%redis.node(c, 1)", GET, c) == %{data2}) && \
+			    (%redis("-@%redis.node(d, 1)", GET, d) == %{data3})) {
+				break
+			}
+		}
 	}
 
-	# Perform checks every 0.5 seconds
-	update {
-		Tmp-Integer-0 := `/bin/sleep 0.5`
-	}
+	&request -= &Module-Failure-Message[*]
 
-	if ("%{Foreach-Variable-0}" == 10) {
+	# Perform checks every half second for 10 seconds.
+	#
+	# The cluster tends to come up within a couple of seconds, but it takes longer
+	# for the replicas to be displayed in cluster slot output (usually ~5 seconds).
+	%delay(0.5)
+
+	#
+	#  If the cluster is still not behaving
+	#  abandon the test to avoid false negatives
+	#
+	if (%{Foreach-Variable-0} == 20) {
 		test_fail
+		return
 	}
-}
-
-update request {
-	Module-Failure-Message !* ANY
 }

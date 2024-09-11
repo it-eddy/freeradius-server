@@ -1,6 +1,7 @@
 #
 #  Input packet
 #
+Packet-Type = Access-Request
 User-Name = "bob"
 User-Password = "hello"
 Filter-Id = "1"
@@ -13,13 +14,13 @@ Calling-Station-Id += "bar"
 #
 #  Expected answer
 #
-Response-Packet-Type == Access-Accept
-Called-Station-Id == '1 foo\n'
+Packet-Type == Access-Accept
+Called-Station-Id == "1 foo\n"
 Called-Station-Id == '1 bar'
-Called-Station-Id == '2 foo\n'
+Called-Station-Id == "2 foo\n"
 Called-Station-Id == '2 bar'
-Called-Station-Id == '3 foo\n'
+Called-Station-Id == "3 foo\n"
 Called-Station-Id == '3 bar'
-Called-Station-Id == '4 foo\n'
+Called-Station-Id == "4 foo\n"
 Called-Station-Id == '4 bar'
 

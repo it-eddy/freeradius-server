@@ -36,22 +36,22 @@ use Data::Dumper;
 # Bring the global hashes into the package scope
 our (%RAD_REQUEST, %RAD_REPLY, %RAD_CONFIG, %RAD_STATE);
 
-# This is hash wich hold original request from radius
+# This hash holds the original request from radius
 #my %RAD_REQUEST;
 # In this hash you add values that will be returned to NAS.
 #my %RAD_REPLY;
-#This is for config items (was %RAD_CHECK in earlier versions)
+# This hash contains config items (was %RAD_CHECK in earlier versions)
 #my %RAD_CONFIG;
-# This is the session-sate
+# This is the session state
 #my %RAD_STATE;
-# This is configuration items from "config" perl module configuration section
+# This hash contains config items from "config" perl module configuration section
 #my %RAD_PERLCONF;
 
 # Multi-value attributes are mapped to perl arrayrefs.
 #
-#  update request {
-#    Filter-Id := 'foo'
-#    Filter-Id += 'bar'
+#  &request.Filter-Id := 'foo'
+#  &request += {
+#    &Filter-Id = 'bar'
 #  }
 #
 # This results to the following entry in %RAD_REQUEST:
@@ -68,7 +68,7 @@ use constant {
 	RLM_MODULE_OK       => 2, # the module is OK, continue
 	RLM_MODULE_HANDLED  => 3, # the module handled the request, so stop
 	RLM_MODULE_INVALID  => 4, # the module considers the request invalid
-	RLM_MODULE_USERLOCK => 5, # reject the request (user is locked out)
+	RLM_MODULE_DISALLOW => 5, # reject the request (user is locked out)
 	RLM_MODULE_NOTFOUND => 6, # user not found
 	RLM_MODULE_NOOP     => 7, # module succeeded without doing anything
 	RLM_MODULE_UPDATED  => 8, # OK (pairs modified)
@@ -126,7 +126,7 @@ sub authenticate {
 		return RLM_MODULE_REJECT;
 	} else {
 		# Accept user and set some attribute
-		if (&radiusd::xlat("%{client:group}") eq 'UltraAllInclusive') {
+		if (&radiusd::xlat("%client(group)") eq 'UltraAllInclusive') {
 			# User called from NAS with unlim plan set, set higher limits
 			$RAD_REPLY{'h323-credit-amount'} = "1000000";
 		} else {
@@ -180,21 +180,33 @@ sub post_auth {
 }
 
 # Function to handle xlat
+# Receives arguments presented to the xlat as discrete
+# arguments to the function.
+# If any of the arguments are lists with multiple values e.g.
+# %{User-Name[*]} where there are multiple instances of User-Name
+# then these will be passed as references to arrays.
+#
+# Any return value is presented as the result of the xlat
+#
+# The function is called in array context so all returned values
+# are received, though currently are concatenated before being
+# presented as the expansion of the xlat.  This is due to change
+# in the future.
+#
+# Note: Hashes for the attribute lists are not available in
+#       xlat evaluation and neither will setting them result
+#       in attributes being created.
 sub xlat {
-	# For debugging purposes only
-#	log_request_attributes();
-
 	# Loads some external perl and evaluate it
 	my ($filename,$a,$b,$c,$d) = @_;
-	radiusd::radlog(L_DBG, "From xlat $filename ");
-	radiusd::radlog(L_DBG,"From xlat $a $b $c $d ");
-	local *FH;
-	open FH, $filename or die "open '$filename' $!";
+	radiusd::log(L_DBG, "From xlat $filename");
+	radiusd::log(L_DBG,"From xlat $a $b $c $d");
+	open(my $FH, '<', $filename) or die "open '$filename' $!";
 	local($/) = undef;
-	my $sub = <FH>;
-	close FH;
+	my $sub = <$FH>;
+	close $FH;
 	my $eval = qq{ sub handler{ $sub;} };
-	eval $eval;
+	eval $eval;  ## no critic
 	eval {main->handler;};
 }
 
@@ -216,7 +228,7 @@ sub log_request_attributes {
 	# This shouldn't be done in production environments!
 	# This is only meant for debugging!
 	for (keys %RAD_REQUEST) {
-		radiusd::radlog(L_DBG, "RAD_REQUEST: $_ = $RAD_REQUEST{$_}");
+		radiusd::log(L_DBG, "RAD_REQUEST: $_ = $RAD_REQUEST{$_}");
 	}
 }
 

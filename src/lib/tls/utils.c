@@ -1,9 +1,68 @@
+/*
+ *   This program is free software; you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program; if not, write to the Free Software
+ *   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
+/**
+ * $Id$
+ *
+ * @file tls/utils.c
+ * @brief TLS utility functions
+ *
+ * @copyright 2018 The FreeRADIUS server project
+ */
+
+#include "utils.h"
 #include <openssl/ssl.h>
-#include <freeradius-devel/radiusd.h>
+
+/** PKEY types (friendly names)
+ *
+ */
+static fr_table_num_sorted_t const pkey_types[] = {
+	{ L("DH"),	EVP_PKEY_DH	},
+	{ L("DSA"),	EVP_PKEY_DSA	},
+	{ L("EC"),	EVP_PKEY_EC	},
+	{ L("RSA"),	EVP_PKEY_RSA	}
+};
+static size_t pkey_types_len = NUM_ELEMENTS(pkey_types);
+
+/** Returns a friendly identifier for the public key type of a certificate
+ *
+ * @param[in] cert	The X509 cert to return the type of.
+ * @return the type string.
+ */
+char const *fr_tls_utils_x509_pkey_type(X509 *cert)
+{
+	EVP_PKEY	*pkey;
+	int		pkey_type;
+	char const	*type_str;
+
+	if (!cert) return NULL;
+
+	pkey = X509_get_pubkey(cert);
+	if (!pkey) return NULL;
+
+	pkey_type = EVP_PKEY_type(EVP_PKEY_id(pkey));
+	type_str = fr_table_str_by_value(pkey_types, pkey_type, OBJ_nid2sn(pkey_type));
+	EVP_PKEY_free(pkey);
+
+	return type_str;
+}
 
 /** Returns the OpenSSL keyblock size
  *
- * Copyright (c) 2002-2016, Jouni Malinen <j@w1.fi> and contributors
+ * @copyright (c) 2002-2016, Jouni Malinen (j@w1.fi) and contributors
  * All Rights Reserved.
  *
  * These programs are licensed under the BSD license (the one with
@@ -18,32 +77,10 @@
  *	- -1 problem with the session.
  *	- >=0 length of the block.
  */
-int tls_utils_keyblock_size_get(REQUEST *request, SSL *ssl)
+int fr_tls_utils_keyblock_size_get(request_t *request, SSL *ssl)
 {
 	const EVP_CIPHER *c;
 	const EVP_MD *h;
-#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
-	int md_size;
-
-	if (ssl->enc_read_ctx == NULL || ssl->enc_read_ctx->cipher == NULL || ssl->read_hash == NULL)
-		return -1;
-
-	c = ssl->enc_read_ctx->cipher;
-	h = EVP_MD_CTX_md(ssl->read_hash);
-	if (h)
-		md_size = EVP_MD_size(h);
-	else if (ssl->s3)
-		md_size = ssl->s3->tmp.new_mac_secret_size;
-	else
-		return -1;
-
-	RDEBUG2("OpenSSL: keyblock size: key_len=%d MD_size=%d "
-		   "IV_len=%d", EVP_CIPHER_key_length(c), md_size,
-		   EVP_CIPHER_iv_length(c));
-	return 2 * (EVP_CIPHER_key_length(c) +
-		    md_size +
-		    EVP_CIPHER_iv_length(c));
-#else
 	const SSL_CIPHER *ssl_cipher;
 	int cipher, digest;
 
@@ -65,7 +102,6 @@ int tls_utils_keyblock_size_get(REQUEST *request, SSL *ssl)
 		   EVP_CIPHER_iv_length(c));
 	return 2 * (EVP_CIPHER_key_length(c) + EVP_MD_size(h) +
 		    EVP_CIPHER_iv_length(c));
-#endif
 }
 
 /** Convert OpenSSL's ASN1_TIME to an epoch time
@@ -76,7 +112,7 @@ int tls_utils_keyblock_size_get(REQUEST *request, SSL *ssl)
  *	- 0 success.
  *	- -1 on failure.
  */
-int tls_utils_asn1time_to_epoch(time_t *out, ASN1_TIME const *asn1)
+int fr_tls_utils_asn1time_to_epoch(time_t *out, ASN1_TIME const *asn1)
 {
 	struct		tm t;
 	char const	*p = (char const *)asn1->data, *end = p + strlen(p);
@@ -130,10 +166,44 @@ int tls_utils_asn1time_to_epoch(time_t *out, ASN1_TIME const *asn1)
 	t.tm_sec = (*(p++) - '0') * 10;
 	t.tm_sec += (*(p++) - '0');
 
-	/* ASN1_TIME is UTC, but mktime will treat it as being in the local timezone */
+	/* ASN1_TIME is UTC, so get the UTC time */
 done:
-	*out = mktime(&t) + timezone;
+	*out = timegm(&t);
 
 	return 0;
 }
 
+/** Return the static private key password we have configured
+ *
+ * @note This is used as a callback to OpenSSL's PEM_read_PrivateKey function.
+
+ * @param[out] buf	Where to write the password to.
+ * @param[in] size	The length of buf.
+ * @param[in] rwflag
+ *			- 0 if password used for decryption.
+ *			- 1 if password used for encryption.
+ * @param[in] u		The static password.
+ * @return
+ *	- 0 on error.
+ *	- >0 on success (the length of the password).
+ */
+int fr_utils_get_private_key_password(char *buf, int size, UNUSED int rwflag, void *u)
+{
+	char		*pass;
+	size_t		len;
+
+	if (!u) {
+		ERROR("Private key encrypted but no private_key_password configured");
+		return 0;
+	}
+
+ 	pass = talloc_get_type_abort(u, char);
+	len = talloc_array_length(pass);	/* Len includes \0 */
+	if (len > (size_t)size) {
+		ERROR("Password too long.  Maximum length is %i bytes", size - 1);
+		return -1;
+	}
+	memcpy(buf, pass, len);			/* Copy complete password including \0 byte */
+
+	return len - 1;
+}

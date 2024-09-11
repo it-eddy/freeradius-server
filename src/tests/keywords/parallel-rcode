@@ -26,8 +26,8 @@ if (!fail) {
 group {
 	parallel {
 		fail
-		update request {	# This should *NOT* be dispatched
-			Tmp-String-0 := 'foo'
+		group {	# This should *NOT* be dispatched
+			Filter-Id := 'foo'
 		}
 	}
 	actions {
@@ -37,7 +37,7 @@ group {
 if (!fail) {
 	test_fail
 }
-if (&request:Tmp-String-0) {
+if (Filter-Id) {
 	test_fail
 }
 
@@ -50,8 +50,8 @@ group {
 		fail {
 			fail = 10	# Higher priority than ok and no longer action return
 		}
-		update request {	# This should now be dispatched
-			Tmp-String-0 := 'foo'
+		group {	# This should now be dispatched
+			parent.request.Filter-Id := 'foo'
 		}
 	}
 	actions {
@@ -61,7 +61,7 @@ group {
 if (!fail) {
 	test_fail
 }
-if (&request:Tmp-String-0 != 'foo') {
+if (!(Filter-Id == 'foo')) {
 	test_fail
 }
 

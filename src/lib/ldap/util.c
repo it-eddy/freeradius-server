@@ -19,17 +19,34 @@
  * @file lib/ldap/util.c
  * @brief Utility functions to escape and parse DNs
  *
- * @author Arran Cudbard-Bell <a.cudbardb@freeradius.org>
- * @copyright 2017 Arran Cudbard-Bell <a.cudbardb@freeradius.org>
+ * @author Arran Cudbard-Bell (a.cudbardb@freeradius.org)
+ * @copyright 2017 Arran Cudbard-Bell (a.cudbardb@freeradius.org)
  * @copyright 2017 The FreeRADIUS Server Project.
  */
-#include "libfreeradius-ldap.h"
+RCSID("$Id$")
+
+USES_APPLE_DEPRECATED_API
+
+#include <freeradius-devel/ldap/base.h>
+#include <freeradius-devel/util/base16.h>
 
 #include <stdarg.h>
 #include <ctype.h>
 
 static const char specials[] = ",+\"\\<>;*=()";
 static const char hextab[] = "0123456789abcdef";
+static const bool escapes[UINT8_MAX + 1] = {
+	[' '] = true,
+	['#'] = true,
+	['='] = true,
+	['"'] = true,
+	['+'] = true,
+	[','] = true,
+	[';'] = true,
+	['<'] = true,
+	['>'] = true,
+	['\''] = true
+};
 
 /** Converts "bad" strings into ones which are safe for LDAP
  *
@@ -50,12 +67,11 @@ static const char hextab[] = "0123456789abcdef";
  * @param in Raw unescaped string.
  * @param arg Any additional arguments (unused).
  */
-size_t fr_ldap_escape_func(UNUSED REQUEST *request, char *out, size_t outlen, char const *in, UNUSED void *arg)
+size_t fr_ldap_uri_escape_func(UNUSED request_t *request, char *out, size_t outlen, char const *in, UNUSED void *arg)
 {
-
 	size_t left = outlen;
 
-	if (*in && ((*in == ' ') || (*in == '#'))) goto encode;
+	if ((*in == ' ') || (*in == '#')) goto encode;
 
 	while (*in) {
 		/*
@@ -91,6 +107,45 @@ size_t fr_ldap_escape_func(UNUSED REQUEST *request, char *out, size_t outlen, ch
 	return outlen - left;
 }
 
+int fr_ldap_box_escape(fr_value_box_t *vb, UNUSED void *uctx)
+{
+	fr_sbuff_t		sbuff;
+	fr_sbuff_uctx_talloc_t 	sbuff_ctx;
+	size_t			len;
+	fr_value_box_entry_t	entry;
+
+	if (fr_value_box_is_safe_for(vb, fr_ldap_box_escape)) return 0;
+
+	if ((vb->type != FR_TYPE_STRING) && (fr_value_box_cast_in_place(vb, vb, FR_TYPE_STRING, NULL) < 0)) {
+		fr_value_box_clear_value(vb);
+		return -1;
+	}
+
+	if (!fr_sbuff_init_talloc(vb, &sbuff, &sbuff_ctx, vb->vb_length * 3, vb->vb_length * 3)) {
+		fr_strerror_printf_push("Failed to allocate buffer for escaped filter");
+		return -1;
+	}
+
+	len = fr_ldap_uri_escape_func(NULL, fr_sbuff_buff(&sbuff), vb->vb_length * 3 + 1, vb->vb_strvalue, NULL);
+
+	/*
+	 *	If the returned length is unchanged, the value was already safe
+	 */
+	if (len == vb->vb_length) {
+		talloc_free(fr_sbuff_buff(&sbuff));
+	} else {
+		entry = vb->entry;
+		fr_sbuff_trim_talloc(&sbuff, len);
+		fr_value_box_clear_value(vb);
+		fr_value_box_strdup_shallow(vb, NULL, fr_sbuff_buff(&sbuff), vb->tainted);
+		vb->entry = entry;
+	}
+
+	fr_value_box_mark_safe_for(vb, fr_ldap_box_escape);
+
+	return 0;
+}
+
 /** Converts escaped DNs and filter strings into normal
  *
  * @note RFC 4515 says filter strings can only use the @verbatim \<hex><hex> @endverbatim
@@ -106,7 +161,7 @@ size_t fr_ldap_escape_func(UNUSED REQUEST *request, char *out, size_t outlen, ch
  * @param in Escaped string string.
  * @param arg Any additional arguments (unused).
  */
-size_t fr_ldap_unescape_func(UNUSED REQUEST *request, char *out, size_t outlen, char const *in, UNUSED void *arg)
+size_t fr_ldap_uri_unescape_func(UNUSED request_t *request, char *out, size_t outlen, char const *in, UNUSED void *arg)
 {
 	char const *p;
 	char *c1, *c2, c3;
@@ -125,7 +180,7 @@ size_t fr_ldap_unescape_func(UNUSED REQUEST *request, char *out, size_t outlen, 
 		p++;
 
 		/* It's an escaped special, just remove the slash */
-		if (memchr(specials, *in, sizeof(specials) - 1)) {
+		if (memchr(specials, *p, sizeof(specials) - 1)) {
 			*out++ = *p++;
 			continue;
 		}
@@ -184,23 +239,10 @@ bool fr_ldap_util_is_dn(char const *in, size_t inlen)
 			/*
 			 *	Special, consume two chars
 			 */
-			switch (p[1]) {
-			case ' ':
-			case '#':
-			case '=':
-			case '"':
-			case '+':
-			case ',':
-			case ';':
-			case '<':
-			case '>':
-			case '\'':
+			if (escapes[(uint8_t) p[1]]) {
 				inlen -= 1;
 				p += 1;
 				continue;
-
-			default:
-				break;
 			}
 
 			/*
@@ -211,7 +253,7 @@ bool fr_ldap_util_is_dn(char const *in, size_t inlen)
 			/*
 			 *	Hex encoding, consume three chars
 			 */
-			if (fr_hex2bin((uint8_t *) &c, 1, p + 1, 2) == 1) {
+			if (fr_base16_decode(NULL, &FR_DBUFF_TMP((uint8_t *) &c, 1), &FR_SBUFF_IN(p + 1, 2), false) == 1) {
 				inlen -= 2;
 				p += 2;
 				continue;
@@ -256,22 +298,23 @@ bool fr_ldap_util_is_dn(char const *in, size_t inlen)
 
 /** Parse a subset (just server side sort for now) of LDAP URL extensions
  *
- * @param[out] sss		Where to write a pointer to the server side sort control
- *				we created.
- * @param[in] request		The current request.
- * @param[in] conn		Handle to allocate controls under.
+ * @param[out] sss		Array of LDAPControl * pointers to add controls to.
+ * @param[in] sss_len		How many elements remain in the sss array.
  * @param[in] extensions	A NULL terminated array of extensions.
  * @return
- *	- 0 on success.
+ *	- >0 the number of controls added.
+ *	- 0 if no controls added.
  *	- -1 on failure.
  */
-int fr_ldap_parse_url_extensions(LDAPControl **sss, REQUEST *request, fr_ldap_connection_t *conn, char **extensions)
+int fr_ldap_parse_url_extensions(LDAPControl **sss, size_t sss_len, char *extensions[])
 {
+	LDAPControl **sss_p = sss, **sss_end = sss_p + sss_len;
 	int i;
 
-	*sss = NULL;
-
-	if (!extensions) return 0;
+	if (!extensions) {
+		*sss_p = NULL;
+		return 0;
+	}
 
 	/*
 	 *	Parse extensions in the LDAP URL
@@ -286,7 +329,6 @@ int fr_ldap_parse_url_extensions(LDAPControl **sss, REQUEST *request, fr_ldap_co
 			p++;
 		}
 
-#ifdef HAVE_LDAP_CREATE_SORT_CONTROL
 		/*
 		 *	Server side sort control
 		 */
@@ -297,36 +339,41 @@ int fr_ldap_parse_url_extensions(LDAPControl **sss, REQUEST *request, fr_ldap_co
 			p += 3;
 			p = strchr(p, '=');
 			if (!p) {
-				REDEBUG("Server side sort extension must be in the format \"[!]sss=<key>[,key]\"");
+				fr_strerror_const("Server side sort extension must be "
+						  "in the format \"[!]sss=<key>[,key]\"");
 				return -1;
 			}
 			p++;
 
 			ret = ldap_create_sort_keylist(&keys, p);
 			if (ret != LDAP_SUCCESS) {
-				REDEBUG("Invalid server side sort value \"%s\": %s", p, ldap_err2string(ret));
+				fr_strerror_printf("Invalid server side sort value \"%s\": %s",
+						   p, ldap_err2string(ret));
 				return -1;
 			}
 
-			if (*sss) ldap_control_free(*sss);
+			if (*sss_p) ldap_control_free(*sss_p);
 
-			ret = ldap_create_sort_control(conn->handle, keys, is_critical ? 1 : 0, sss);
+			ret = ldap_create_sort_control(fr_ldap_handle_thread_local(), keys, is_critical ? 1 : 0, sss_p);
 			ldap_free_sort_keylist(keys);
 			if (ret != LDAP_SUCCESS) {
-				ERROR("Failed creating server sort control: %s", ldap_err2string(ret));
+				fr_strerror_printf("Failed creating server sort control: %s",
+						   ldap_err2string(ret));
 				return -1;
 			}
+			sss_p++;
 
 			continue;
 		}
-#endif
 
-		RWDEBUG("URL extension \"%s\" ignored", p);
+		fr_strerror_printf("URL extension \"%s\" not supported", p);
+		return -1;
 	}
 
-	return 0;
-}
+	*sss_p = NULL;	/* Terminate */
 
+	return (sss_end - sss_p);
+}
 
 /** Convert a berval to a talloced string
  *
@@ -363,7 +410,7 @@ uint8_t *fr_ldap_berval_to_bin(TALLOC_CTX *ctx, struct berval const *in)
 {
 	uint8_t *out;
 
-	out = talloc_array(ctx, uint8_t, in->bv_len + 1);
+	out = talloc_array(ctx, uint8_t, in->bv_len);
 	if (!out) return NULL;
 
 	memcpy(out, in->bv_val, in->bv_len);
@@ -396,7 +443,7 @@ size_t fr_ldap_util_normalise_dn(char *out, char const *in)
 
 	for (p = in; *p != '\0'; p++) {
 		if (p[0] == '\\') {
-			char c;
+			char c = '\0';
 
 			/*
 			 *	Double backslashes get processed specially
@@ -413,26 +460,12 @@ size_t fr_ldap_util_normalise_dn(char *out, char const *in)
 			 *	special encoding, get rewritten to the
 			 *	special encoding.
 			 */
-			if (fr_hex2bin((uint8_t *) &c, 1, p + 1, 2) == 1) {
-				switch (c) {
-				case ' ':
-				case '#':
-				case '=':
-				case '"':
-				case '+':
-				case ',':
-				case ';':
-				case '<':
-				case '>':
-				case '\'':
-					*o++ = '\\';
-					*o++ = c;
-					p += 2;
-					continue;
-
-				default:
-					break;
-				}
+			if (fr_base16_decode(NULL, &FR_DBUFF_TMP((uint8_t *) &c, 1), &FR_SBUFF_IN(p + 1, 2), false) == 1 &&
+			    escapes[(uint8_t) c]) {
+				*o++ = '\\';
+				*o++ = c;
+				p += 2;
+				continue;
 			}
 		}
 		*o++ = *p;
@@ -472,25 +505,25 @@ size_t fr_ldap_common_dn(char const *full, char const *part)
 	return f_len - p_len;
 }
 
-/** Combine and expand filters
+/** Combine filters and tokenize to a tmpl
  *
- * @param request Current request.
- * @param out Where to write the expanded string.
- * @param outlen Length of output buffer.
- * @param sub Array of subfilters (may contain NULLs).
- * @param sublen Number of potential subfilters in array.
- * @return length of expanded data.
+ * @param ctx		To allocate combined filter in
+ * @param t_rules	Rules for parsing combined filter.
+ * @param sub		Array of subfilters (may contain NULLs).
+ * @param sublen	Number of potential subfilters in array.
+ * @param out		Where to write a pointer to the resulting tmpl.
+ * @return length of combined data.
  */
-ssize_t fr_ldap_xlat_filter(REQUEST *request, char const **sub, size_t sublen, char *out, size_t outlen)
+int fr_ldap_filter_to_tmpl(TALLOC_CTX *ctx, tmpl_rules_t const *t_rules, char const **sub, size_t sublen, tmpl_t **out)
 {
-	char buffer[LDAP_MAX_FILTER_STR_LEN + 1];
-	char const *in = NULL;
-	char *p = buffer;
+	char		*buffer = NULL;
+	char const	*in = NULL;
+	ssize_t		len = 0;
+	size_t		i;
+	int		cnt = 0;
+	tmpl_t		*parsed;
 
-	ssize_t len = 0;
-
-	unsigned int i;
-	int cnt = 0;
+	*out = NULL;
 
 	/*
 	 *	Figure out how many filter elements we need to integrate
@@ -499,51 +532,250 @@ ssize_t fr_ldap_xlat_filter(REQUEST *request, char const **sub, size_t sublen, c
 		if (sub[i] && *sub[i]) {
 			in = sub[i];
 			cnt++;
+			len += strlen(sub[i]);
 		}
 	}
 
-	if (!cnt) {
-		out[0] = '\0';
-		return 0;
-	}
+	if (!cnt) return 0;
 
 	if (cnt > 1) {
-		if (outlen < 3) {
-			goto oob;
-		}
+		/*
+		 *	Allocate a buffer large enough, allowing for (& ... ) plus trailing '\0'
+		 */
+		buffer = talloc_array(ctx, char, len + 4);
 
-		p[len++] = '(';
-		p[len++] = '&';
-
+		strcpy(buffer, "(&");
 		for (i = 0; i < sublen; i++) {
 			if (sub[i] && (*sub[i] != '\0')) {
-				len += strlcpy(p + len, sub[i], outlen - len);
-
-				if ((size_t) len >= outlen) {
-					oob:
-					REDEBUG("Out of buffer space creating filter");
-
-					return -1;
-				}
+				strcat(buffer, sub[i]);
 			}
 		}
-
-		if ((outlen - len) < 2) {
-			goto oob;
-		}
-
-		p[len++] = ')';
-		p[len] = '\0';
-
+		strcat(buffer, ")");
 		in = buffer;
 	}
 
-	len = xlat_eval(out, outlen, request, in, fr_ldap_escape_func, NULL);
-	if (len < 0) {
-		REDEBUG("Failed creating filter");
+	len = tmpl_afrom_substr(ctx, &parsed, &FR_SBUFF_IN(in, strlen(in)), T_DOUBLE_QUOTED_STRING, NULL, t_rules);
 
+	talloc_free(buffer);
+
+	if (len < 0) {
+		EMARKER(in, -len, fr_strerror());
 		return -1;
 	}
 
-	return len;
+	*out = parsed;
+	return 0;
+}
+
+/** Check that a particular attribute is included in an attribute list
+ *
+ * @param[in] attrs	list to check
+ * @param[in] attr	to look for
+ * @return
+ *	- 1 if attr is in list
+ *	- 0 if attr is missing
+ *	- -1 if checks not possible
+ */
+int fr_ldap_attrs_check(char const **attrs, char const *attr)
+{
+	size_t		len, i;
+
+	if (!attr) return -1;
+
+	len = talloc_array_length(attrs);
+
+	for (i = 0; i < len; i++) {
+		if (!attrs[i]) continue;
+		if (strcasecmp(attrs[i], attr) == 0) return 1;
+		if (strcasecmp(attrs[i], "*") == 0) return 1;
+	}
+
+	return 0;
+}
+
+/** Check an LDAP server entry in URL format is valid
+ *
+ * @param[in,out] handle_config	LDAP handle config being built
+ * @param[in] server		string to parse
+ * @param[in] cs		in which the server is defined
+ * @return
+ *	- 0 for valid server definition
+ *	- -1 for invalid server definition
+ */
+int fr_ldap_server_url_check(fr_ldap_config_t *handle_config, char const *server, CONF_SECTION const *cs)
+{
+	LDAPURLDesc	*ldap_url;
+	bool		set_port_maybe = true;
+	int		default_port = LDAP_PORT;
+	char		*p, *url;
+	CONF_ITEM	*ci = (CONF_ITEM *)cf_pair_find(cs, "server");
+
+	if (ldap_url_parse(server, &ldap_url)) {
+		cf_log_err(ci, "Parsing LDAP URL \"%s\" failed", server);
+	ldap_url_error:
+		ldap_free_urldesc(ldap_url);
+		return -1;
+	}
+
+	if (ldap_url->lud_dn && (ldap_url->lud_dn[0] != '\0')) {
+		cf_log_err(ci, "Base DN cannot be specified via server URL");
+		goto ldap_url_error;
+	}
+
+	if (ldap_url->lud_attrs && ldap_url->lud_attrs[0]) {
+		cf_log_err(ci, "Attribute list cannot be speciried via server URL");
+		goto ldap_url_error;
+	}
+
+	/*
+	 *	ldap_url_parse sets this to base by default.
+	 */
+	if (ldap_url->lud_scope != LDAP_SCOPE_BASE) {
+		cf_log_err(ci, "Scope cannot be specified via server URL");
+		goto ldap_url_error;
+	}
+	ldap_url->lud_scope = -1;	/* Otherwise LDAP adds ?base */
+
+	/*
+	 *	The public ldap_url_parse function sets the default
+	 *	port, so we have to discover whether a port was
+	 *	included ourselves.
+	 */
+	if ((p = strchr(server, ']')) && (p[1] == ':')) {			/* IPv6 */
+		set_port_maybe = false;
+	} else if ((p = strchr(server, ':')) && (strchr(p+1, ':') != NULL)) {	/* IPv4 */
+		set_port_maybe = false;
+	}
+
+	/*
+	 *	Figure out the default port from the URL
+	 */
+	if (ldap_url->lud_scheme) {
+		if (strcmp(ldap_url->lud_scheme, "ldaps") == 0) {
+			if (handle_config->start_tls == true) {
+				cf_log_err(ci, "ldaps:// scheme is not compatible with 'start_tls'");
+				goto ldap_url_error;
+			}
+			default_port = LDAPS_PORT;
+			handle_config->tls_mode = LDAP_OPT_X_TLS_HARD;
+		} else if (strcmp(ldap_url->lud_scheme, "ldapi") == 0) {
+			set_port_maybe = false;
+		}
+	}
+
+	if (set_port_maybe) {
+		/*
+		 *	URL port overrides configured port.
+		 */
+		ldap_url->lud_port = handle_config->port;
+
+		/*
+		 *	If there's no URL port, then set it to the default
+		 *	this is so debugging messages show explicitly
+		 *	the port we're connecting to.
+		 */
+		if (!ldap_url->lud_port) ldap_url->lud_port = default_port;
+	}
+
+	url = ldap_url_desc2str(ldap_url);
+	if (!url) {
+		cf_log_err(ci, "Failed recombining URL components");
+		goto ldap_url_error;
+	}
+	handle_config->server = talloc_asprintf_append(handle_config->server, "%s ", url);
+
+	ldap_free_urldesc(ldap_url);
+	ldap_memfree(url);
+	return (0);
+}
+
+/** Check an LDAP server config in server:port format is valid
+ *
+ * @param[in,out] handle_config	LDAP handle config being built
+ * @param[in] server		string to parse
+ * @param[in] cs		in which the server is defined
+ * @return
+ *	- 0 for valid server definition
+ *	- -1 for invalid server definition
+ */
+int fr_ldap_server_config_check(fr_ldap_config_t *handle_config, char const *server, CONF_SECTION *cs)
+{
+	char	const *p;
+	char	*q;
+	int	port = 0;
+	size_t	len;
+
+	port = handle_config->port;
+
+	/*
+	 *	We don't support URLs if the library didn't provide
+	 *	URL parsing functions.
+	 */
+	if (strchr(server, '/')) {
+		CONF_ITEM	*ci;
+	bad_server_fmt:
+		ci = (CONF_ITEM *)cf_pair_find(cs, "server");
+		cf_log_err(ci, "Invalid 'server' entry, must be in format <server>[:<port>] or "
+			       "an ldap URI (ldap|cldap|ldaps|ldapi)://<server>:<port>");
+		return -1;
+	}
+
+	p = strrchr(server, ':');
+	if (p) {
+		port = (int)strtol((p + 1), &q, 10);
+		if ((p == server) || ((p + 1) == q) || (*q != '\0')) goto bad_server_fmt;
+		len = p - server;
+	} else {
+		len = strlen(server);
+	}
+	if (port == 0) port = LDAP_PORT;
+
+	handle_config->server = talloc_asprintf_append(handle_config->server, "ldap://%.*s:%i ",
+						       (int)len, server, port);
+	return 0;
+}
+
+/** Translate the error code emitted from ldap_url_parse and friends into something accessible with fr_strerror()
+ *
+ * @param[in] ldap_url_err	The error code returned
+ */
+char const *fr_ldap_url_err_to_str(int ldap_url_err)
+{
+	switch (ldap_url_err) {
+	case LDAP_URL_SUCCESS:
+		return "success";
+
+	case LDAP_URL_ERR_MEM:
+		return "no memory";
+
+	case LDAP_URL_ERR_PARAM:
+		return "parameter is bad";
+
+	case LDAP_URL_ERR_BADSCHEME:
+		return "URL doesn't begin with \"[c]ldap[si]://\"";
+
+	case LDAP_URL_ERR_BADENCLOSURE:
+		return "URL is missing trailing \">\"";
+
+	case LDAP_URL_ERR_BADURL:
+		return "URL is bad";
+
+	case LDAP_URL_ERR_BADHOST:
+		return "host/port is bad";
+
+	case LDAP_URL_ERR_BADATTRS:
+		return "bad (or missing) attributes";
+
+	case LDAP_URL_ERR_BADSCOPE:
+		return "scope string is invalid (or missing)";
+
+	case LDAP_URL_ERR_BADFILTER:
+		return "bad or missing filter";
+
+	case LDAP_URL_ERR_BADEXTS:
+		return "bad or missing extensions";
+
+	default:
+		return "unknown reason";
+	}
 }

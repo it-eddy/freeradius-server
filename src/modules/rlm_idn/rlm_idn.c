@@ -19,20 +19,20 @@
  * @file rlm_idn.c
  * @brief Internationalized Domain Name encoding for DNS aka IDNA aka RFC3490
  *
- * @copyright 2013  Brian S. Julin <bjulin@clarku.edu>
+ * @copyright 2013 Brian S. Julin (bjulin@clarku.edu)
  */
 RCSID("$Id$")
 
-#include <freeradius-devel/radiusd.h>
-#include <freeradius-devel/modules.h>
+#include <freeradius-devel/server/base.h>
+#include <freeradius-devel/server/module_rlm.h>
+#include <freeradius-devel/unlang/xlat_func.h>
 
 #include <idna.h>
 
 /*
  *      Structure for module configuration
  */
-typedef struct rlm_idn_t {
-	char const	*xlat_name;
+typedef struct {
 	bool		use_std3_ascii_rules;
 	bool		allow_unassigned;
 } rlm_idn_t;
@@ -64,14 +64,14 @@ typedef struct rlm_idn_t {
 /*
  *      A mapping of configuration file names to internal variables.
  */
-static const CONF_PARSER mod_config[] = {
+static const conf_parser_t mod_config[] = {
 	/*
 	 *	If a STRINGPREP profile other than NAMEPREP is ever desired,
 	 *	we can implement an option, and it will default to NAMEPREP settings.
 	 *	...and if we want raw punycode or to tweak Bootstring parameters,
 	 *	we can do similar things.  All defaults should result in IDNA
 	 *	ToASCII with the use_std3_ascii_rules flag set, allow_unassigned unset,
-	 *	because that is the forseeable use case.
+	 *	because that is the foreseeable use case.
 	 *
 	 *	Note that doing anything much different will require choosing the
 	 *	appropriate libidn API functions, as we currently call the IDNA
@@ -82,20 +82,35 @@ static const CONF_PARSER mod_config[] = {
 	 *	be used.
 	 */
 
-	{ FR_CONF_OFFSET("allow_unassigned", FR_TYPE_BOOL, rlm_idn_t, allow_unassigned), .dflt = "no" },
-	{ FR_CONF_OFFSET("use_std3_ascii_rules", FR_TYPE_BOOL, rlm_idn_t, use_std3_ascii_rules), .dflt = "yes" },
+	{ FR_CONF_OFFSET("allow_unassigned", rlm_idn_t, allow_unassigned), .dflt = "no" },
+	{ FR_CONF_OFFSET("use_std3_ascii_rules", rlm_idn_t, use_std3_ascii_rules), .dflt = "yes" },
 	CONF_PARSER_TERMINATOR
 };
 
-static ssize_t xlat_idna(UNUSED TALLOC_CTX *ctx, char **out, size_t outlen,
-			 void const *mod_inst, UNUSED void const *xlat_inst,
-			 REQUEST *request, char const *fmt)
+static xlat_arg_parser_t const xlat_idna_arg[] = {
+	{ .required = true, .concat = true, .type = FR_TYPE_STRING },
+	XLAT_ARG_PARSER_TERMINATOR
+};
+
+/** Convert domain name to ASCII punycode
+ *
+@verbatim
+%idn(<domain>)
+@endverbatim
+ *
+ * @ingroup xlat_functions
+ */
+static xlat_action_t xlat_idna(TALLOC_CTX *ctx, fr_dcursor_t *out,
+			       xlat_ctx_t const *xctx,
+			       request_t *request, fr_value_box_list_t *in)
 {
-	rlm_idn_t const *inst = mod_inst;
-	char *idna = NULL;
-	int res;
-	size_t len;
-	int flags = 0;
+	rlm_idn_t const	*inst = talloc_get_type_abort(xctx->mctx->mi->data, rlm_idn_t);
+	char		*idna = NULL;
+	int		res;
+	size_t		len;
+	int		flags = 0;
+	fr_value_box_t	*arg = fr_value_box_list_head(in);
+	fr_value_box_t	*vb;
 
 	if (inst->use_std3_ascii_rules) {
 		flags |= IDNA_USE_STD3_ASCII_RULES;
@@ -104,57 +119,53 @@ static ssize_t xlat_idna(UNUSED TALLOC_CTX *ctx, char **out, size_t outlen,
 		flags |= IDNA_ALLOW_UNASSIGNED;
 	}
 
-	res = idna_to_ascii_8z(fmt, &idna, flags);
+	res = idna_to_ascii_8z(arg->vb_strvalue, &idna, flags);
 	if (res) {
 		if (idna) {
 			free (idna); /* Docs unclear, be safe. */
 		}
 
 		REDEBUG("%s", idna_strerror(res));
-		return -1;
+		return XLAT_ACTION_FAIL;
 	}
 
 	len = strlen(idna);
 
 	/* 253 is max DNS length */
-	if (!((len < (outlen - 1)) && (len <= 253))) {
+	if (len > 253) {
 		/* Never provide a truncated result, as it may be queried. */
 		REDEBUG("Conversion was truncated");
 
 		free(idna);
-		return -1;
-
+		return XLAT_ACTION_FAIL;
 	}
 
-	strlcpy(*out, idna, outlen);
+	MEM(vb = fr_value_box_alloc_null(ctx));
+	MEM(fr_value_box_strdup(ctx, vb, NULL, idna, false) >= 0);
+	fr_dcursor_append(out, vb);
 	free(idna);
 
-	return len;
+	return XLAT_ACTION_DONE;
 }
 
-static int mod_bootstrap(void *instance, CONF_SECTION *conf)
+static int mod_bootstrap(module_inst_ctx_t const *mctx)
 {
-	rlm_idn_t *inst = instance;
-	char const *xlat_name;
+	xlat_t		*xlat;
 
-	xlat_name = cf_section_name2(conf);
-	if (!xlat_name) {
-		xlat_name = cf_section_name1(conf);
-	}
-
-	inst->xlat_name = xlat_name;
-
-	xlat_register(inst, inst->xlat_name, xlat_idna, NULL, NULL, 0, XLAT_DEFAULT_BUF_LEN, true);
+	xlat = module_rlm_xlat_register(mctx->mi->boot, mctx, NULL, xlat_idna, FR_TYPE_STRING);
+	xlat_func_args_set(xlat, xlat_idna_arg);
+	xlat_func_flags_set(xlat, XLAT_FUNC_FLAG_PURE);
 
 	return 0;
 }
 
-extern rad_module_t rlm_idn;
-rad_module_t rlm_idn = {
-	.magic		= RLM_MODULE_INIT,
-	.name		= "idn",
-	.type		= RLM_TYPE_THREAD_SAFE,
-	.inst_size	= sizeof(rlm_idn_t),
-	.config		= mod_config,
-	.bootstrap	= mod_bootstrap
+extern module_rlm_t rlm_idn;
+module_rlm_t rlm_idn = {
+	.common = {
+		.magic		= MODULE_MAGIC_INIT,
+		.name		= "idn",
+		.inst_size	= sizeof(rlm_idn_t),
+		.config		= mod_config,
+		.bootstrap	= mod_bootstrap
+	}
 };

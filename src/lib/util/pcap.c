@@ -13,29 +13,34 @@
  *   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
-/**
- * $Id$
- * @file lib/util/pcap.c
- * @brief Wrappers around libpcap functions
+/** Wrappers around libpcap functions
  *
- * @author Arran Cudbard-Bell <a.cudbardb@freeradius.org>
- * @copyright 2013 Arran Cudbard-Bell <a.cudbardb@freeradius.org>
+ * @file src/lib/util/pcap.c
+ *
+ * @author Arran Cudbard-Bell (a.cudbardb@freeradius.org)
+ * @copyright 2013 Arran Cudbard-Bell (a.cudbardb@freeradius.org)
  */
 #ifdef HAVE_LIBPCAP
 
+#include <freeradius-devel/util/debug.h>
+#include <freeradius-devel/util/net.h>
+#include <freeradius-devel/util/pair.h>
+#include <freeradius-devel/util/pcap.h>
+#include <freeradius-devel/util/syserror.h>
+
+#include <net/if.h>
 #include <sys/ioctl.h>
-#include <sys/types.h>
+#include <sys/uio.h>
 
 #ifndef SIOCGIFHWADDR
-  #include <net/if_dl.h>
-  #include <ifaddrs.h>
+#  include <ifaddrs.h>
+#  ifdef HAVE_NET_IF_DL_H
+#    include <net/if_dl.h>
+#  endif
 #else
-  #include <net/if.h>
+#  include <net/if.h>
 #endif
 
-#include <freeradius-devel/pcap.h>
-#include <freeradius-devel/net.h>
-#include <freeradius-devel/rad_assert.h>
 
 /** Talloc destructor to free pcap resources associated with a handle.
  *
@@ -80,19 +85,22 @@ static int _free_pcap(fr_pcap_t *pcap)
  * unfortunately when we're trying to find useful interfaces
  * this is too late.
  *
- * @param errbuff Error message.
  * @param dev to get link layer for.
  * @return
  *	- Datalink layer.
  *	- -1 on failure.
  */
-int fr_pcap_if_link_layer(char *errbuff, pcap_if_t *dev)
+int fr_pcap_if_link_layer(pcap_if_t *dev)
 {
-	pcap_t *pcap;
-	int data_link;
+	char	errbuf[PCAP_ERRBUF_SIZE];
+	pcap_t	*pcap;
+	int	data_link;
 
-	pcap = pcap_open_live(dev->name, 0, 0, 0, errbuff);
-	if (!pcap) return -1;
+	pcap = pcap_open_live(dev->name, 0, 0, 0, errbuf);
+	if (!pcap) {
+		fr_strerror_printf("%s", errbuf);
+		return -1;
+	}
 
 	data_link = pcap_datalink(pcap);
 	pcap_close(pcap);
@@ -199,8 +207,8 @@ int fr_pcap_open(fr_pcap_t *pcap)
 		 *
 		 *	We do this first, as it's the most specific error.
 		 */
-		pcap->if_index = if_nametoindex(pcap->name);
-		if (!pcap->if_index) {
+		pcap->ifindex = if_nametoindex(pcap->name);
+		if (!pcap->ifindex) {
 			fr_strerror_printf("Unknown interface \"%s\"", pcap->name);
 			return -1;
 		}
@@ -296,7 +304,7 @@ int fr_pcap_open(fr_pcap_t *pcap)
 		}
 		pcap->handle = pcap_open_dead(pcap->link_layer, SNAPLEN);
 		if (!pcap->handle) {
-			fr_strerror_printf("Unknown error occurred opening dead PCAP handle");
+			fr_strerror_const("Unknown error occurred opening dead PCAP handle");
 
 			return -1;
 		}
@@ -321,7 +329,7 @@ int fr_pcap_open(fr_pcap_t *pcap)
 		break;
 #else
 	case PCAP_STDIO_IN:
-		fr_strerror_printf("This version of libpcap does not support reading pcap data from streams");
+		fr_strerror_const("This version of libpcap does not support reading pcap data from streams");
 
 		return -1;
 #endif
@@ -337,7 +345,7 @@ int fr_pcap_open(fr_pcap_t *pcap)
 		break;
 #else
 	case PCAP_STDIO_OUT:
-		fr_strerror_printf("This version of libpcap does not support writing pcap data to streams");
+		fr_strerror_const("This version of libpcap does not support writing pcap data to streams");
 
 		return -1;
 #endif
@@ -376,7 +384,7 @@ int fr_pcap_apply_filter(fr_pcap_t *pcap, char const *expression)
 	 */
 #ifdef DLT_NFLOG
 	if (pcap->link_layer == DLT_NFLOG) {
-		fr_strerror_printf("NFLOG link-layer type filtering not implemented");
+		fr_strerror_const("NFLOG link-layer type filtering not implemented");
 
 		return 1;
 	}
@@ -396,10 +404,13 @@ int fr_pcap_apply_filter(fr_pcap_t *pcap, char const *expression)
 	}
 
 	if (pcap_setfilter(pcap->handle, &fp) < 0) {
-		fr_strerror_printf("%s", pcap_geterr(pcap->handle));
+		pcap_freecode(&fp);
 
+		fr_strerror_printf("%s", pcap_geterr(pcap->handle));
 		return -1;
 	}
+
+	pcap_freecode(&fp);	/* Free the filter, it's not longer needed after its been applied */
 
 	return 0;
 }
@@ -416,35 +427,171 @@ int fr_pcap_apply_filter(fr_pcap_t *pcap, char const *expression)
 char *fr_pcap_device_names(TALLOC_CTX *ctx, fr_pcap_t *pcap, char c)
 {
 	fr_pcap_t *pcap_p;
-	char *buff, *p;
-	size_t len = 0, left = 0, wrote;
+	char *buff, *p, *end;
+	size_t len = 0;
 
 	if (!pcap) {
-		goto null;
-	}
-
-	for (pcap_p = pcap;
-	     pcap_p;
-	     pcap_p = pcap_p->next) {
-		len += talloc_array_length(pcap_p->name);	// Talloc array length includes the \0
-	}
-
-	if (!len) {
 	null:
 		return talloc_zero_array(ctx, char, 1);
 	}
 
-	left = len + 1;
-	buff = p = talloc_zero_array(ctx, char, left);
 	for (pcap_p = pcap;
 	     pcap_p;
 	     pcap_p = pcap_p->next) {
-		wrote = snprintf(p, left, "%s%c", pcap_p->name, c);
-		left -= wrote;
-		p += wrote;
+	     	/*
+	     	 *	talloc_array_length includes \0 which accounts for c
+	     	 */
+		len += talloc_array_length(pcap_p->name);
 	}
-	buff[len - 1] = '\0';
+
+	if (!len) goto null;
+
+	buff = p = talloc_zero_array(ctx, char, len);
+	end = p + len;
+
+	for (pcap_p = pcap;
+	     pcap_p;
+	     pcap_p = pcap_p->next) {
+	     	size_t name_len = talloc_array_length(pcap_p->name) - 1;
+
+		if (!fr_cond_assert(p < end)) {
+			talloc_free(buff);
+			return NULL;
+		}
+
+		memcpy(p, pcap_p->name, name_len);
+		p += name_len;
+		*p++ = c;
+	}
+	*(end - 1) = '\0';	/* Strip trailing separation char */
 
 	return buff;
+}
+
+
+/** Check whether fr_pcap_link_layer_offset can process a link_layer
+ *
+ * @param link_layer to check.
+ * @return
+ *	- true if supported.
+ *	- false if not supported.
+ */
+bool fr_pcap_link_layer_supported(int link_layer)
+{
+	switch (link_layer) {
+	case DLT_EN10MB:
+	case DLT_RAW:
+	case DLT_NULL:
+	case DLT_LOOP:
+#ifdef DLT_LINUX_SLL
+	case DLT_LINUX_SLL:
+#endif
+	case DLT_PFLOG:
+		return true;
+
+	default:
+		return false;
+	}
+}
+
+/** Returns the length of the link layer header
+ *
+ * Libpcap does not include a decoding function to skip the L2 header, but it does
+ * at least inform us of the type.
+ *
+ * Unfortunately some headers are of variable length (like ethernet), so additional
+ * decoding logic is required.
+ *
+ * @note No header data is returned, this is only meant to be used to determine how
+ * data to consume before attempting to parse the IP header.
+ *
+ * @param data start of packet data.
+ * @param len caplen.
+ * @param link_layer value returned from pcap_linktype.
+ * @return
+ *	- Length of the header.
+ *	- -1 on failure.
+ */
+ssize_t fr_pcap_link_layer_offset(uint8_t const *data, size_t len, int link_layer)
+{
+	uint8_t const *p = data;
+
+	switch (link_layer) {
+	case DLT_RAW:
+		break;
+
+	case DLT_NULL:
+	case DLT_LOOP:
+		p += 4;
+		if (((size_t)(p - data)) > len) {
+		ood:
+			fr_strerror_printf("Out of data, needed %zu bytes, have %zu bytes",
+					   (size_t)(p - data), len);
+			return -1;
+		}
+		break;
+
+	case DLT_EN10MB:
+	{
+		uint16_t ether_type;	/* Ethernet type */
+		int i;
+
+		p += 12;		/* SRC/DST Mac-Addresses */
+		if (((size_t)(p - data)) > len) {
+			goto ood;
+		}
+
+		for (i = 0; i < 3; i++) {
+			ether_type = ntohs(*((uint16_t const *) p));
+			switch (ether_type) {
+			/*
+			 *	There are a number of devices out there which
+			 *	double tag with 0x8100 *sigh*
+			 */
+			case 0x8100:	/* CVLAN */
+			case 0x9100:	/* SVLAN */
+			case 0x9200:	/* SVLAN */
+			case 0x9300:	/* SVLAN */
+				p += 4;
+				if (((size_t)(p - data)) > len) {
+					goto ood;
+				}
+				break;
+
+			default:
+				p += 2;
+				if (((size_t)(p - data)) > len) {
+					goto ood;
+				}
+				goto done;
+			}
+		}
+		fr_strerror_const("Exceeded maximum level of VLAN tag nesting (2)");
+		return -1;
+	}
+
+#ifdef DLT_LINUX_SLL
+	case DLT_LINUX_SLL:
+		p += 16;
+		if (((size_t)(p - data)) > len) {
+			goto ood;
+		}
+		break;
+#endif
+
+	case DLT_PFLOG:
+		p += 28;
+		if (((size_t)(p - data)) > len) {
+			goto ood;
+		}
+		break;
+
+	default:
+		fr_strerror_printf("Unsupported link layer type %i", link_layer);
+		return -1;
+	}
+
+done:
+	return p - data;
 }
 #endif	/* HAVE_LIBPCAP */

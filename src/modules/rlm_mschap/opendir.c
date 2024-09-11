@@ -15,39 +15,36 @@
  *   along with this program; if not, write to the Free Software
  *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  *
- * Copyright 2007 Apple Inc.
+ * @copyright 2007 Apple Inc.
  */
 
 RCSID("$Id$")
 USES_APPLE_DEPRECATED_API
 
-#include	<freeradius-devel/radiusd.h>
-#include	<freeradius-devel/modules.h>
-#include	<freeradius-devel/rad_assert.h>
-#include	<freeradius-devel/md5.h>
+#include <freeradius-devel/server/base.h>
+#include <freeradius-devel/server/module_rlm.h>
+#include <freeradius-devel/util/debug.h>
+#include <freeradius-devel/util/md5.h>
 
-#include 	<ctype.h>
+#include <ctype.h>
 
-#include	"smbdes.h"
+#include "smbdes.h"
+#include "rlm_mschap.h"
+#include "mschap.h"
 
 #include <DirectoryService/DirectoryService.h>
 
 #define kActiveDirLoc "/Active Directory/"
 
 /*
- *	In rlm_mschap.c
- */
-void mschap_add_reply(REQUEST *request, VALUE_PAIR** vp, unsigned char ident,
-		      char const* name, char const* value, int len);
-
-/*
  *	Only used by rlm_mschap.c
  */
-rlm_rcode_t od_mschap_auth(REQUEST *request, VALUE_PAIR *challenge, VALUE_PAIR * usernamepair);
+unlang_action_t od_mschap_auth(rlm_rcode_t *p_result, request_t *request, fr_pair_t *challenge, fr_pair_t *usernamepair,
+			       mschap_auth_call_env_t *call_env);
 
 
-static rlm_rcode_t getUserNodeRef(REQUEST *request, char* inUserName, char **outUserName,
-				  tDirNodeReference* userNodeRef, tDirReference dsRef)
+static unlang_action_t getUserNodeRef(rlm_rcode_t *p_result, request_t *request, char* inUserName, char **outUserName,
+				      tDirNodeReference* userNodeRef, tDirReference dsRef)
 {
 	tDataBuffer	     	*tDataBuff	= NULL;
 	tDirNodeReference       nodeRef		= 0;
@@ -72,13 +69,13 @@ static rlm_rcode_t getUserNodeRef(REQUEST *request, char* inUserName, char **out
 
 	if (!inUserName) {
 		REDEBUG("getUserNodeRef(): No username");
-		return RLM_MODULE_FAIL;
+		RETURN_MODULE_FAIL;
 	}
 
 	tDataBuff = dsDataBufferAllocate(dsRef, 4096);
 	if (!tDataBuff) {
 		REDEBUG("Failed allocating buffer");
-		return RLM_MODULE_FAIL;
+		RETURN_MODULE_FAIL;
 	}
 
 	do {
@@ -126,8 +123,7 @@ static rlm_rcode_t getUserNodeRef(REQUEST *request, char* inUserName, char **out
 			goto error;
 		}
 
-		status = dsGetRecordEntry(nodeRef, tDataBuff, 1,
-					  &attrListRef, &pRecEntry);
+		status = dsGetRecordEntry(nodeRef, tDataBuff, 1, &attrListRef, &pRecEntry);
 		OPEN_DIR_ERROR("Failed getting record entry");
 
 		for (attrIndex = 1; (attrIndex <= pRecEntry->fRecordAttributeCount) && (status == eDSNoErr); attrIndex++) {
@@ -138,14 +134,16 @@ static rlm_rcode_t getUserNodeRef(REQUEST *request, char* inUserName, char **out
 				if (strcmp(pAttrEntry->fAttributeSignature.fBufferData, kDSNAttrMetaNodeLocation) == 0) {
 					status = dsGetAttributeValue(nodeRef, tDataBuff, 1, valueRef, &pValueEntry);
 					if (status == eDSNoErr && pValueEntry != NULL) {
-						pUserLocation = talloc_zero_array(request, char, pValueEntry->fAttributeValueData.fBufferLength + 1);
-						memcpy(pUserLocation, pValueEntry->fAttributeValueData.fBufferData, pValueEntry->fAttributeValueData.fBufferLength);
+						pUserLocation = talloc_bstrndup(request,
+										pValueEntry->fAttributeValueData.fBufferData,
+										pValueEntry->fAttributeValueData.fBufferLength);
 					}
 				} else if (strcmp(pAttrEntry->fAttributeSignature.fBufferData, kDSNAttrRecordName) == 0) {
 					status = dsGetAttributeValue(nodeRef, tDataBuff, 1, valueRef, &pValueEntry);
 					if (status == eDSNoErr && pValueEntry != NULL) {
-						*outUserName = talloc_array(request, char, pValueEntry->fAttributeValueData.fBufferLength + 1);
-						memcpy(*outUserName, pValueEntry->fAttributeValueData.fBufferData, pValueEntry->fAttributeValueData.fBufferLength);
+						*outUserName = talloc_bstrndup(request,
+									       pValueEntry->fAttributeValueData.fBufferData,
+									       pValueEntry->fAttributeValueData.fBufferLength);
 					}
 				}
 
@@ -198,14 +196,11 @@ static rlm_rcode_t getUserNodeRef(REQUEST *request, char* inUserName, char **out
 		}
 
 		result = RLM_MODULE_OK;
-	}
-	while (0);
+	} while (0);
 
-	if (pRecEntry != NULL)
-		dsDeallocRecordEntry(dsRef, pRecEntry);
+	if (pRecEntry != NULL) dsDeallocRecordEntry(dsRef, pRecEntry);
 
-	if (tDataBuff != NULL)
-		dsDataBufferDeAllocate(dsRef, tDataBuff);
+	if (tDataBuff != NULL) dsDataBufferDeAllocate(dsRef, tDataBuff);
 
 	if (pUserLocation != NULL)
 		talloc_free(pUserLocation);
@@ -222,13 +217,13 @@ static rlm_rcode_t getUserNodeRef(REQUEST *request, char* inUserName, char **out
 		dsDataListDeallocate(dsRef, pAttrType);
 		free(pAttrType);
 	}
-	if (nodeRef != 0)
-		dsCloseDirNode(nodeRef);
+	if (nodeRef != 0) dsCloseDirNode(nodeRef);
 
-	return  result;
+	RETURN_MODULE_RCODE(result);
 }
 
-rlm_rcode_t od_mschap_auth(REQUEST *request, VALUE_PAIR *challenge, VALUE_PAIR * usernamepair)
+unlang_action_t od_mschap_auth(rlm_rcode_t *p_result, request_t *request, fr_pair_t *challenge, fr_pair_t *usernamepair,
+			       mschap_auth_call_env_t *env_data)
 {
 	rlm_rcode_t		rcode		 = RLM_MODULE_OK;
 	tDirStatus		status		 = eDSNoErr;
@@ -241,15 +236,15 @@ rlm_rcode_t od_mschap_auth(REQUEST *request, VALUE_PAIR *challenge, VALUE_PAIR *
 	uint32_t		user_id_len		 = 0;
 	char			*username_string = NULL;
 	char			*short_user_name	 = NULL;
-	VALUE_PAIR		*response	 = fr_pair_find_by_num(request->packet->vps, VENDORPEC_MICROSOFT,
-									  FR_MSCHAP2_RESPONSE, TAG_ANY);
+	fr_pair_t		*response;
 #ifndef NDEBUG
 	unsigned int t;
 #endif
 
+	response = fr_pair_find_by_da_nested(&request->request_pairs, NULL, tmpl_attr_tail_da(env_data->chap2_response));
+
 	username_string = talloc_array(request, char, usernamepair->vp_length + 1);
-	if (!username_string)
-		return RLM_MODULE_FAIL;
+	if (!username_string) RETURN_MODULE_FAIL;
 
 	strlcpy(username_string, usernamepair->vp_strvalue, usernamepair->vp_length + 1);
 
@@ -257,10 +252,10 @@ rlm_rcode_t od_mschap_auth(REQUEST *request, VALUE_PAIR *challenge, VALUE_PAIR *
 	if (status != eDSNoErr) {
 		talloc_free(username_string);
 		RERROR("Failed opening directory service");
-		return RLM_MODULE_FAIL;
+		RETURN_MODULE_FAIL;
 	}
 
-	rcode = getUserNodeRef(request, username_string, &short_user_name, &userNodeRef, dsRef);
+	getUserNodeRef(&rcode, request, username_string, &short_user_name, &userNodeRef, dsRef);
 	if (rcode != RLM_MODULE_OK) {
 		if (rcode != RLM_MODULE_NOOP) {
 			RDEBUG2("od_mschap_auth: getUserNodeRef() failed");
@@ -269,7 +264,7 @@ rlm_rcode_t od_mschap_auth(REQUEST *request, VALUE_PAIR *challenge, VALUE_PAIR *
 			talloc_free(username_string);
 		if (dsRef != 0)
 			dsCloseDirService(dsRef);
-		return rcode;
+		RETURN_MODULE_RCODE(rcode);
 	}
 
 	/* We got a node; fill the stepBuffer
@@ -293,13 +288,12 @@ rlm_rcode_t od_mschap_auth(REQUEST *request, VALUE_PAIR *challenge, VALUE_PAIR *
 	   peerchal	=   response->vp_strvalue + 2 (16 octets)
 	   p24			=   response->vp_strvalue + 26 (24 octets)
 	*/
-
 	pStepBuff = dsDataBufferAllocate(dsRef, 4096);
 	tDataBuff = dsDataBufferAllocate(dsRef, 4096);
 	pAuthType = dsDataNodeAllocateString(dsRef, kDSStdAuthMSCHAP2);
 	uiCurr = 0;
 
-	user_id_len = (uint32_t)short_user_name ? strlen(short_user_name) : 0;
+	user_id_len = (uint32_t)(short_user_name ? strlen(short_user_name) : 0);
 
 	RDEBUG2("OD username_string = %s, OD short_user_name=%s (length = %u)",
 		username_string, short_user_name, user_id_len);
@@ -313,7 +307,7 @@ rlm_rcode_t od_mschap_auth(REQUEST *request, VALUE_PAIR *challenge, VALUE_PAIR *
 	RINDENT();
 	RDEBUG2("Stepbuf server challenge : ");
 	for (t = 0; t < challenge->vp_length; t++) {
-		fprintf(stderr, "%02x", challenge->vp_strvalue[t]);
+		fprintf(stderr, "%02x", (unsigned int) challenge->vp_strvalue[t]);
 	}
 	fprintf(stderr, "\n");
 #endif
@@ -329,7 +323,7 @@ rlm_rcode_t od_mschap_auth(REQUEST *request, VALUE_PAIR *challenge, VALUE_PAIR *
 #ifndef NDEBUG
 	RDEBUG2("Stepbuf peer challenge   : ");
 	for (t = 2; t < 18; t++) {
-		fprintf(stderr, "%02x", response->vp_strvalue[t]);
+		fprintf(stderr, "%02x", (unsigned int) response->vp_strvalue[t]);
 	}
 	fprintf(stderr, "\n");
 #endif
@@ -346,7 +340,7 @@ rlm_rcode_t od_mschap_auth(REQUEST *request, VALUE_PAIR *challenge, VALUE_PAIR *
 	RDEBUG2("Stepbuf p24              : ");
 	REXDENT();
 	for (t = 26; t < 50; t++) {
-		fprintf(stderr, "%02x", response->vp_strvalue[t]);
+		fprintf(stderr, "%02x", (unsigned int) response->vp_strvalue[t]);
 	}
 	fprintf(stderr, "\n");
 #endif
@@ -355,8 +349,8 @@ rlm_rcode_t od_mschap_auth(REQUEST *request, VALUE_PAIR *challenge, VALUE_PAIR *
 	user_id_len =  24; /* strlen(&(response->vp_strvalue[26])); may contain NULL byte in the middle. */
 	memcpy(&(tDataBuff->fBufferData[uiCurr]), &user_id_len, sizeof(user_id_len));
 	uiCurr += sizeof(user_id_len);
-	memcpy(&(tDataBuff->fBufferData[uiCurr]), &(response->vp_strvalue[26]),
-	       user_id_len);
+
+	memcpy(&(tDataBuff->fBufferData[uiCurr]), &(response->vp_strvalue[26]), user_id_len);
 	uiCurr += user_id_len;
 
 	/* Client generated use name (short name?) */
@@ -368,24 +362,21 @@ rlm_rcode_t od_mschap_auth(REQUEST *request, VALUE_PAIR *challenge, VALUE_PAIR *
 
 	tDataBuff->fBufferLength = uiCurr;
 
-	status = dsDoDirNodeAuth(userNodeRef, pAuthType, 1, tDataBuff,
-				 pStepBuff, NULL);
+	status = dsDoDirNodeAuth(userNodeRef, pAuthType, 1, tDataBuff, pStepBuff, NULL);
 	if (status == eDSNoErr) {
 		if (pStepBuff->fBufferLength > 4) {
-			size_t len;
+			uint32_t len;
 
 			memcpy(&len, pStepBuff->fBufferData, sizeof(len));
 			if (len == 40) {
-				char mschap_reply[42] = { '\0' };
-				pStepBuff->fBufferData[len+4] = '\0';
+				char mschap_reply[42] = "";
 				mschap_reply[0] = 'S';
 				mschap_reply[1] = '=';
 				memcpy(&(mschap_reply[2]), &(pStepBuff->fBufferData[4]), len);
-				mschap_add_reply(request, &request->reply->vps,
-						 *response->vp_strvalue,
-						 "MS-CHAP2-Success",
-						 mschap_reply, len+2);
-				RDEBUG2("dsDoDirNodeAuth returns stepbuff: %s (len=%zu)\n", mschap_reply, len);
+				if (env_data->chap2_success) mschap_add_reply(request, *response->vp_strvalue,
+						 			      tmpl_attr_tail_da(env_data->chap2_success),
+									      mschap_reply, len + 2);
+				RDEBUG2("dsDoDirNodeAuth returns stepbuff: %s (len=%u)\n", mschap_reply, (unsigned int) len);
 			}
 		}
 	}
@@ -411,10 +402,10 @@ rlm_rcode_t od_mschap_auth(REQUEST *request, VALUE_PAIR *challenge, VALUE_PAIR *
 		char *status_name = dsCopyDirStatusName(status);
 		RERROR("Authentication failed - status = %s", status_name);
 		free(status_name);
-		return RLM_MODULE_REJECT;
+		RETURN_MODULE_REJECT;
 	}
 
-	return RLM_MODULE_OK;
+	RETURN_MODULE_OK;
 }
 
 #endif /* __APPLE__ */

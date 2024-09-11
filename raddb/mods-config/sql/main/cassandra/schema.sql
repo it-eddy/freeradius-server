@@ -39,11 +39,20 @@ CREATE TABLE radacct (
   acctterminatecause text,
   framedprotocol text,
   framedipaddress text,
+  framedipv6address text,
+  framedipv6prefix text,
+  framedinterfaceid text,
+  delegatedipv6prefix text,
+  class text,
   PRIMARY KEY (acctuniqueid)
 );
 
 CREATE INDEX ON radacct(username);
 CREATE INDEX ON radacct(framedipaddress);
+CREATE INDEX ON radacct(framedipv6address);
+CREATE INDEX ON radacct(framedipv6prefix);
+CREATE INDEX ON radacct(framedinterfaceid);
+CREATE INDEX ON radacct(delegatedipv6prefix);
 CREATE INDEX ON radacct(nasipaddress);
 
 --
@@ -62,6 +71,7 @@ CREATE TABLE radpostauth (
   pass text,
   reply text,
   authdate timestamp,
+  class text,
   PRIMARY KEY (username, authdate)
 ) WITH CLUSTERING ORDER BY (authdate ASC);
 

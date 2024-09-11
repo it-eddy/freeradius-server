@@ -30,22 +30,30 @@
  * @file rlm_sql_cassandra.c
  * @brief Cassandra SQL driver
  *
- * @author Linnaea Von Lavia <le.concorde.4590@gmail.com>
- * @author Arran Cudbard-Bell <a.cudbardb@freeradius.org>
+ * @author Linnaea Von Lavia (le.concorde.4590@gmail.com)
+ * @author Arran Cudbard-Bell (a.cudbardb@freeradius.org)
  */
-#define LOG_PREFIX "rlm_sql_cassandra - "
+#define LOG_PREFIX "sql - cassandra"
 
-#include <freeradius-devel/radiusd.h>
-#include <freeradius-devel/rad_assert.h>
+#include <freeradius-devel/server/base.h>
+#include <freeradius-devel/util/debug.h>
 
+#ifdef HAVE_WDOCUMENTATION
+DIAG_OFF(documentation)
+#endif
+DIAG_OFF(strict-prototypes)  /* Seen with homebrew cassandra-cpp-driver 2.15.3 */
 #include <cassandra.h>
+DIAG_ON(strict-prototypes)
+#ifdef HAVE_WDOCUMENTATION
+DIAG_ON(documentation)
+#endif
 
 #include "rlm_sql.h"
 
 /** Cassandra cluster connection
  *
  */
-typedef struct rlm_sql_cassandra_conn {
+typedef struct {
 	CassResult const	*result;			//!< Result from executing a query.
 	CassIterator		*iterator;			//!< Row set iterator.
 
@@ -57,7 +65,7 @@ typedef struct rlm_sql_cassandra_conn {
 /** Cassandra driver instance
  *
  */
-typedef struct rlm_sql_cassandra {
+typedef struct {
 	CassCluster		*cluster;			//!< Configuration of the cassandra cluster connection.
 	CassSession		*session;			//!< Cluster's connection pool.
 	CassSsl			*ssl;				//!< Connection's SSL context.
@@ -116,8 +124,9 @@ typedef struct rlm_sql_cassandra {
 	uint32_t		spawn_max;			//!< The maximum number of connections that
 								//!< will be created concurrently.
 
-	struct timeval		spawn_retry_delay;		//!< Amount of time to wait before attempting
+	fr_time_delta_t		spawn_retry_delay;		//!< Amount of time to wait before attempting
 								//!< to reconnect.
+	bool			spawn_retry_delay_is_set;
 
 	bool			load_balance_round_robin;	//!< Enable round robin load balancing.
 
@@ -131,22 +140,22 @@ typedef struct rlm_sql_cassandra {
 								//!< dc hosts are available and the consistency level
 								//!< is LOCAL_ONE or LOCAL_QUORUM.
 
-	struct timeval		lar_exclusion_threshold;	//!< How much worse the latency me be, compared to
+	double			lar_exclusion_threshold;	//!< How much worse the latency me be, compared to
 								//!< the average latency of the best performing node
 								//!< before it's penalized.
 								//!< This gets mangled to a double.
 
-	struct timeval		lar_scale;			//!< Weight given to older latencies when calculating
+	fr_time_delta_t		lar_scale;			//!< Weight given to older latencies when calculating
 								//!< the average latency of a node. A bigger scale will
 								//!< give more weight to older latency measurements.
 
-	struct timeval		lar_retry_period;		//!< The amount of time a node is penalized by the
+	fr_time_delta_t		lar_retry_period;		//!< The amount of time a node is penalized by the
 								//!< policy before being given a second chance when
 								//!< the current average latency exceeds the calculated
 								//!< threshold
 								//!< (exclusion_threshold * best_average_latency).
 
-	struct timeval		lar_update_rate;		//!< The rate at which the best average latency is
+	fr_time_delta_t		lar_update_rate;		//!< The rate at which the best average latency is
 								//!< recomputed.
 	uint64_t		lar_min_measured;		//!< The minimum number of measurements per-host
 								//!< required to be considered by the policy.
@@ -164,85 +173,105 @@ typedef struct rlm_sql_cassandra {
 								//!< server.
 } rlm_sql_cassandra_t;
 
-static const FR_NAME_NUMBER consistency_levels[] = {
-	{ "any",		CASS_CONSISTENCY_ANY },
-	{ "one",		CASS_CONSISTENCY_ONE },
-	{ "two",		CASS_CONSISTENCY_TWO },
-	{ "three",		CASS_CONSISTENCY_THREE },
-	{ "quorum",		CASS_CONSISTENCY_QUORUM	},
-	{ "all",		CASS_CONSISTENCY_ALL },
-	{ "each_quorum",	CASS_CONSISTENCY_EACH_QUORUM },
-	{ "local_quorum",	CASS_CONSISTENCY_LOCAL_QUORUM },
-	{ "local_one",		CASS_CONSISTENCY_LOCAL_ONE },
-	{ NULL, 0 }
+static fr_table_num_sorted_t const consistency_levels[] = {
+	{ L("all"),		CASS_CONSISTENCY_ALL		},
+	{ L("any"),		CASS_CONSISTENCY_ANY		},
+	{ L("each_quorum"),	CASS_CONSISTENCY_EACH_QUORUM	},
+	{ L("local_one"),		CASS_CONSISTENCY_LOCAL_ONE	},
+	{ L("local_quorum"),	CASS_CONSISTENCY_LOCAL_QUORUM	},
+	{ L("one"),		CASS_CONSISTENCY_ONE		},
+	{ L("quorum"),		CASS_CONSISTENCY_QUORUM		},
+	{ L("three"),		CASS_CONSISTENCY_THREE		},
+	{ L("two"),		CASS_CONSISTENCY_TWO		}
 };
+static size_t consistency_levels_len = NUM_ELEMENTS(consistency_levels);
 
-static const FR_NAME_NUMBER verify_cert_table[] = {
-	{ "no",			CASS_SSL_VERIFY_NONE },
-	{ "yes",		CASS_SSL_VERIFY_PEER_CERT },
-	{ "identity",		CASS_SSL_VERIFY_PEER_IDENTITY },
-	{ NULL, 0 }
+static fr_table_num_sorted_t const verify_cert_table[] = {
+	{ L("identity"),		CASS_SSL_VERIFY_PEER_IDENTITY	},
+	{ L("no"),			CASS_SSL_VERIFY_NONE		},
+	{ L("yes"),		CASS_SSL_VERIFY_PEER_CERT	}
 };
+static size_t verify_cert_table_len = NUM_ELEMENTS(verify_cert_table);
 
-static CONF_PARSER load_balance_dc_aware_config[] = {
-	{ FR_CONF_OFFSET("local_dc", FR_TYPE_STRING, rlm_sql_cassandra_t, lbdc_local_dc) },
-	{ FR_CONF_OFFSET("hosts_per_remote_dc", FR_TYPE_UINT32, rlm_sql_cassandra_t, lbdc_hosts_per_remote_dc), .dflt = "0" },
-	{ FR_CONF_OFFSET("allow_remote_dcs_for_local_cl", FR_TYPE_BOOL, rlm_sql_cassandra_t, lbdc_allow_remote_dcs_for_local_cl), .dflt = "no" },
+static conf_parser_t load_balance_dc_aware_config[] = {
+	{ FR_CONF_OFFSET("local_dc", rlm_sql_cassandra_t, lbdc_local_dc) },
+	{ FR_CONF_OFFSET("hosts_per_remote_dc", rlm_sql_cassandra_t, lbdc_hosts_per_remote_dc), .dflt = "0" },
+	{ FR_CONF_OFFSET("allow_remote_dcs_for_local_cl", rlm_sql_cassandra_t, lbdc_allow_remote_dcs_for_local_cl), .dflt = "no" },
 	CONF_PARSER_TERMINATOR
 };
 
-static CONF_PARSER latency_aware_routing_config[] = {
-	{ FR_CONF_OFFSET("exclusion_threshold", FR_TYPE_TIMEVAL, rlm_sql_cassandra_t, lar_exclusion_threshold), .dflt = "2.0" },
-	{ FR_CONF_OFFSET("scale", FR_TYPE_TIMEVAL, rlm_sql_cassandra_t, lar_scale), .dflt = "0.1" },
-	{ FR_CONF_OFFSET("retry_period", FR_TYPE_TIMEVAL, rlm_sql_cassandra_t, lar_retry_period), .dflt = "10" },
-	{ FR_CONF_OFFSET("update_rate", FR_TYPE_TIMEVAL, rlm_sql_cassandra_t, lar_update_rate), .dflt = "0.1" },
-	{ FR_CONF_OFFSET("min_measured", FR_TYPE_UINT64, rlm_sql_cassandra_t, lar_min_measured), .dflt = "50" },
+static conf_parser_t latency_aware_routing_config[] = {
+	{ FR_CONF_OFFSET("exclusion_threshold", rlm_sql_cassandra_t, lar_exclusion_threshold), .dflt = "2.0" },
+	{ FR_CONF_OFFSET("scale", rlm_sql_cassandra_t, lar_scale), .dflt = "0.1" },
+	{ FR_CONF_OFFSET("retry_period", rlm_sql_cassandra_t, lar_retry_period), .dflt = "10" },
+	{ FR_CONF_OFFSET("update_rate", rlm_sql_cassandra_t, lar_update_rate), .dflt = "0.1" },
+	{ FR_CONF_OFFSET("min_measured", rlm_sql_cassandra_t, lar_min_measured), .dflt = "50" },
 	CONF_PARSER_TERMINATOR
 };
 
-static CONF_PARSER tls_config[] = {
-	{ FR_CONF_OFFSET("ca_file", FR_TYPE_FILE_INPUT, rlm_sql_cassandra_t, tls_ca_file) },
-	{ FR_CONF_OFFSET("certificate_file", FR_TYPE_FILE_INPUT, rlm_sql_cassandra_t, tls_certificate_file) },
-	{ FR_CONF_OFFSET("private_key_file", FR_TYPE_FILE_INPUT, rlm_sql_cassandra_t, tls_private_key_file) },
-	{ FR_CONF_OFFSET("private_key_password", FR_TYPE_STRING | FR_TYPE_SECRET, rlm_sql_cassandra_t, tls_private_key_password) },
+static conf_parser_t tls_config[] = {
+	{ FR_CONF_OFFSET_FLAGS("ca_file", CONF_FLAG_FILE_INPUT, rlm_sql_cassandra_t, tls_ca_file) },
+	{ FR_CONF_OFFSET_FLAGS("certificate_file", CONF_FLAG_FILE_INPUT, rlm_sql_cassandra_t, tls_certificate_file) },
+	{ FR_CONF_OFFSET_FLAGS("private_key_file", CONF_FLAG_FILE_INPUT, rlm_sql_cassandra_t, tls_private_key_file) },
+	{ FR_CONF_OFFSET_FLAGS("private_key_password", CONF_FLAG_SECRET, rlm_sql_cassandra_t, tls_private_key_password) },
 
-	{ FR_CONF_OFFSET("verify_cert", FR_TYPE_STRING, rlm_sql_cassandra_t, tls_verify_cert_str) },
+	{ FR_CONF_OFFSET("verify_cert", rlm_sql_cassandra_t, tls_verify_cert_str) },
 	CONF_PARSER_TERMINATOR
 };
 
-static const CONF_PARSER driver_config[] = {
-	{ FR_CONF_OFFSET("consistency", FR_TYPE_STRING, rlm_sql_cassandra_t, consistency_str), .dflt = "quorum" },
+static const conf_parser_t driver_config[] = {
+	{ FR_CONF_OFFSET("consistency", rlm_sql_cassandra_t, consistency_str), .dflt = "quorum" },
 
-	{ FR_CONF_OFFSET("protocol_version", FR_TYPE_UINT32, rlm_sql_cassandra_t, protocol_version) },
+	{ FR_CONF_OFFSET("protocol_version", rlm_sql_cassandra_t, protocol_version) },
 
-	{ FR_CONF_OFFSET("connections_per_host", FR_TYPE_UINT32, rlm_sql_cassandra_t, connections_per_host) },
-	{ FR_CONF_OFFSET("connections_per_host_max", FR_TYPE_UINT32, rlm_sql_cassandra_t, connections_per_host_max) },
+	{ FR_CONF_OFFSET("connections_per_host", rlm_sql_cassandra_t, connections_per_host) },
 
-	{ FR_CONF_OFFSET("io_threads", FR_TYPE_UINT32, rlm_sql_cassandra_t, io_threads) },
-	{ FR_CONF_OFFSET("io_queue_size", FR_TYPE_UINT32, rlm_sql_cassandra_t, io_queue_size) },
-	{ FR_CONF_OFFSET("io_flush_requests_max", FR_TYPE_UINT32, rlm_sql_cassandra_t, io_flush_requests_max) },
+/*
+ * The below functions was deprecated in 2.10
+ */
+#if (CASS_VERSION_MAJOR >= 2 && CASS_VERSION_MINOR >= 10)
+	{ FR_CONF_DEPRECATED("connections_per_host_max", rlm_sql_cassandra_t, connections_per_host_max) },
+	{ FR_CONF_DEPRECATED("io_flush_requests_max", rlm_sql_cassandra_t, io_flush_requests_max) },
 
-	{ FR_CONF_OFFSET("pending_requests_high", FR_TYPE_UINT32, rlm_sql_cassandra_t, pending_requests_high) },
-	{ FR_CONF_OFFSET("pending_requests_low", FR_TYPE_UINT32, rlm_sql_cassandra_t, pending_requests_low) },
-	{ FR_CONF_OFFSET("write_bytes_high", FR_TYPE_UINT32, rlm_sql_cassandra_t, write_bytes_high) },
-	{ FR_CONF_OFFSET("write_bytes_low", FR_TYPE_UINT32, rlm_sql_cassandra_t, write_bytes_low) },
+	{ FR_CONF_DEPRECATED("pending_requests_high", rlm_sql_cassandra_t, pending_requests_high) },
+	{ FR_CONF_DEPRECATED("pending_requests_low", rlm_sql_cassandra_t, pending_requests_low) },
 
-	{ FR_CONF_OFFSET("event_queue_size", FR_TYPE_UINT32, rlm_sql_cassandra_t, event_queue_size) },
+	{ FR_CONF_DEPRECATED("write_bytes_high", rlm_sql_cassandra_t, write_bytes_high) },
+	{ FR_CONF_DEPRECATED("write_bytes_low", rlm_sql_cassandra_t, write_bytes_low) },
 
-	{ FR_CONF_OFFSET("spawn_threshold", FR_TYPE_UINT32, rlm_sql_cassandra_t, spawn_threshold) },
-	{ FR_CONF_OFFSET("spawn_max", FR_TYPE_UINT32, rlm_sql_cassandra_t, spawn_max) },
-	{ FR_CONF_OFFSET("spawn_retry_delay", FR_TYPE_TIMEVAL, rlm_sql_cassandra_t, spawn_retry_delay) },
+	{ FR_CONF_DEPRECATED("spawn_threshold", rlm_sql_cassandra_t, spawn_threshold) },
+	{ FR_CONF_DEPRECATED("spawn_max", rlm_sql_cassandra_t, spawn_max) },
+	{ FR_CONF_DEPRECATED("spawn_retry_delay", rlm_sql_cassandra_t, spawn_retry_delay) },
+#else
+	{ FR_CONF_OFFSET("connections_per_host_max", rlm_sql_cassandra_t, connections_per_host_max) },
+	{ FR_CONF_OFFSET("io_flush_requests_max", rlm_sql_cassandra_t, io_flush_requests_max) },
 
-	{ FR_CONF_POINTER("load_balance_dc_aware", FR_TYPE_SUBSECTION, NULL), .subcs = (void const *) load_balance_dc_aware_config },
-	{ FR_CONF_OFFSET("load_balance_round_robin", FR_TYPE_BOOL, rlm_sql_cassandra_t, load_balance_round_robin), .dflt = "no" },
+	{ FR_CONF_OFFSET("pending_requests_high", rlm_sql_cassandra_t, pending_requests_high) },
+	{ FR_CONF_OFFSET("pending_requests_low", rlm_sql_cassandra_t, pending_requests_low) },
 
-	{ FR_CONF_OFFSET("token_aware_routing", FR_TYPE_BOOL, rlm_sql_cassandra_t, token_aware_routing), .dflt = "yes" },
-	{ FR_CONF_POINTER("latency_aware_routing", FR_TYPE_SUBSECTION, NULL), .subcs = (void const *) latency_aware_routing_config },
+	{ FR_CONF_OFFSET("write_bytes_high", rlm_sql_cassandra_t, write_bytes_high) },
+	{ FR_CONF_OFFSET("write_bytes_low", rlm_sql_cassandra_t, write_bytes_low) },
 
-	{ FR_CONF_OFFSET("tcp_keepalive", FR_TYPE_UINT32, rlm_sql_cassandra_t, tcp_keepalive) },
-	{ FR_CONF_OFFSET("tcp_nodelay", FR_TYPE_BOOL, rlm_sql_cassandra_t, tcp_nodelay), .dflt = "no" },
+	{ FR_CONF_OFFSET("spawn_threshold", rlm_sql_cassandra_t, spawn_threshold) },
+	{ FR_CONF_OFFSET("spawn_max", rlm_sql_cassandra_t, spawn_max) },
+	{ FR_CONF_OFFSET_IS_SET("spawn_retry_delay", FR_TYPE_TIME_DELTA, 0, rlm_sql_cassandra_t, spawn_retry_delay) },
+#endif
 
-	{ FR_CONF_POINTER("tls", FR_TYPE_SUBSECTION, NULL), .subcs = (void const *) tls_config },
+	{ FR_CONF_OFFSET("io_threads", rlm_sql_cassandra_t, io_threads) },
+	{ FR_CONF_OFFSET("io_queue_size", rlm_sql_cassandra_t, io_queue_size) },
+
+	{ FR_CONF_OFFSET("event_queue_size", rlm_sql_cassandra_t, event_queue_size) },
+
+	{ FR_CONF_POINTER("load_balance_dc_aware", 0, CONF_FLAG_SUBSECTION, NULL), .subcs = (void const *) load_balance_dc_aware_config },
+	{ FR_CONF_OFFSET("load_balance_round_robin", rlm_sql_cassandra_t, load_balance_round_robin), .dflt = "no" },
+
+	{ FR_CONF_OFFSET("token_aware_routing", rlm_sql_cassandra_t, token_aware_routing), .dflt = "yes" },
+	{ FR_CONF_POINTER("latency_aware_routing", 0, CONF_FLAG_SUBSECTION, NULL), .subcs = (void const *) latency_aware_routing_config },
+
+	{ FR_CONF_OFFSET("tcp_keepalive", rlm_sql_cassandra_t, tcp_keepalive) },
+	{ FR_CONF_OFFSET("tcp_nodelay", rlm_sql_cassandra_t, tcp_nodelay), .dflt = "no" },
+
+	{ FR_CONF_POINTER("tls", 0, CONF_FLAG_SUBSECTION, NULL), .subcs = (void const *) tls_config },
 	CONF_PARSER_TERMINATOR
 };
 
@@ -354,10 +383,10 @@ static int _sql_socket_destructor(rlm_sql_cassandra_conn_t *conn)
 	return 0;
 }
 
-static sql_rcode_t sql_socket_init(rlm_sql_handle_t *handle, rlm_sql_config_t *config, struct timeval const *timeout)
+static sql_rcode_t sql_socket_init(rlm_sql_handle_t *handle, rlm_sql_config_t const *config, fr_time_delta_t timeout)
 {
 	rlm_sql_cassandra_conn_t	*conn;
-	rlm_sql_cassandra_t		*inst = config->driver;
+	rlm_sql_cassandra_t		*inst = talloc_get_type_abort(handle->inst->driver_submodule->data, rlm_sql_cassandra_t);
 
 	MEM(conn = handle->conn = talloc_zero(handle, rlm_sql_cassandra_conn_t));
 	talloc_set_destructor(conn, _sql_socket_destructor);
@@ -377,7 +406,7 @@ static sql_rcode_t sql_socket_init(rlm_sql_handle_t *handle, rlm_sql_config_t *c
 			 *	Easier to do this here instead of mod_instantiate
 			 *	as we don't have a pointer to the pool.
 			 */
-			cass_cluster_set_connect_timeout(inst->cluster, FR_TIMEVAL_TO_MS(timeout));
+			cass_cluster_set_connect_timeout(inst->cluster, fr_time_delta_to_msec(timeout));
 
 			DEBUG2("Connecting to Cassandra cluster");
 			future = cass_session_connect_keyspace(inst->session, inst->cluster, config->sql_db);
@@ -389,6 +418,7 @@ static sql_rcode_t sql_socket_init(rlm_sql_handle_t *handle, rlm_sql_config_t *c
 				cass_future_error_message(future, &msg, &msg_len);
 				ERROR("Unable to connect: [%x] %s", (int)ret, msg);
 				cass_future_free(future);
+				pthread_mutex_unlock(&inst->connect_mutex);
 
 				return RLM_SQL_ERROR;
 			}
@@ -402,18 +432,20 @@ static sql_rcode_t sql_socket_init(rlm_sql_handle_t *handle, rlm_sql_config_t *c
 	return RLM_SQL_OK;
 }
 
-static sql_rcode_t sql_query(rlm_sql_handle_t *handle, rlm_sql_config_t *config, char const *query)
+static unlang_action_t sql_query(rlm_rcode_t *p_result, UNUSED int *priority, UNUSED request_t *request, void *uctx)
 {
-	rlm_sql_cassandra_conn_t	*conn = handle->conn;
-	rlm_sql_cassandra_t	*conf = config->driver;
+	fr_sql_query_t			*query_ctx = talloc_get_type_abort(uctx, fr_sql_query_t);
+	rlm_sql_cassandra_conn_t	*conn = query_ctx->handle->conn;
+	rlm_sql_cassandra_t		*inst = talloc_get_type_abort(query_ctx->handle->inst->driver_submodule->data, rlm_sql_cassandra_t);
+
 	CassStatement			*statement;
 	CassFuture			*future;
 	CassError			ret;
 
-	statement = cass_statement_new_n(query, talloc_array_length(query) - 1, 0);
-	if (conf->consistency_str) cass_statement_set_consistency(statement, conf->consistency);
+	statement = cass_statement_new_n(query_ctx->query_str, talloc_array_length(query_ctx->query_str) - 1, 0);
+	if (inst->consistency_str) cass_statement_set_consistency(statement, inst->consistency);
 
-	future = cass_session_execute(conf->session, statement);
+	future = cass_session_execute(inst->session, statement);
 	cass_statement_free(statement);
 
 	ret = cass_future_error_code(future);
@@ -428,51 +460,49 @@ static sql_rcode_t sql_query(rlm_sql_handle_t *handle, rlm_sql_config_t *config,
 		switch (ret) {
 		case CASS_ERROR_SERVER_SYNTAX_ERROR:
 		case CASS_ERROR_SERVER_INVALID_QUERY:
-			return RLM_SQL_QUERY_INVALID;
+			query_ctx->rcode = RLM_SQL_QUERY_INVALID;
+			RETURN_MODULE_INVALID;
 
 		default:
-			return RLM_SQL_ERROR;
+			query_ctx->rcode = RLM_SQL_ERROR;
+			RETURN_MODULE_FAIL;
 		}
 	}
 
 	conn->result = cass_future_get_result(future);
 	cass_future_free(future);
 
-	return RLM_SQL_OK;
+	query_ctx->rcode = RLM_SQL_OK;
+	RETURN_MODULE_OK;
 }
 
-static int sql_num_fields(rlm_sql_handle_t *handle, UNUSED rlm_sql_config_t *config)
+static int sql_num_rows(fr_sql_query_t *query_ctx, UNUSED rlm_sql_config_t const *config)
 {
-	rlm_sql_cassandra_conn_t *conn = handle->conn;
-
-	return conn->result ? cass_result_column_count(conn->result) : 0;
-}
-
-static int sql_num_rows(rlm_sql_handle_t *handle, UNUSED rlm_sql_config_t *config)
-{
-	rlm_sql_cassandra_conn_t *conn = handle->conn;
+	rlm_sql_cassandra_conn_t *conn = query_ctx->handle->conn;
 
 	return conn->result ? cass_result_row_count(conn->result) : 0;
 }
 
-static sql_rcode_t sql_fields(char const **out[], rlm_sql_handle_t *handle, rlm_sql_config_t *config)
+static sql_rcode_t sql_fields(char const **out[], fr_sql_query_t *query_ctx, UNUSED rlm_sql_config_t const *config)
 {
-	rlm_sql_cassandra_conn_t *conn = handle->conn;
+	rlm_sql_cassandra_conn_t *conn = query_ctx->handle->conn;
 
 	unsigned int	fields, i;
 	char const	**names;
 
-	fields = sql_num_fields(handle, config);
+	fields = conn->result ? cass_result_column_count(conn->result) : 0;
 	if (fields == 0) return RLM_SQL_ERROR;
 
-	MEM(names = talloc_array(handle, char const *, fields));
+	MEM(names = talloc_array(query_ctx, char const *, fields));
 
 	for (i = 0; i < fields; i++) {
 		const char *col_name;
 		size_t	   col_name_len;
 
 		/* Writes out a pointer to a buffer in the result */
-		cass_result_column_name(conn->result, i, &col_name, &col_name_len);
+		if (cass_result_column_name(conn->result, i, &col_name, &col_name_len) != CASS_OK) {
+			col_name = "<INVALID>";
+		}
 		names[i] = col_name;
 	}
 
@@ -481,10 +511,10 @@ static sql_rcode_t sql_fields(char const **out[], rlm_sql_handle_t *handle, rlm_
 	return RLM_SQL_OK;
 }
 
-static sql_rcode_t sql_fetch_row(rlm_sql_row_t *out, rlm_sql_handle_t *handle, rlm_sql_config_t *config)
+static unlang_action_t sql_fetch_row(rlm_rcode_t *p_result, UNUSED int *priority, UNUSED request_t *request, void *uctx)
 {
-
-	rlm_sql_cassandra_conn_t 	*conn = handle->conn;
+	fr_sql_query_t			*query_ctx = talloc_get_type_abort(uctx, fr_sql_query_t);
+	rlm_sql_cassandra_conn_t 	*conn = query_ctx->handle->conn;
 	CassRow	const 			*cass_row;
 	int				fields, i;
 	char				**row;
@@ -499,30 +529,33 @@ do {\
 	}\
 	sql_set_last_error_printf(conn, "Failed to retrieve " _t " data at column %s (%d): %s", \
 				  _col_name, i, cass_error_desc(_ret));\
-	TALLOC_FREE(handle->row);\
-	return RLM_SQL_ERROR;\
+	TALLOC_FREE(query_ctx->row);\
+	query_ctx->rcode = RLM_SQL_ERROR;\
+	RETURN_MODULE_FAIL;\
 } while(0)
 
-	if (!conn->result) return RLM_SQL_OK;				/* no result */
-
-	*out = NULL;
+	query_ctx->rcode = RLM_SQL_OK;
+	if (!conn->result) RETURN_MODULE_OK;				/* no result */
 
 	/*
 	 *	Start of the result set, initialise the iterator.
 	 */
 	if (!conn->iterator) conn->iterator = cass_iterator_from_result(conn->result);
-	if (!conn->iterator) return RLM_SQL_OK;				/* no result */
+	if (!conn->iterator) RETURN_MODULE_OK;				/* no result */
 
-	if (!cass_iterator_next(conn->iterator)) return RLM_SQL_NO_MORE_ROWS;	/* no more rows */
+	if (!cass_iterator_next(conn->iterator)) {
+		query_ctx->rcode = RLM_SQL_NO_MORE_ROWS;		/* no more rows */
+		RETURN_MODULE_OK;
+	}
 
 	cass_row = cass_iterator_get_row(conn->iterator);		/* this shouldn't fail ? */
-	fields = sql_num_fields(handle, config);			/* get the number of fields... */
+	fields = cass_result_column_count(conn->result);		/* get the number of fields... */
 
 	/*
 	 *	Free the previous result (also gets called on finish_query)
 	 */
-	talloc_free(handle->row);
-	MEM(row = handle->row = talloc_zero_array(handle, char *, fields + 1));
+	talloc_free(query_ctx->row);
+	MEM(row = query_ctx->row = talloc_zero_array(query_ctx, char *, fields + 1));
 
 	for (i = 0; i < fields; i++) {
 		CassValue const	*value;
@@ -603,21 +636,21 @@ do {\
 			sql_set_last_error_printf(conn,
 						  "Failed to retrieve data at column %s (%d): Unsupported data type",
 						  col_name, i);
-			talloc_free(handle->row);
-			return RLM_SQL_ERROR;
+			talloc_free(query_ctx->row);
+			query_ctx->rcode = RLM_SQL_ERROR;
+			RETURN_MODULE_FAIL;
 		}
 		}
 	}
-	*out = row;
 
-	return RLM_SQL_OK;
+	RETURN_MODULE_OK;
 }
 
-static sql_rcode_t sql_free_result(rlm_sql_handle_t *handle, UNUSED rlm_sql_config_t *config)
+static sql_rcode_t sql_free_result(fr_sql_query_t *query_ctx, UNUSED rlm_sql_config_t const *config)
 {
-	rlm_sql_cassandra_conn_t *conn = handle->conn;
+	rlm_sql_cassandra_conn_t *conn = query_ctx->handle->conn;
 
-	if (handle->row) TALLOC_FREE(handle->row);
+	if (query_ctx->row) TALLOC_FREE(query_ctx->row);
 
 	if (conn->iterator) {
 		cass_iterator_free(conn->iterator);
@@ -633,9 +666,9 @@ static sql_rcode_t sql_free_result(rlm_sql_handle_t *handle, UNUSED rlm_sql_conf
 }
 
 static size_t sql_error(UNUSED TALLOC_CTX *ctx, sql_log_entry_t out[], size_t outlen,
-			rlm_sql_handle_t *handle, UNUSED rlm_sql_config_t *config)
+			fr_sql_query_t *query_ctx, UNUSED rlm_sql_config_t const *config)
 {
-	rlm_sql_cassandra_conn_t *conn = handle->conn;
+	rlm_sql_cassandra_conn_t *conn = query_ctx->handle->conn;
 
 	if (conn->last_error.msg && (outlen >= 1)) {
 		out[0].msg = conn->last_error.msg;
@@ -648,18 +681,18 @@ static size_t sql_error(UNUSED TALLOC_CTX *ctx, sql_log_entry_t out[], size_t ou
 	return 0;
 }
 
-static sql_rcode_t sql_finish_query(rlm_sql_handle_t *handle, rlm_sql_config_t *config)
+static sql_rcode_t sql_finish_query(fr_sql_query_t *query_ctx, rlm_sql_config_t const *config)
 {
-	rlm_sql_cassandra_conn_t *conn = handle->conn;
+	rlm_sql_cassandra_conn_t *conn = query_ctx->handle->conn;
 
 	/*
 	 *	Clear our local log buffer, and free any messages which weren't
-	 *	reconfiged (so we don't leak memory).
+	 *	reconfigured (so we don't leak memory).
 	 */
 	talloc_free_children(conn->log_ctx);
 	memset(&conn->last_error, 0, sizeof(conn->last_error));
 
-	return sql_free_result(handle, config);
+	return sql_free_result(query_ctx, config);
 }
 
 /*
@@ -669,14 +702,14 @@ static sql_rcode_t sql_finish_query(rlm_sql_handle_t *handle, rlm_sql_config_t *
  *	There's a good article on it here:
  *		http://planetcassandra.org/blog/how-to-do-an-upsert-in-cassandra/
  */
-static int sql_affected_rows(UNUSED rlm_sql_handle_t *handle, UNUSED rlm_sql_config_t *config)
+static int sql_affected_rows(UNUSED fr_sql_query_t *query_ctx, UNUSED rlm_sql_config_t const *config)
 {
 	return 1;
 }
 
-static int mod_detach(void *instance)
+static int mod_detach(module_detach_ctx_t const *mctx)
 {
-	rlm_sql_cassandra_t *inst = instance;
+	rlm_sql_cassandra_t *inst = talloc_get_type_abort(mctx->mi->data, rlm_sql_cassandra_t);
 
 	if (inst->ssl) cass_ssl_free(inst->ssl);
 	if (inst->session) cass_session_free(inst->session);	/* also synchronously closes the session */
@@ -687,13 +720,15 @@ static int mod_detach(void *instance)
 	return 0;
 }
 
-static int mod_instantiate(rlm_sql_config_t const *config, void *instance, CONF_SECTION *cs)
+static int mod_instantiate(module_inst_ctx_t const *mctx)
 {
-	bool				do_tls = false;
-	bool				do_latency_aware_routing = false;
-	rlm_sql_cassandra_t		*inst = instance;
-
-	CassCluster *cluster;
+	rlm_sql_t const		*parent = talloc_get_type_abort(mctx->mi->parent->data, rlm_sql_t);
+	rlm_sql_config_t const	*config = &parent->config;
+	rlm_sql_cassandra_t	*inst = talloc_get_type_abort(mctx->mi->data, rlm_sql_cassandra_t);
+	bool			do_tls = false;
+	bool			do_latency_aware_routing = false;
+	CassCluster 		*cluster;
+	int			ret;
 
 #define DO_CASS_OPTION(_opt, _x) \
 do {\
@@ -704,8 +739,8 @@ do {\
 	}\
 } while (0)
 
-	if (pthread_mutex_init(&inst->connect_mutex, NULL) < 0) {
-		ERROR("Failed initializing mutex: %s", fr_syserror(errno));
+	if ((ret = pthread_mutex_init(&inst->connect_mutex, NULL)) < 0) {
+		ERROR("Failed initializing mutex: %s", fr_syserror(ret));
 		TALLOC_FREE(inst);
 		return -1;
 	}
@@ -714,8 +749,8 @@ do {\
 	 *	This has to be done before we call cf_section_parse
 	 *	as it sets default values, and creates the section.
 	 */
-	if (cf_section_find(cs, "tls"), NULL) do_tls = true;
-	if (cf_section_find(cs, "latency_aware_routing"), NULL) do_latency_aware_routing = true;
+	if (cf_section_find(mctx->mi->conf, "tls", NULL)) do_tls = true;
+	if (cf_section_find(mctx->mi->conf, "latency_aware_routing", NULL)) do_latency_aware_routing = true;
 
 	DEBUG4("Configuring CassCluster structure");
 	cluster = inst->cluster = cass_cluster_new();
@@ -727,7 +762,10 @@ do {\
 	DO_CASS_OPTION("sql_server", cass_cluster_set_contact_points(cluster, config->sql_server));
 	if (config->sql_port) DO_CASS_OPTION("sql_port", cass_cluster_set_port(cluster, config->sql_port));
 	/* Can't fail */
-	if (config->query_timeout) cass_cluster_set_request_timeout(cluster, config->query_timeout * 1000);
+	if (fr_time_delta_ispos(config->query_timeout)) {
+		cass_cluster_set_request_timeout(cluster, fr_time_delta_to_msec(config->query_timeout));
+	}
+
 	/* Can't fail */
 	if (config->sql_login && config->sql_password) cass_cluster_set_credentials(cluster, config->sql_login,
 										    config->sql_password);
@@ -738,7 +776,7 @@ do {\
 	if (inst->consistency_str) {
 		int consistency;
 
-		consistency = fr_str2int(consistency_levels, inst->consistency_str, -1);
+		consistency = fr_table_value_by_str(consistency_levels, inst->consistency_str, -1);
 		if (consistency < 0) {
 			ERROR("Invalid consistency level \"%s\"", inst->consistency_str);
 			return -1;
@@ -757,19 +795,14 @@ do {\
 			       						  inst->connections_per_host));
 	}
 
+	/*
+	 *	The below functions was deprecated in 2.10
+	 */
+#if (CASS_VERSION_MAJOR <= 2 && CASS_VERSION_MINOR < 10)
 	if (inst->connections_per_host_max) {
 		DO_CASS_OPTION("connections_per_host_max",
 				cass_cluster_set_max_connections_per_host(inst->cluster,
 									  inst->connections_per_host_max));
-	}
-
-	if (inst->io_threads) {
-		DO_CASS_OPTION("io_threads", cass_cluster_set_num_threads_io(inst->cluster, inst->io_threads));
-	}
-
-	if (inst->io_queue_size) {
-		DO_CASS_OPTION("io_queue_size",
-			       cass_cluster_set_num_threads_io(inst->cluster, inst->io_queue_size));
 	}
 
 	if (inst->io_flush_requests_max) {
@@ -802,11 +835,6 @@ do {\
 			       						   inst->write_bytes_low));
 	}
 
-	if (inst->event_queue_size) {
-		DO_CASS_OPTION("event_queue_size",
-			       cass_cluster_set_num_threads_io(inst->cluster, inst->event_queue_size));
-	}
-
 	if (inst->spawn_threshold) {
 		DO_CASS_OPTION("spawn_threshold",
 			       cass_cluster_set_max_concurrent_requests_threshold(inst->cluster,
@@ -818,12 +846,23 @@ do {\
 			       cass_cluster_set_max_concurrent_creation(inst->cluster, inst->spawn_max));
 	}
 
-	{
-		uint32_t delay;
+	if (inst->spawn_retry_delay_is_set) {
+		cass_cluster_set_reconnect_wait_time(inst->cluster, fr_time_delta_to_msec(inst->spawn_retry_delay));
+	}
+#endif
 
-		delay = (inst->spawn_retry_delay.tv_sec * (uint64_t)1000) +
-			(inst->spawn_retry_delay.tv_usec / 1000);
-		if (delay) cass_cluster_set_reconnect_wait_time(inst->cluster, delay);
+	if (inst->event_queue_size) {
+		DO_CASS_OPTION("event_queue_size",
+			       cass_cluster_set_num_threads_io(inst->cluster, inst->event_queue_size));
+	}
+
+	if (inst->io_queue_size) {
+		DO_CASS_OPTION("io_queue_size",
+			       cass_cluster_set_num_threads_io(inst->cluster, inst->io_queue_size));
+	}
+
+	if (inst->io_threads) {
+		DO_CASS_OPTION("io_threads", cass_cluster_set_num_threads_io(inst->cluster, inst->io_threads));
 	}
 
 	if (inst->load_balance_round_robin) cass_cluster_set_load_balance_round_robin(inst->cluster);
@@ -839,27 +878,15 @@ do {\
 	}
 
 	if (do_latency_aware_routing) {
-		cass_double_t	exclusion_threshold;
-		uint64_t	scale_ms, retry_period_ms, update_rate_ms;
-
-		exclusion_threshold = inst->lar_exclusion_threshold.tv_sec +
-				      (inst->lar_exclusion_threshold.tv_usec / 1000000);
-
-		scale_ms = (inst->lar_scale.tv_sec * (uint64_t)1000) + (inst->lar_scale.tv_usec / 1000);
-		retry_period_ms = (inst->lar_retry_period.tv_sec * (uint64_t)1000) +
-				  (inst->lar_retry_period.tv_usec / 1000);
-		update_rate_ms = (inst->lar_update_rate.tv_sec * (uint64_t)1000) +
-				 (inst->lar_update_rate.tv_usec / 1000);
-
 		/* Can't fail */
 		cass_cluster_set_latency_aware_routing(inst->cluster, true);
 
 		/* Can't fail */
 		cass_cluster_set_latency_aware_routing_settings(inst->cluster,
-							        exclusion_threshold,
-							        scale_ms,
-							        retry_period_ms,
-							        update_rate_ms,
+							        (cass_double_t)inst->lar_exclusion_threshold,
+							        fr_time_delta_to_msec(inst->lar_scale),
+							        fr_time_delta_to_msec(inst->lar_retry_period),
+							        fr_time_delta_to_msec(inst->lar_update_rate),
 							        inst->lar_min_measured);
 	}
 
@@ -875,7 +902,7 @@ do {\
 		if (inst->tls_verify_cert_str) {
 			int	verify_cert;
 
-			verify_cert = fr_str2int(verify_cert_table, inst->tls_verify_cert_str, -1);
+			verify_cert = fr_table_value_by_str(verify_cert_table, inst->tls_verify_cert_str, -1);
 			if (verify_cert < 0) {
 				ERROR("Invalid certificate validation type \"%s\", "
 				      "must be one of 'yes', 'no', 'identity'", inst->tls_verify_cert_str);
@@ -910,7 +937,12 @@ do {\
 
 static void mod_unload(void)
 {
-	 cass_log_cleanup();	/* must be last call to libcassandra */
+	/*
+	 *	The function cass_log_cleanup() was deprecated in 2.0.1
+	 */
+#if (CASS_VERSION_MAJOR <= 2 && CASS_VERSION_MINOR <= 0)
+	cass_log_cleanup();	/* must be last call to libcassandra */
+#endif
 }
 
 static int mod_load(void)
@@ -930,18 +962,19 @@ static int mod_load(void)
 /* Exported to rlm_sql */
 extern rlm_sql_driver_t rlm_sql_cassandra;
 rlm_sql_driver_t rlm_sql_cassandra = {
-	.name				= "rlm_sql_cassandra",
-	.magic				= RLM_MODULE_INIT,
-	.inst_size			= sizeof(rlm_sql_cassandra_t),
-	.load				= mod_load,
-	.unload				= mod_unload,
-	.config				= driver_config,
-	.mod_instantiate		= mod_instantiate,
-	.detach				= mod_detach,
+	.common = {
+		.name				= "sql_cassandra",
+		.magic				= MODULE_MAGIC_INIT,
+		.inst_size			= sizeof(rlm_sql_cassandra_t),
+		.onload				= mod_load,
+		.unload				= mod_unload,
+		.config				= driver_config,
+		.instantiate			= mod_instantiate,
+		.detach				= mod_detach
+	},
 	.sql_socket_init		= sql_socket_init,
 	.sql_query			= sql_query,
 	.sql_select_query		= sql_query,
-	.sql_num_fields			= sql_num_fields,
 	.sql_num_rows			= sql_num_rows,
 	.sql_affected_rows		= sql_affected_rows,
 	.sql_fields			= sql_fields,

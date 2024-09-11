@@ -19,34 +19,30 @@
  * @file rlm_utf8.c
  * @brief Enforce UTF8 encoding in strings.
  *
- * @copyright 2000,2006  The FreeRADIUS server project
+ * @copyright 2000,2006 The FreeRADIUS server project
  */
 RCSID("$Id$")
 
-#include <freeradius-devel/radiusd.h>
-#include <freeradius-devel/modules.h>
+#include <freeradius-devel/server/base.h>
+#include <freeradius-devel/server/module_rlm.h>
 
 /*
  *	Reject any non-UTF8 data.
  */
-static rlm_rcode_t CC_HINT(nonnull) mod_utf8_clean(UNUSED void *instance, UNUSED void *thread, REQUEST *request)
+static unlang_action_t CC_HINT(nonnull) mod_utf8_clean(rlm_rcode_t *p_result, UNUSED module_ctx_t const *mctx, request_t *request)
 {
 	size_t		i, len;
-	VALUE_PAIR	*vp;
-	fr_cursor_t	cursor;
 
-	for (vp = fr_cursor_init(&cursor, &request->packet->vps);
-	     vp;
-	     vp = fr_cursor_next(&cursor)) {
+	fr_pair_list_foreach(&request->request_pairs, vp) {
 		if (vp->vp_type != FR_TYPE_STRING) continue;
 
 		for (i = 0; i < vp->vp_length; i += len) {
 			len = fr_utf8_char(&vp->vp_octets[i], -1);
-			if (len == 0) return RLM_MODULE_FAIL;
+			if (len == 0) RETURN_MODULE_FAIL;
 		}
 	}
 
-	return RLM_MODULE_NOOP;
+	RETURN_MODULE_NOOP;
 }
 
 /*
@@ -54,20 +50,20 @@ static rlm_rcode_t CC_HINT(nonnull) mod_utf8_clean(UNUSED void *instance, UNUSED
  *	That is, everything else should be 'static'.
  *
  *	If the module needs to temporarily modify it's instantiation
- *	data, the type should be changed to RLM_TYPE_THREAD_UNSAFE.
+ *	data, the type should be changed to MODULE_TYPE_THREAD_UNSAFE.
  *	The server will then take care of ensuring that the module
  *	is single-threaded.
  */
-extern rad_module_t rlm_utf8;
-rad_module_t rlm_utf8 = {
-	.magic		= RLM_MODULE_INIT,
-	.name		= "utf8",
-	.type		= RLM_TYPE_THREAD_SAFE,
-	.methods = {
-		[MOD_AUTHORIZE]		= mod_utf8_clean,
-		[MOD_PREACCT]		= mod_utf8_clean,
-#ifdef WITH_COA
-		[MOD_RECV_COA]		= mod_utf8_clean
-#endif
+extern module_rlm_t rlm_utf8;
+module_rlm_t rlm_utf8 = {
+	.common = {
+		.magic		= MODULE_MAGIC_INIT,
+		.name		= "utf8"
 	},
+	.method_group = {
+		.bindings = (module_method_binding_t[]){
+			{ .section = SECTION_NAME(CF_IDENT_ANY, CF_IDENT_ANY), .method = mod_utf8_clean },
+			MODULE_BINDING_TERMINATOR
+		}
+	}
 };

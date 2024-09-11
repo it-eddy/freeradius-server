@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
@@ -20,27 +21,30 @@
  * @brief Couchbase wrapper function prototypes and datatypes.
  * @file couchbase.h
  *
- * @author Aaron Hurt <ahurt@anbcs.com>
+ * @author Aaron Hurt (ahurt@anbcs.com)
  * @copyright 2013-2014 The FreeRADIUS Server Project.
  */
-
-#ifndef _couchbase_h_
-#define _couchbase_h_
-
 RCSIDH(couchbase_h, "$Id$")
 
+#ifdef HAVE_WDOCUMENTATION
+DIAG_OFF(documentation)
+#endif
 #include <libcouchbase/couchbase.h>
-#include "../rlm_json/json.h"
+#ifdef HAVE_WDOCUMENTATION
+DIAG_ON(documentation)
+#endif
+
+#include <freeradius-devel/json/base.h>
 
 /** Information relating to the parsing of Couchbase document payloads
  *
  * This structure holds various references to json-c objects used when parsing
  * Couchbase document payloads.
  */
-typedef struct cookie_t {
-	json_object *jobj;              //!< JSON objects handled by the json-c library.
-	json_tokener *jtok;             //!< JSON tokener objects handled by the json-c library.
-	enum json_tokener_error jerr;   //!< Error values produced by the json-c library.
+typedef struct {
+	json_object		*jobj;	//!< JSON objects handled by the json-c library.
+	json_tokener		*jtok;	//!< JSON tokener objects handled by the json-c library.
+	enum json_tokener_error	jerr;   //!< Error values produced by the json-c library.
 } cookie_t;
 
 /** Union of constant and non-constant pointers
@@ -52,6 +56,23 @@ typedef union cookie_u {
 	const void *cdata;    //!< Constant pointer to cookie payload (@p cookie_t).
 	void *data;           //!< Non-constant pointer to data payload (@p cookie_t).
 } cookie_u;
+
+/**
+ * This may be used to provide a simple interface from a command line or higher
+ * evel language to allow the setting of specific key-value pairs.
+ *
+ * Options ref: https://docs.couchbase.com/sdk-api/couchbase-c-client-2.5.6/group__lcb-cntl.html
+ */
+typedef struct couchbase_opts_s couchbase_opts_t;
+struct couchbase_opts_s {
+    char *key;				//!< Key value for lcb_cntl_string().
+    char *val;				//!< Value for the key used in lcb_cntl_string().
+    couchbase_opts_t *next; 		//!< Linked list.
+};
+
+extern HIDDEN fr_dict_attr_t const *attr_acct_status_type;
+extern HIDDEN fr_dict_attr_t const *attr_acct_session_time;
+extern HIDDEN fr_dict_attr_t const *attr_event_timestamp;
 
 /* couchbase statistics callback */
 void couchbase_stat_callback(lcb_t instance, const void *cookie, lcb_error_t error,
@@ -70,8 +91,8 @@ void couchbase_http_data_callback(lcb_http_request_t request, lcb_t instance,
 	const void *cookie, lcb_error_t error, const lcb_http_resp_t *resp);
 
 /* create a couchbase instance and connect to the cluster */
-lcb_error_t couchbase_init_connection(lcb_t *instance, const char *host, const char *bucket, const char *pass,
-				      lcb_uint32_t timeout);
+lcb_error_t couchbase_init_connection(lcb_t *instance, const char *host, const char *bucket, const char *user,
+					const char *pass, lcb_uint32_t timeout, const couchbase_opts_t *opts);
 
 /* get server statistics */
 lcb_error_t couchbase_server_stats(lcb_t instance, const void *cookie);
@@ -84,5 +105,3 @@ lcb_error_t couchbase_get_key(lcb_t instance, const void *cookie, const char *ke
 
 /* query a couchbase view via http */
 lcb_error_t couchbase_query_view(lcb_t instance, const void *cookie, const char *path, const char *post);
-
-#endif /* _couchbase_h_ */

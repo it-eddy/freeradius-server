@@ -20,264 +20,36 @@
  * @file protocols/radius/encode.c
  * @brief Functions to encode RADIUS attributes
  *
- * @copyright 2000-2003,2006-2015  The FreeRADIUS server project
+ * @copyright 2000-2003,2006-2015 The FreeRADIUS server project
  */
 RCSID("$Id$")
 
-#include <freeradius-devel/libradius.h>
-#include <freeradius-devel/md5.h>
+#include <freeradius-devel/util/dbuff.h>
+#include <freeradius-devel/util/md5.h>
+#include <freeradius-devel/util/struct.h>
 #include <freeradius-devel/io/test_point.h>
+#include <freeradius-devel/protocol/radius/freeradius.internal.h>
+#include "attrs.h"
 
-static unsigned int salt_offset = 0;
+#define TAG_VALID(x)		((x) > 0 && (x) < 0x20)
 
-static ssize_t encode_value(uint8_t *out, size_t outlen,
-			    fr_dict_attr_t const **tlv_stack, int depth,
-			    vp_cursor_t *cursor, void *encoder_ctx);
+static ssize_t encode_value(fr_dbuff_t *dbuff,
+			    fr_da_stack_t *da_stack, unsigned int depth,
+			    fr_dcursor_t *cursor, void *encode_ctx);
 
-static ssize_t encode_rfc_hdr_internal(uint8_t *out, size_t outlen,
-				       fr_dict_attr_t const **tlv_stack, unsigned int depth,
-				       vp_cursor_t *cursor, void *encoder_ctx);
+static ssize_t encode_child(fr_dbuff_t *dbuff,
+			    fr_da_stack_t *da_stack, unsigned int depth,
+			    fr_dcursor_t *cursor, void *encode_ctx);
 
-static ssize_t encode_tlv_hdr(uint8_t *out, size_t outlen,
-			      fr_dict_attr_t const **tlv_stack, unsigned int depth,
-			      vp_cursor_t *cursor, void *encoder_ctx);
-
-
-/** Determine if the current attribute is encodable, or find the first one that is
+/** "encrypt" a password RADIUS style
  *
- * @param cursor to iterate over.
- * @return encodable VALUE_PAIR, or NULL if none available.
+ * Input and output buffers can be identical if in-place encryption is needed.
  */
-static inline VALUE_PAIR *first_encodable(vp_cursor_t *cursor)
+static ssize_t encode_password(fr_dbuff_t *dbuff, fr_dbuff_marker_t *input, size_t inlen, fr_radius_encode_ctx_t *packet_ctx)
 {
-	VALUE_PAIR *vp;
-
-	for (vp = fr_pair_cursor_current(cursor); vp && vp->da->flags.internal; vp = fr_pair_cursor_next(cursor));
-	return fr_pair_cursor_current(cursor);
-}
-
-/** Find the next attribute to encode
- *
- * @param cursor to iterate over.
- * @return encodable VALUE_PAIR, or NULL if none available.
- */
-static inline VALUE_PAIR *next_encodable(vp_cursor_t *cursor)
-{
-	VALUE_PAIR *vp;
-
-	for (;;) {
-		vp = fr_pair_cursor_next(cursor);
-		if (!vp || !vp->da->flags.internal) break;
-	}
-
-	return fr_pair_cursor_current(cursor);
-}
-
-/** Encode a CHAP password
- *
- * @bug FIXME: might not work with Ascend because
- * we use vp->vp_length, and Ascend gear likes
- * to send an extra '\0' in the string!
- */
-int fr_radius_encode_chap_password(uint8_t *output, RADIUS_PACKET *packet, int id, VALUE_PAIR *password)
-{
-	int		i;
-	uint8_t		*ptr;
-	uint8_t		string[FR_MAX_STRING_LEN * 2 + 1];
-	VALUE_PAIR	*challenge;
-
-	/*
-	 *	Sanity check the input parameters
-	 */
-	if ((packet == NULL) || (password == NULL)) return -1;
-
-	/*
-	 *	Note that the password VP can be EITHER
-	 *	a User-Password attribute (from a check-item list),
-	 *	or a CHAP-Password attribute (the client asking
-	 *	the library to encode it).
-	 */
-
-	i = 0;
-	ptr = string;
-	*ptr++ = id;
-
-	i++;
-	memcpy(ptr, password->vp_strvalue, password->vp_length);
-	ptr += password->vp_length;
-	i += password->vp_length;
-
-	/*
-	 *	Use Chap-Challenge pair if present,
-	 *	Request Authenticator otherwise.
-	 */
-	challenge = fr_pair_find_by_num(packet->vps, 0, FR_CHAP_CHALLENGE, TAG_ANY);
-	if (challenge) {
-		memcpy(ptr, challenge->vp_strvalue, challenge->vp_length);
-		i += challenge->vp_length;
-	} else {
-		memcpy(ptr, packet->vector, AUTH_VECTOR_LEN);
-		i += AUTH_VECTOR_LEN;
-	}
-
-	*output = id;
-	fr_md5_calc((uint8_t *)output + 1, (uint8_t *)string, i);
-
-	return 0;
-}
-
-/** Encode Tunnel-Password attributes when sending them out on the wire
- *
- * int *pwlen is updated to the new length of the encrypted
- * password - a multiple of 16 bytes.
- *
- * This is per RFC-2868 which adds a two char SALT to the initial intermediate
- * value MD5 hash.
- */
-int fr_radius_encode_tunnel_password(char *passwd, size_t *pwlen, char const *secret, uint8_t const *vector)
-{
-	uint8_t		buffer[AUTH_VECTOR_LEN + FR_MAX_STRING_LEN + 3];
-	unsigned char	digest[AUTH_VECTOR_LEN];
-	char		*salt;
-	int		i, n, secretlen;
-	unsigned	len, n2;
-
-	len = *pwlen;
-
-	if (len > 127) len = 127;
-
-	/*
-	 *	Shift the password 3 positions right to place a salt and original
-	 *	length, tag will be added automatically on packet send.
-	 */
-	for (n = len ; n >= 0 ; n--) passwd[n + 3] = passwd[n];
-	salt = passwd;
-	passwd += 2;
-
-	/*
-	 *	save original password length as first password character;
-	 */
-	*passwd = len;
-	len += 1;
-
-
-	/*
-	 *	Generate salt.  The RFC's say:
-	 *
-	 *	The high bit of salt[0] must be set, each salt in a
-	 *	packet should be unique, and they should be random
-	 *
-	 *	So, we set the high bit, add in a counter, and then
-	 *	add in some CSPRNG data.  should be OK..
-	 */
-	salt[0] = (0x80 | (((salt_offset++) & 0x0f) << 3) | (fr_rand() & 0x07));
-	salt[1] = fr_rand();
-
-	/*
-	 *	Padd password to multiple of AUTH_PASS_LEN bytes.
-	 */
-	n = len % AUTH_PASS_LEN;
-	if (n) {
-		n = AUTH_PASS_LEN - n;
-		for (; n > 0; n--, len++) passwd[len] = 0;
-	}
-	/* set new password length */
-	*pwlen = len + 2;
-
-	/*
-	 *	Use the secret to setup the decryption digest
-	 */
-	secretlen = talloc_array_length(secret) - 1;
-	memcpy(buffer, secret, secretlen);
-
-	for (n2 = 0; n2 < len; n2 +=AUTH_PASS_LEN) {
-		if (!n2) {
-			memcpy(buffer + secretlen, vector, AUTH_VECTOR_LEN);
-			memcpy(buffer + secretlen + AUTH_VECTOR_LEN, salt, 2);
-			fr_md5_calc(digest, buffer, secretlen + AUTH_VECTOR_LEN + 2);
-		} else {
-			memcpy(buffer + secretlen, passwd + n2 - AUTH_PASS_LEN, AUTH_PASS_LEN);
-			fr_md5_calc(digest, buffer, secretlen + AUTH_PASS_LEN);
-		}
-		for (i = 0; i < AUTH_PASS_LEN; i++) passwd[i + n2] ^= digest[i];
-	}
-	passwd[n2] = 0;
-	return 0;
-}
-
-/** Encode password
- *
- * We assume that the passwd buffer passed is big enough.
- * RFC2138 says the password is max 128 chars, so the size
- * of the passwd buffer must be at least 129 characters.
- * Preferably it's just FR_MAX_STRING_LEN.
- *
- * int *pwlen is updated to the new length of the encrypted
- * password - a multiple of 16 bytes.
- */
-int fr_radius_encode_password(char *passwd, size_t *pwlen, char const *secret, uint8_t const *vector)
-{
-	FR_MD5_CTX	context, old;
-	uint8_t		digest[AUTH_VECTOR_LEN];
-	int		i, n, secretlen;
-	int		len;
-
-	/*
-	 *	RFC maximum is 128 bytes.
-	 *
-	 *	If length is zero, pad it out with zeros.
-	 *
-	 *	If the length isn't aligned to 16 bytes,
-	 *	zero out the extra data.
-	 */
-	len = *pwlen;
-
-	if (len > 128) len = 128;
-
-	if (len == 0) {
-		memset(passwd, 0, AUTH_PASS_LEN);
-		len = AUTH_PASS_LEN;
-	} else if ((len % AUTH_PASS_LEN) != 0) {
-		memset(&passwd[len], 0, AUTH_PASS_LEN - (len % AUTH_PASS_LEN));
-		len += AUTH_PASS_LEN - (len % AUTH_PASS_LEN);
-	}
-	*pwlen = len;
-
-	/*
-	 *	Use the secret to setup the decryption digest
-	 */
-	secretlen = talloc_array_length(secret) - 1;
-
-	fr_md5_init(&context);
-	fr_md5_update(&context, (uint8_t const *) secret, secretlen);
-	fr_md5_copy(&old, &context); /* save intermediate work */
-
-	/*
-	 *	Encrypt it in place.  Don't bother checking
-	 *	len, as we've ensured above that it's OK.
-	 */
-	for (n = 0; n < len; n += AUTH_PASS_LEN) {
-		if (n == 0) {
-			fr_md5_update(&context, vector, AUTH_PASS_LEN);
-			fr_md5_final(digest, &context);
-		} else {
-			fr_md5_copy(&context, &old);
-			fr_md5_update(&context, (uint8_t *) passwd + n - AUTH_PASS_LEN, AUTH_PASS_LEN);
-			fr_md5_final(digest, &context);
-		}
-
-		for (i = 0; i < AUTH_PASS_LEN; i++) passwd[i + n] ^= digest[i];
-	}
-
-	return 0;
-}
-
-static void encode_password(uint8_t *out, ssize_t *outlen, uint8_t const *input, size_t inlen,
-			    char const *secret, uint8_t const *vector)
-{
-	FR_MD5_CTX	context, old;
-	uint8_t		digest[AUTH_VECTOR_LEN];
-	uint8_t		passwd[MAX_PASS_LEN];
+	fr_md5_ctx_t	*md5_ctx, *md5_ctx_old;
+	uint8_t	digest[RADIUS_AUTH_VECTOR_LENGTH];
+	uint8_t	passwd[RADIUS_MAX_PASS_LENGTH] = {0};
 	size_t		i, n;
 	size_t		len;
 
@@ -286,9 +58,9 @@ static void encode_password(uint8_t *out, ssize_t *outlen, uint8_t const *input,
 	 */
 	len = inlen;
 
-	if (len > MAX_PASS_LEN) len = MAX_PASS_LEN;
+	if (len > RADIUS_MAX_PASS_LENGTH) len = RADIUS_MAX_PASS_LENGTH;
 
-	memcpy(passwd, input, len);
+	(void) fr_dbuff_out_memcpy(passwd, input, len);
 	if (len < sizeof(passwd)) memset(passwd + len, 0, sizeof(passwd) - len);
 
 	if (len == 0) len = AUTH_PASS_LEN;
@@ -296,80 +68,105 @@ static void encode_password(uint8_t *out, ssize_t *outlen, uint8_t const *input,
 		len += 0x0f;
 		len &= ~0x0f;
 	}
-	*outlen = len;
 
-	fr_md5_init(&context);
-	fr_md5_update(&context, (uint8_t const *) secret, talloc_array_length(secret) - 1);
-	fr_md5_copy(&old, &context);
+	md5_ctx = fr_md5_ctx_alloc_from_list();
+	md5_ctx_old = fr_md5_ctx_alloc_from_list();
+
+	fr_md5_update(md5_ctx, (uint8_t const *) packet_ctx->common->secret, packet_ctx->common->secret_length);
+	fr_md5_ctx_copy(md5_ctx_old, md5_ctx);
 
 	/*
 	 *	Do first pass.
 	 */
-	fr_md5_update(&context, vector, AUTH_PASS_LEN);
+	fr_md5_update(md5_ctx, packet_ctx->request_authenticator, AUTH_PASS_LEN);
 
 	for (n = 0; n < len; n += AUTH_PASS_LEN) {
 		if (n > 0) {
-			fr_md5_copy(&context, &old);
-			fr_md5_update(&context, passwd + n - AUTH_PASS_LEN, AUTH_PASS_LEN);
+			fr_md5_ctx_copy(md5_ctx, md5_ctx_old);
+			fr_md5_update(md5_ctx, passwd + n - AUTH_PASS_LEN, AUTH_PASS_LEN);
 		}
 
-		fr_md5_final(digest, &context);
+		fr_md5_final(digest, md5_ctx);
 		for (i = 0; i < AUTH_PASS_LEN; i++) passwd[i + n] ^= digest[i];
 	}
 
-	memcpy(out, passwd, len);
+	fr_md5_ctx_free_from_list(&md5_ctx);
+	fr_md5_ctx_free_from_list(&md5_ctx_old);
+
+	return fr_dbuff_in_memcpy(dbuff, passwd, len);
 }
 
 
-static void encode_tunnel_password(uint8_t *out, ssize_t *outlen,
-				   uint8_t const *input, size_t inlen, size_t freespace,
-				   char const *secret, uint8_t const *vector)
+static ssize_t encode_tunnel_password(fr_dbuff_t *dbuff, fr_dbuff_marker_t *in, size_t inlen, fr_radius_encode_ctx_t *packet_ctx)
 {
-	FR_MD5_CTX	context, old;
-	uint8_t		digest[AUTH_VECTOR_LEN];
+	fr_md5_ctx_t	*md5_ctx, *md5_ctx_old;
+	uint8_t		digest[RADIUS_AUTH_VECTOR_LENGTH];
+	uint8_t		tpasswd[RADIUS_MAX_STRING_LENGTH];
 	size_t		i, n;
-	size_t		encrypted_len;
-
-	/*
-	 *	The password gets encoded with a 1-byte "length"
-	 *	field.  Ensure that it doesn't overflow.
-	 */
-	if (freespace > 253) freespace = 253;
+	uint32_t	r;
+	size_t		output_len, encrypted_len, padding;
+	ssize_t		slen;
+	fr_dbuff_t	work_dbuff = FR_DBUFF_MAX(dbuff, RADIUS_MAX_STRING_LENGTH);
 
 	/*
 	 *	Limit the maximum size of the input password.  2 bytes
 	 *	are taken up by the salt, and one by the encoded
-	 *	"length" field.  Note that if we have a tag, the
-	 *	"freespace" will be 252 octets, not 253 octets.
+	 *	"length" field.
 	 */
-	if (inlen > (freespace - 3)) inlen = freespace - 3;
+	if (inlen > (RADIUS_MAX_STRING_LENGTH - 3)) {
+	fail:
+		fr_strerror_const("Input password is too large for tunnel password encoding");
+		return -(inlen + 3);
+	}
 
 	/*
 	 *	Length of the encrypted data is the clear-text
 	 *	password length plus one byte which encodes the length
 	 *	of the password.  We round up to the nearest encoding
-	 *	block.  Note that this can result in the encoding
-	 *	length being more than 253 octets.
+	 *	block, and bound it by the size of the output buffer,
+	 *	while accounting for 2 bytes of salt.
+	 *
+	 *	And also ensuring that we don't truncate the input
+	 *	password.
 	 */
-	encrypted_len = inlen + 1;
-	if ((encrypted_len & 0x0f) != 0) {
-		encrypted_len += 0x0f;
-		encrypted_len &= ~0x0f;
+	encrypted_len = ROUND_UP(inlen + 1, 16);
+	if (encrypted_len > (RADIUS_MAX_STRING_LENGTH - 2)) encrypted_len = (RADIUS_MAX_STRING_LENGTH - 2);
+
+	/*
+	 *	Get the number of padding bytes in the last block.
+	 */
+	padding = encrypted_len - (inlen + 1);
+
+	output_len = encrypted_len + 2;	/* account for the salt */
+
+	/*
+	 *	We will have up to 253 octets of data in the output
+	 *	buffer, some of which are padding.
+	 *
+	 *	If we over-run the output buffer, see if we can drop
+	 *	some of the padding bytes.  If not, we return an error
+	 *	instead of truncating the password.
+	 *
+	 *	Otherwise we lower the amount of data we copy into the
+	 *	output buffer, because the last bit is just padding,
+	 *	and can be safely discarded.
+	 */
+	slen = fr_dbuff_set(&work_dbuff, output_len);
+	if (slen < 0) {
+		if (((size_t) -slen) > padding) goto fail;
+
+		output_len += slen;
 	}
+	fr_dbuff_set_to_start(&work_dbuff);
 
 	/*
-	 *	We need 2 octets for the salt, followed by the actual
-	 *	encrypted data.
+	 *	Copy the password over, and fill the remainder with random data.
 	 */
-	if (encrypted_len > (freespace - 2)) encrypted_len = freespace - 2;
+	(void) fr_dbuff_out_memcpy(tpasswd + 3, in, inlen);
 
-	*outlen = encrypted_len + 2;	/* account for the salt */
-
-	/*
-	 *	Copy the password over, and zero-fill the remainder.
-	 */
-	memcpy(out + 3, input, inlen);
-	memset(out + 3 + inlen, 0, *outlen - 3 - inlen);
+	for (i = 3 + inlen; i < sizeof(tpasswd); i++) {
+		tpasswd[i] = fr_fast_rand(&packet_ctx->rand_ctx);
+	}
 
 	/*
 	 *	Generate salt.  The RFCs say:
@@ -378,787 +175,835 @@ static void encode_tunnel_password(uint8_t *out, ssize_t *outlen,
 	 *	packet should be unique, and they should be random
 	 *
 	 *	So, we set the high bit, add in a counter, and then
-	 *	add in some CSPRNG data.  should be OK..
+	 *	add in some PRNG data.  should be OK..
 	 */
-	out[0] = (0x80 | (((salt_offset++) & 0x0f) << 3) | (fr_rand() & 0x07));
-	out[1] = fr_rand();
-	out[2] = inlen;	/* length of the password string */
+	r = fr_fast_rand(&packet_ctx->rand_ctx);
+	tpasswd[0] = (0x80 | (((packet_ctx->salt_offset++) & 0x07) << 4) | ((r >> 8) & 0x0f));
+	tpasswd[1] = r & 0xff;
+	tpasswd[2] = inlen;	/* length of the password string */
 
-	fr_md5_init(&context);
-	fr_md5_update(&context, (uint8_t const *) secret, talloc_array_length(secret) - 1);
-	fr_md5_copy(&old, &context);
+	md5_ctx = fr_md5_ctx_alloc_from_list();
+	md5_ctx_old = fr_md5_ctx_alloc_from_list();
 
-	fr_md5_update(&context, vector, AUTH_VECTOR_LEN);
-	fr_md5_update(&context, &out[0], 2);
+	fr_md5_update(md5_ctx, (uint8_t const *) packet_ctx->common->secret, packet_ctx->common->secret_length);
+	fr_md5_ctx_copy(md5_ctx_old, md5_ctx);
 
+	fr_md5_update(md5_ctx, packet_ctx->request_authenticator, RADIUS_AUTH_VECTOR_LENGTH);
+	fr_md5_update(md5_ctx, &tpasswd[0], 2);
+
+	/*
+	 *	Do various hashing, and XOR the length+password with
+	 *	the output of the hash blocks.
+	 */
 	for (n = 0; n < encrypted_len; n += AUTH_PASS_LEN) {
 		size_t block_len;
 
 		if (n > 0) {
-			fr_md5_copy(&context, &old);
-			fr_md5_update(&context, out + 2 + n - AUTH_PASS_LEN, AUTH_PASS_LEN);
+			fr_md5_ctx_copy(md5_ctx, md5_ctx_old);
+			fr_md5_update(md5_ctx, tpasswd + 2 + n - AUTH_PASS_LEN, AUTH_PASS_LEN);
 		}
-		fr_md5_final(digest, &context);
+		fr_md5_final(digest, md5_ctx);
 
-		if ((2 + n + AUTH_PASS_LEN) < freespace) {
-			block_len = AUTH_PASS_LEN;
-		} else {
-			block_len = freespace - 2 - n;
-		}
+		block_len = encrypted_len - n;
+		if (block_len > AUTH_PASS_LEN) block_len = AUTH_PASS_LEN;
 
-		for (i = 0; i < block_len; i++) out[i + 2 + n] ^= digest[i];
+		for (i = 0; i < block_len; i++) tpasswd[i + 2 + n] ^= digest[i];
 	}
+
+	fr_md5_ctx_free_from_list(&md5_ctx);
+	fr_md5_ctx_free_from_list(&md5_ctx_old);
+
+	FR_DBUFF_IN_MEMCPY_RETURN(&work_dbuff, tpasswd, output_len);
+
+	return fr_dbuff_set(dbuff, &work_dbuff);
 }
 
-static ssize_t encode_struct(uint8_t *out, size_t outlen,
-			      fr_dict_attr_t const **tlv_stack, unsigned int depth,
-			      vp_cursor_t *cursor, void *encoder_ctx)
+/*
+ *	Encode the contents of an attribute of type TLV.
+ */
+static ssize_t encode_tlv(fr_dbuff_t *dbuff,
+			  fr_da_stack_t *da_stack, unsigned int depth,
+			  fr_dcursor_t *cursor, void *encode_ctx)
 {
-	ssize_t			len;
-	unsigned int		child_num = 1;
-	uint8_t			*p = out;
-	VALUE_PAIR const	*vp = fr_pair_cursor_current(cursor);
-	fr_dict_attr_t const	*da = tlv_stack[depth];
+	ssize_t		slen;
+	fr_pair_t const	*vp = fr_dcursor_current(cursor);
+	fr_dict_attr_t const	*da = da_stack->da[depth];
+	fr_dbuff_t		work_dbuff = FR_DBUFF_MAX(dbuff, RADIUS_MAX_STRING_LENGTH);
 
-	VP_VERIFY(fr_pair_cursor_current(cursor));
-	FR_PROTO_STACK_PRINT(tlv_stack, depth);
-
-	if (tlv_stack[depth]->type != FR_TYPE_STRUCT) {
-		fr_strerror_printf("%s: Expected type \"struct\" got \"%s\"", __FUNCTION__,
-				   fr_int2str(dict_attr_types, tlv_stack[depth]->type, "?Unknown?"));
-		return -1;
-	}
-
-	if (!tlv_stack[depth + 1]) {
-		fr_strerror_printf("%s: Can't encode empty struct", __FUNCTION__);
-		return -1;
-	}
-
-	while (outlen) {
-		fr_dict_attr_t const *child_da;
-
-		FR_PROTO_STACK_PRINT(tlv_stack, depth);
-
-		/*
-		 *	The child attributes should be in order.  If
-		 *	they're not, we fill the struct with zeroes.
-		 */
-		child_da = vp->da;
-		if (child_da->attr != child_num) {
-			child_da = fr_dict_attr_child_by_num(da, child_num);
-
-			if (!child_da) break;
-
-			if (child_da->flags.length < outlen) break;
-
-			len = child_da->flags.length;
-			memset(p, 0, len);
-
-			p += len;
-			outlen -= len;
-			child_num++;
-			continue;
-		}
-
-		/*
-		 *	Determine the nested type and call the appropriate encoder
-		 *
-		 *	@fixme: allow structs within structs
-		 */
-		len = encode_value(p, outlen, tlv_stack, depth + 1, cursor, encoder_ctx);
-		if (len <= 0) return len;
-
-		p += len;
-		outlen -= len;				/* Subtract from the buffer we have available */
-		child_num++;
-
-		/*
-		 *	If nothing updated the attribute, stop
-		 */
-		if (!fr_pair_cursor_current(cursor) || (vp == fr_pair_cursor_current(cursor))) break;
-
-		/*
-		 *	We can encode multiple sub TLVs, if after
-		 *	rebuilding the TLV Stack, the attribute
-		 *	at this depth is the same.
-		 */
-		if (da != tlv_stack[depth]) break;
-		vp = fr_pair_cursor_current(cursor);
-
-		FR_PROTO_HEX_DUMP("Done STRUCT", out, p - out);
-	}
-
-	return p - out;
-}
-
-static ssize_t encode_tlv_hdr_internal(uint8_t *out, size_t outlen,
-				       fr_dict_attr_t const **tlv_stack, unsigned int depth,
-				       vp_cursor_t *cursor, void *encoder_ctx)
-{
-	ssize_t			len;
-	uint8_t			*p = out;
-	VALUE_PAIR const	*vp = fr_pair_cursor_current(cursor);
-	fr_dict_attr_t const	*da = tlv_stack[depth];
-
-	while (outlen >= 5) {
-		size_t sublen;
-		FR_PROTO_STACK_PRINT(tlv_stack, depth);
+	for (;;) {
+		FR_PROTO_STACK_PRINT(da_stack, depth);
 
 		/*
 		 *	This attribute carries sub-TLVs.  The sub-TLVs
-		 *	can only carry 255 bytes of data.
+		 *	can only carry a total of 253 bytes of data.
 		 */
-		sublen = outlen;
-		if (sublen > 255) sublen = 255;
 
 		/*
 		 *	Determine the nested type and call the appropriate encoder
 		 */
-		if (tlv_stack[depth + 1]->type == FR_TYPE_TLV) {
-			len = encode_tlv_hdr(p, sublen, tlv_stack, depth + 1, cursor, encoder_ctx);
+		if (!da_stack->da[depth + 1]) {
+			fr_dcursor_t child_cursor;
+
+			if (vp->da != da_stack->da[depth]) {
+				fr_strerror_printf("%s: Can't encode empty TLV", __FUNCTION__);
+				return 0;
+			}
+
+			fr_pair_dcursor_child_iter_init(&child_cursor, &vp->vp_group, cursor);
+			vp = fr_dcursor_current(&child_cursor);
+			fr_proto_da_stack_build(da_stack, vp->da);
+
+			/*
+			 *	Call ourselves recursively to encode children.
+			 */
+			slen = encode_tlv(&work_dbuff, da_stack, depth, &child_cursor, encode_ctx);
+			if (slen < 0) return slen;
+
+			vp = fr_dcursor_next(cursor);
+			fr_proto_da_stack_build(da_stack, vp ? vp->da : NULL);
+
 		} else {
-			len = encode_rfc_hdr_internal(p, sublen, tlv_stack, depth + 1, cursor, encoder_ctx);
+			slen = encode_child(&work_dbuff, da_stack, depth + 1, cursor, encode_ctx);
 		}
-
-		if (len <= 0) return len;
-
-		p += len;
-		outlen -= len;				/* Subtract from the buffer we have available */
+		if (slen < 0) return slen;
 
 		/*
 		 *	If nothing updated the attribute, stop
 		 */
-		if (!fr_pair_cursor_current(cursor) || (vp == fr_pair_cursor_current(cursor))) break;
+		if (!fr_dcursor_current(cursor) || (vp == fr_dcursor_current(cursor))) break;
 
 		/*
 		 *	We can encode multiple sub TLVs, if after
 		 *	rebuilding the TLV Stack, the attribute
 		 *	at this depth is the same.
 		 */
-		if (da != tlv_stack[depth]) break;
-		vp = fr_pair_cursor_current(cursor);
-
-		FR_PROTO_HEX_DUMP("Done TLV", out, p - out);
+		if ((da != da_stack->da[depth]) || (da_stack->depth < da->depth)) break;
+		vp = fr_dcursor_current(cursor);
 	}
 
-	return p - out;
+	return fr_dbuff_set(dbuff, &work_dbuff);
 }
 
-static ssize_t encode_tlv_hdr(uint8_t *out, size_t outlen,
-			      fr_dict_attr_t const **tlv_stack, unsigned int depth,
-			      vp_cursor_t *cursor, void *encoder_ctx)
+static ssize_t encode_pairs(fr_dbuff_t *dbuff, fr_pair_list_t const *vps, void *encode_ctx)
 {
-	ssize_t			len;
-
-	VP_VERIFY(fr_pair_cursor_current(cursor));
-	FR_PROTO_STACK_PRINT(tlv_stack, depth);
-
-	if (tlv_stack[depth]->type != FR_TYPE_TLV) {
-		fr_strerror_printf("%s: Expected type \"tlv\" got \"%s\"", __FUNCTION__,
-				   fr_int2str(dict_attr_types, tlv_stack[depth]->type, "?Unknown?"));
-		return -1;
-	}
-
-	if (!tlv_stack[depth + 1]) {
-		fr_strerror_printf("%s: Can't encode empty TLV", __FUNCTION__);
-		return -1;
-	}
-
-	if (outlen < 5) return 0;
+	ssize_t			slen;
+	fr_pair_t const	*vp;
+	fr_dcursor_t		cursor;
 
 	/*
-	 *	Encode the first level of TLVs
+	 *	Note that we skip tags inside of tags!
 	 */
-	out[0] = tlv_stack[depth]->attr & 0xff;
-	out[1] = 2;	/* TLV header */
+	fr_pair_dcursor_iter_init(&cursor, vps, fr_proto_next_encodable, dict_radius);
+	while ((vp = fr_dcursor_current(&cursor))) {
+		PAIR_VERIFY(vp);
 
-	if (outlen > 255) outlen = 255;
+		/*
+		 *	Encode an individual VP
+		 */
+		slen = fr_radius_encode_pair(dbuff, &cursor, encode_ctx);
+		if (slen < 0) return slen;
+	}
 
-	len = encode_tlv_hdr_internal(out + out[1], outlen - out[1], tlv_stack, depth, cursor, encoder_ctx);
-	if (len <= 0) return len;
-
-	out[1] += len;
-
-	return out[1];
+	return fr_dbuff_used(dbuff);
 }
+
 
 /** Encodes the data portion of an attribute
  *
  * @return
  *	> 0, Length of the data portion.
  *      = 0, we could not encode anything, skip this attribute (and don't encode the header)
- *	< 0, failure.
+ *	  unless it's one of a list of exceptions.
+ *	< 0, How many additional bytes we'd need as a negative integer.
+ *	PAIR_ENCODE_FATAL_ERROR - Abort encoding the packet.
  */
-static ssize_t encode_value(uint8_t *out, size_t outlen,
-			    fr_dict_attr_t const **tlv_stack, int depth,
-			    vp_cursor_t *cursor, void *encoder_ctx)
+static ssize_t encode_value(fr_dbuff_t *dbuff,
+			    fr_da_stack_t *da_stack, unsigned int depth,
+			    fr_dcursor_t *cursor, void *encode_ctx)
 {
-	size_t			offset;
-	ssize_t			len;
-	uint8_t	const		*data = NULL;
-	uint8_t			*ptr = out;
-	uint8_t			buffer[64];
-	VALUE_PAIR const	*vp = fr_pair_cursor_current(cursor);
-	fr_dict_attr_t const	*da = tlv_stack[depth];
-	fr_radius_ctx_t		*packet_ctx = encoder_ctx;
+	ssize_t			slen;
+	size_t			len;
+	fr_pair_t const	*vp = fr_dcursor_current(cursor);
+	fr_dict_attr_t const	*da = da_stack->da[depth];
+	fr_radius_encode_ctx_t	*packet_ctx = encode_ctx;
+	fr_dbuff_t		work_dbuff = FR_DBUFF(dbuff);
+	fr_dbuff_t		value_dbuff;
+	fr_dbuff_marker_t	value_start, src, dest;
+	bool			encrypted = false;
 
-	VP_VERIFY(vp);
-	FR_PROTO_STACK_PRINT(tlv_stack, depth);
+	PAIR_VERIFY(vp);
+	FR_PROTO_STACK_PRINT(da_stack, depth);
 
 	/*
-	 *	It's a little weird to consider a TLV as a value,
-	 *	but it seems to work OK.
+	 *	TLVs are just another type of value.
 	 */
-	if (da->type == FR_TYPE_TLV) {
-		return encode_tlv_hdr(out, outlen, tlv_stack, depth, cursor, encoder_ctx);
+	if (da->type == FR_TYPE_TLV) return encode_tlv(dbuff, da_stack, depth, cursor, encode_ctx);
+
+	if (da->type == FR_TYPE_GROUP) return fr_pair_ref_to_network(dbuff, da_stack, depth, cursor);
+
+	/*
+	 *	Catch errors early on.
+	 */
+	if (flag_encrypted(&vp->da->flags) && !packet_ctx) {
+		fr_strerror_const("Asked to encrypt attribute, but no packet context provided");
+		return PAIR_ENCODE_FATAL_ERROR;
 	}
 
 	/*
 	 *	This has special requirements.
 	 */
-	if (da->type == FR_TYPE_STRUCT) {
-		len = encode_struct(out, outlen, tlv_stack, depth, cursor, encoder_ctx);
-		if (len < 0) return len;
+	if ((vp->vp_type == FR_TYPE_STRUCT) || (da->type == FR_TYPE_STRUCT)) {
+		slen = fr_struct_to_network(&work_dbuff, da_stack, depth, cursor, encode_ctx, encode_value, encode_child);
+		if (slen <= 0) return slen;
 
-		vp = next_encodable(cursor);
-		fr_proto_tlv_stack_build(tlv_stack, vp ? vp->da : NULL);
-		return len;
+		vp = fr_dcursor_current(cursor);
+		fr_proto_da_stack_build(da_stack, vp ? vp->da : NULL);
+		return fr_dbuff_set(dbuff, &work_dbuff);
 	}
 
 	/*
 	 *	If it's not a TLV, it should be a value type RFC
 	 *	attribute make sure that it is.
 	 */
-	if (tlv_stack[depth + 1] != NULL) {
+	if (da_stack->da[depth + 1] != NULL) {
 		fr_strerror_printf("%s: Encoding value but not at top of stack", __FUNCTION__);
-		return -1;
+		return PAIR_ENCODE_FATAL_ERROR;
 	}
 
 	if (vp->da != da) {
 		fr_strerror_printf("%s: Top of stack does not match vp->da", __FUNCTION__);
-		return -1;
+		return PAIR_ENCODE_FATAL_ERROR;
 	}
 
-	switch (da->type) {
-	case FR_TYPE_STRUCTURAL:
+	if (fr_type_is_structural(da->type)) {
 		fr_strerror_printf("%s: Called with structural type %s", __FUNCTION__,
-				   fr_int2str(dict_attr_types, tlv_stack[depth]->type, "?Unknown?"));
-		return -1;
-
-	default:
-		break;
+				   fr_type_to_str(da_stack->da[depth]->type));
+		return PAIR_ENCODE_FATAL_ERROR;
 	}
 
 	/*
-	 *	Set up the default sources for the data.
+	 *	Write tag byte
+	 *
+	 *	The Tag field is one octet in length and is intended to provide a
+	 *	means of grouping attributes in the same packet which refer to the
+	 *	same tunnel.  If the value of the Tag field is greater than 0x00
+	 *	and less than or equal to 0x1F, it SHOULD be interpreted as
+	 *	indicating which tunnel (of several alternatives) this attribute
+	 *	pertains.  If the Tag field is greater than 0x1F, it SHOULD be
+	 *	interpreted as the first byte of the following String field.
+	 *
+	 *	If the first byte of the string value looks like a
+	 *	tag, then we always encode a tag byte, even one that
+	 *	is zero.
 	 */
-	len = fr_radius_attr_len(vp);
-
-	switch (da->type) {
-	case FR_TYPE_OCTETS:
-		/*
-		 *	If asked to encode more data than allowed, we
-		 *	encode only the allowed data.
-		 */
-		if (da->flags.length && (len > da->flags.length)) {
-			len = da->flags.length;
+	if ((vp->vp_type == FR_TYPE_STRING) && flag_has_tag(&vp->da->flags)) {
+		if (packet_ctx->tag) {
+			FR_DBUFF_IN_RETURN(&work_dbuff, (uint8_t)packet_ctx->tag);
+		} else if (TAG_VALID(vp->vp_strvalue[0])) {
+			FR_DBUFF_IN_RETURN(&work_dbuff, (uint8_t)0x00);
 		}
-		/* FALL-THROUGH */
-
-	case FR_TYPE_STRING:
-		data = vp->vp_ptr;
-		break;
-
-	case FR_TYPE_ABINARY:
-		data = vp->vp_filter;
-		break;
+	}
 
 	/*
-	 *	Common encoder might add scope byte
+	 * Starting here is a value that may require encryption.
+	 */
+	value_dbuff = FR_DBUFF(&work_dbuff);
+	fr_dbuff_marker(&value_start, &value_dbuff);
+	fr_dbuff_marker(&src, &value_dbuff);
+	fr_dbuff_marker(&dest, &value_dbuff);
+
+	switch (vp->vp_type) {
+		/*
+		 *	IPv4 addresses are normal, but IPv6 addresses are special to RADIUS.
+		 */
+	case FR_TYPE_COMBO_IP_ADDR:
+		if (vp->vp_ip.af == AF_INET) goto encode;
+		FALL_THROUGH;
+
+	/*
+	 *	Common encoder might add scope byte, which we don't want.
 	 */
 	case FR_TYPE_IPV6_ADDR:
-		memcpy(buffer, vp->vp_ipv6addr, sizeof(vp->vp_ipv6addr));
-		data = buffer;
+		FR_DBUFF_IN_MEMCPY_RETURN(&value_dbuff, vp->vp_ipv6addr, sizeof(vp->vp_ipv6addr));
 		break;
+
+	case FR_TYPE_COMBO_IP_PREFIX:
+		if (vp->vp_ip.af == AF_INET) goto ipv4_prefix;
+		FALL_THROUGH;
 
 	/*
 	 *	Common encoder doesn't add reserved byte
 	 */
 	case FR_TYPE_IPV6_PREFIX:
-		buffer[0] = 0;
-		buffer[1] = vp->vp_ip.prefix;
-		len = vp->vp_ip.prefix >> 3;		/* Convert bits to whole bytes */
-		memcpy(buffer, vp->vp_ipv6addr, len);	/* Only copy the minimum number of address bytes required */
-		len += 2;				/* Reserved and prefix bytes */
-		data = buffer;
+		len = fr_bytes_from_bits(vp->vp_ip.prefix);
+		FR_DBUFF_IN_BYTES_RETURN(&value_dbuff, 0x00, vp->vp_ip.prefix);
+		/* Only copy the minimum number of address bytes required */
+		FR_DBUFF_IN_MEMCPY_RETURN(&value_dbuff, (uint8_t const *)vp->vp_ipv6addr, len);
 		break;
 
 	/*
 	 *	Common encoder doesn't add reserved byte
 	 */
 	case FR_TYPE_IPV4_PREFIX:
-		buffer[0] = 0;
-		buffer[1] = vp->vp_ip.prefix;
-		memcpy(buffer, &vp->vp_ipv4addr, sizeof(vp->vp_ipv4addr));
-		data = buffer;
+	ipv4_prefix:
+		FR_DBUFF_IN_BYTES_RETURN(&value_dbuff, 0x00, vp->vp_ip.prefix);
+		FR_DBUFF_IN_MEMCPY_RETURN(&value_dbuff, (uint8_t const *)&vp->vp_ipv4addr, sizeof(vp->vp_ipv4addr));
 		break;
+
+	/*
+	 *	Special handling for "abinary".  Otherwise, fall
+	 *	through to using the common encoder.
+	 */
+	case FR_TYPE_STRING:
+		if (flag_abinary(&da->flags)) {
+			slen = fr_radius_encode_abinary(vp, &value_dbuff);
+			if (slen <= 0) return slen;
+			break;
+		}
+		FALL_THROUGH;
+
+	case FR_TYPE_OCTETS:
 
 	/*
 	 *	Simple data types use the common encoder.
 	 */
-	case FR_TYPE_IPV4_ADDR:
-	case FR_TYPE_IFID:
-	case FR_TYPE_ETHERNET:	/* just in case */
-	case FR_TYPE_BOOL:
-	case FR_TYPE_UINT8:
-	case FR_TYPE_UINT16:
-	case FR_TYPE_UINT32:
-	case FR_TYPE_UINT64:
-	case FR_TYPE_INT8:
-	case FR_TYPE_INT16:
-	case FR_TYPE_INT32:
-	case FR_TYPE_INT64:
-	case FR_TYPE_DATE:
-		len = fr_value_box_to_network(NULL, buffer, sizeof(buffer), &vp->data);
-		if (len < 0) return -1;
-		data = buffer;
+	default:
+	encode:
+		slen = fr_value_box_to_network(&value_dbuff, &vp->data);
+		if (slen < 0) return slen;
 		break;
-
-	case FR_TYPE_INVALID:
-	case FR_TYPE_EXTENDED:
-	case FR_TYPE_LONG_EXTENDED:
-	case FR_TYPE_COMBO_IP_ADDR:	/* Should have been converted to concrete equivalent */
-	case FR_TYPE_COMBO_IP_PREFIX:	/* Should have been converted to concrete equivalent */
-	case FR_TYPE_EVS:
-	case FR_TYPE_VSA:
-	case FR_TYPE_VENDOR:
-	case FR_TYPE_TLV:
-	case FR_TYPE_STRUCT:
-	case FR_TYPE_SIZE:
-	case FR_TYPE_TIMEVAL:
-	case FR_TYPE_FLOAT32:
-	case FR_TYPE_FLOAT64:
-	case FR_TYPE_DATE_MILLISECONDS:
-	case FR_TYPE_DATE_MICROSECONDS:
-	case FR_TYPE_DATE_NANOSECONDS:
-	case FR_TYPE_MAX:
-		fr_strerror_printf("ERROR: Unsupported attribute type %d", da->type);
-		return -1;
 	}
 
 	/*
 	 *	No data: don't encode the value.  The type and length should still
 	 *	be written.
 	 */
-	if (!data || (len == 0)) {
-		vp = next_encodable(cursor);
-		fr_proto_tlv_stack_build(tlv_stack, vp ? vp->da : NULL);
+	if (fr_dbuff_used(&value_dbuff) == 0) {
+	return_0:
+		vp = fr_dcursor_next(cursor);
+		fr_proto_da_stack_build(da_stack, vp ? vp->da : NULL);
 		return 0;
 	}
 
-	/*
-	 *	Bound the data to the calling size
-	 */
-	if (len > (ssize_t)outlen) len = outlen;
-
-	if (vp->da->flags.encrypt && !packet_ctx) {
-		fr_strerror_printf("Asked to encrypt attribute, but no packet context provided");
-		return -1;
-	}
 	/*
 	 *	Encrypt the various password styles
 	 *
 	 *	Attributes with encrypted values MUST be less than
 	 *	128 bytes long.
 	 */
-	if (da->type != FR_TYPE_STRUCT) switch (vp->da->flags.encrypt) {
+	if (flag_encrypted(&da->flags)) switch (vp->da->flags.subtype) {
 	case FLAG_ENCRYPT_USER_PASSWORD:
-		encode_password(ptr, &len, data, len, packet_ctx->secret, packet_ctx->vector);
+		/*
+		 *	Encode the password in place
+		 */
+		slen = encode_password(&work_dbuff, &value_start, fr_dbuff_used(&value_dbuff), packet_ctx);
+		if (slen < 0) return slen;
+		encrypted = true;
 		break;
 
+	case FLAG_TAGGED_TUNNEL_PASSWORD:
 	case FLAG_ENCRYPT_TUNNEL_PASSWORD:
-		offset = 0;
-		if (da->flags.has_tag) offset = 1;
-
-		/*
-		 *	Check if there's enough freespace.  If there isn't,
-		 *	we discard the attribute.
-		 *
-		 *	This is ONLY a problem if we have multiple VSA's
-		 *	in one Vendor-Specific, though.
-		 */
-		if (outlen < (18 + offset)) return 0;
-
-		if (offset) ptr[0] = TAG_VALID(vp->tag) ? vp->tag : TAG_NONE;
-
-		encode_tunnel_password(ptr + offset, &len, data, len,
-				       outlen - offset, packet_ctx->secret, packet_ctx->vector);
-		len += offset;
-		break;
-
-		/*
-		 *	The code above ensures that this attribute
-		 *	always fits.
-		 */
-	case FLAG_ENCRYPT_ASCEND_SECRET:
-		if (len != 16) return 0;
-
-		fr_radius_ascend_secret(ptr, packet_ctx->vector, packet_ctx->secret, data);
-		len = AUTH_VECTOR_LEN;
-		break;
-
-	default:
-		if (vp->da->flags.has_tag && TAG_VALID(vp->tag)) {
-			if (vp->vp_type == FR_TYPE_STRING) {
-				if (len > ((ssize_t) (outlen - 1))) len = outlen - 1;
-				ptr[0] = vp->tag;
-				ptr++;
-			} else if (vp->vp_type == FR_TYPE_UINT32) {
-				buffer[0] = vp->tag;
-			} /* else it can't be any other type */
+		if (packet_ctx->disallow_tunnel_passwords) {
+			fr_strerror_const("Attributes with 'encrypt=2' set cannot go into this packet.");
+			goto return_0;
 		}
-		memcpy(ptr, data, len);
+
+		/*
+		 *	Always encode the tag even if it's zero.
+		 *
+		 *	The Tunnel-Password uses 2 salt fields which
+		 *	MAY have any value.  As a result, we always
+		 *	encode a tag.  If we would omit the tag, then
+		 *	perhaps one of the salt fields could be
+		 *	mistaken for the tag.
+		 */
+		if (flag_has_tag(&vp->da->flags)) fr_dbuff_advance(&work_dbuff, 1);
+
+		slen = encode_tunnel_password(&work_dbuff, &value_start, fr_dbuff_used(&value_dbuff), packet_ctx);
+		if (slen < 0) {
+			fr_strerror_printf("%s too long", vp->da->name);
+			return slen - flag_has_tag(&vp->da->flags);
+		}
+
+		/*
+		 *	Do this after so we don't mess up the input
+		 *	value.
+		 */
+		if (flag_has_tag(&vp->da->flags)) {
+			fr_dbuff_set_to_start(&value_start);
+			fr_dbuff_in(&value_start, (uint8_t) 0x00);
+		}
+		encrypted = true;
 		break;
-	} /* switch over encryption flags */
+
+	/*
+	 *	The code above ensures that this attribute
+	 *	always fits.
+	 */
+	case FLAG_ENCRYPT_ASCEND_SECRET:
+		/*
+		 *	@todo radius decoding also uses fr_radius_ascend_secret() (Vernam cipher
+		 *	is its own inverse). As part of converting decode, make sure the caller
+		 *	there can pass a marker so we can use it here, too.
+		 */
+		slen = fr_radius_ascend_secret(&work_dbuff, fr_dbuff_current(&value_start), fr_dbuff_used(&value_dbuff),
+					       packet_ctx->common->secret, packet_ctx->request_authenticator);
+		if (slen < 0) return slen;
+		encrypted = true;
+		break;
+	}
+
+	if (!encrypted) {
+		fr_dbuff_set(&work_dbuff, &value_dbuff);
+		fr_dbuff_set(&value_start, fr_dbuff_start(&value_dbuff));
+	}
+
+	/*
+	 *	High byte of 32bit integers gets set to the tag
+	 *	value.
+	 *
+	 *	The Tag field is one octet in length and is intended to provide a
+	 *	means of grouping attributes in the same packet which refer to the
+	 *	same tunnel.  Valid values for this field are 0x01 through 0x1F,
+	 *	inclusive.  If the Tag field is unused, it MUST be zero (0x00).
+	 */
+	if ((vp->vp_type == FR_TYPE_UINT32) && flag_has_tag(&vp->da->flags)) {
+		uint8_t	msb = 0;
+		/*
+		 *	Only 24bit integers are allowed here
+		 */
+		fr_dbuff_set(&src,  &value_start);
+		(void) fr_dbuff_out(&msb, &src);
+		if (msb != 0) {
+			fr_strerror_const("Integer overflow for tagged uint32 attribute");
+			goto return_0;
+		}
+		fr_dbuff_set(&dest, &value_start);
+		fr_dbuff_in(&dest, packet_ctx->tag);
+	}
+
+	FR_PROTO_HEX_DUMP(fr_dbuff_start(&work_dbuff), fr_dbuff_used(&work_dbuff), "value %s",
+			  fr_type_to_str(vp->vp_type));
 
 	/*
 	 *	Rebuilds the TLV stack for encoding the next attribute
 	 */
-	vp = next_encodable(cursor);
-	fr_proto_tlv_stack_build(tlv_stack, vp ? vp->da : NULL);
+	vp = fr_dcursor_next(cursor);
+	fr_proto_da_stack_build(da_stack, vp ? vp->da : NULL);
 
-	return len + (ptr - out);
+	return fr_dbuff_set(dbuff, &work_dbuff);
 }
 
-static ssize_t attr_shift(uint8_t const *start, uint8_t const *end,
-			  uint8_t *ptr, int hdr_len, ssize_t len,
-			  int flag_offset, int vsa_offset)
+/** Breaks down large data into pieces, each with a header
+ *
+ * @param[out] data		we're fragmenting.
+ * @param[in] data_len		the amount of data in the dbuff that makes up the value we're
+ *      			splitting.
+ * @param[in,out] hdr      	marker that points at said header
+ * @param[in] hdr_len		length of the headers that will be added
+ * @param[in] flag_offset	offset within header of a flag byte whose MSB is set for all
+ *				but the last piece.
+ * @param[in] vsa_offset	if non-zero, the offset of a length field in a (sub?)-header
+ *				of size 3 that also needs to be adjusted to include the number
+ *				of bytes of data in the piece
+ * @return
+ *      - <0 the number of bytes we would have needed to create
+ *	  space for another attribute header in the buffer.
+ *	- 0 data was not modified.
+ *      - >0 the number additional bytes we used inserting extra
+ *        headers.
+ */
+static ssize_t attr_fragment(fr_dbuff_t *data, size_t data_len, fr_dbuff_marker_t *hdr, size_t hdr_len,
+			     int flag_offset, int vsa_offset)
 {
-	int check_len = len - ptr[1];
-	int total = len + hdr_len;
+	unsigned int		num_fragments, i = 0;
+	size_t			max_frag_data = UINT8_MAX - hdr_len;
+	fr_dbuff_t		frag_data = FR_DBUFF_ABS(hdr);
+	fr_dbuff_marker_t	frag_hdr, frag_hdr_p;
 
-	/*
-	 *	Pass 1: Check if the addition of the headers
-	 *	overflows the available freespace.  If so, return
-	 *	what we were capable of encoding.
-	 */
+	if (unlikely(!data_len)) return 0;	/* Shouldn't have been called */
 
-	while (check_len > (255 - hdr_len)) {
-		total += hdr_len;
-		check_len -= (255 - hdr_len);
+	num_fragments = ROUND_UP_DIV(data_len, max_frag_data);
+	if (num_fragments == 1) return 0;	/* Nothing to do */
+
+	fr_dbuff_marker(&frag_hdr, &frag_data);
+	fr_dbuff_marker(&frag_hdr_p, &frag_data);
+
+	fr_dbuff_advance(&frag_data, hdr_len);
+
+	FR_PROTO_HEX_DUMP(fr_dbuff_current(hdr), hdr_len + data_len, "attr_fragment in");
+	for (;;) {
+		bool	last = (i + 1) == num_fragments;
+		uint8_t frag_len;
+
+		/*
+		 *	How long is this fragment?
+		 */
+		if (last) {
+			frag_len = (data_len - (max_frag_data * (num_fragments - 1)));
+		} else {
+			frag_len = max_frag_data;
+		}
+
+		/*
+		 *	Update the "outer" header to reflect the actual
+		 *	length of the fragment
+		 */
+		fr_dbuff_set(&frag_hdr_p, &frag_hdr);
+		fr_dbuff_advance(&frag_hdr_p, 1);
+		fr_dbuff_in(&frag_hdr_p, (uint8_t)(hdr_len + frag_len));
+
+		/*
+		 *	Update the "inner" header.  The length here is
+		 *	the inner VSA header length (3) + the fragment
+		 *	length.
+		 */
+		if (vsa_offset) {
+			fr_dbuff_set(&frag_hdr_p, fr_dbuff_current(&frag_hdr) + vsa_offset);
+			fr_dbuff_in(&frag_hdr_p, (uint8_t)(3 + frag_len));
+		}
+
+		/*
+		 *	Just over-ride the flag field.  Nothing else
+		 *	uses it.
+		 */
+		if (flag_offset) {
+			fr_dbuff_set(&frag_hdr_p, fr_dbuff_current(&frag_hdr) + flag_offset);
+			fr_dbuff_in(&frag_hdr_p, (uint8_t)(!last << 7));
+		}
+
+		FR_PROTO_HEX_DUMP(fr_dbuff_current(hdr), frag_len + hdr_len,
+				  "attr_fragment fragment %u/%u", i + 1, num_fragments);
+
+		fr_dbuff_advance(&frag_data, frag_len);	/* Go to the start of the next fragment */
+		if (last) break;
+
+		/*
+		 *	There's still trailing data after this
+		 *	fragment.  Move the trailing data to *past*
+		 *	the next header.  And after there's room, copy
+		 *	the header over.
+		 *
+		 *	This process leaves the next header in place,
+		 *	ready for the next iteration of the loop.
+		 *
+		 *	Yes, moving things multiple times is less than
+		 *	efficient.  Oh well.  it's ~1K memmoved()
+		 *	maybe 4 times.  We are nowhere near the CPU /
+		 *	electrical requirements of Bitcoin.
+		 */
+		i++;
+
+		fr_dbuff_set(&frag_hdr, &frag_data);		/* Remember where the header should be */
+		fr_dbuff_advance(&frag_data, hdr_len);		/* Advance past the header */
+
+		/*
+		 *	Shift remaining data by hdr_len.
+		 */
+		FR_DBUFF_IN_MEMCPY_RETURN(&FR_DBUFF(&frag_data), &frag_hdr, data_len - (i * max_frag_data));
+		fr_dbuff_in_memcpy(&FR_DBUFF(&frag_hdr), hdr, hdr_len);	/* Copy the old header over */
 	}
 
-	/*
-	 *	Note that this results in a number of attributes maybe
-	 *	being marked as "encoded", but which aren't in the
-	 *	packet.  Oh well.  The solution is to fix the
-	 *	"encode_value" function to take into account the header
-	 *	lengths.
-	 */
-	if ((ptr + ptr[1] + total) > end) return (ptr + ptr[1]) - start;
-
-	/*
-	 *	Pass 2: Now that we know there's enough freespace,
-	 *	re-arrange the data to form a set of valid
-	 *	RADIUS attributes.
-	 */
-	while (1) {
-		int sublen = 255 - ptr[1];
-
-		if (len <= sublen) break;
-
-		len -= sublen;
-		memmove(ptr + 255 + hdr_len, ptr + 255, sublen);
-		memmove(ptr + 255, ptr, hdr_len);
-		ptr[1] += sublen;
-		if (vsa_offset) ptr[vsa_offset] += sublen;
-		ptr[flag_offset] |= 0x80;
-
-		ptr += 255;
-		ptr[1] = hdr_len;
-		if (vsa_offset) ptr[vsa_offset] = 3;
-	}
-
-	ptr[1] += len;
-	if (vsa_offset) ptr[vsa_offset] += len;
-
-	return (ptr + ptr[1]) - start;
+	return fr_dbuff_set(data, &frag_data);
 }
 
 /** Encode an "extended" attribute
  *
  */
-static int encode_extended_hdr(uint8_t *out, size_t outlen,
-			       fr_dict_attr_t const **tlv_stack, unsigned int depth,
-			       vp_cursor_t *cursor, void *encoder_ctx)
+static ssize_t encode_extended(fr_dbuff_t *dbuff,
+				   fr_da_stack_t *da_stack, NDEBUG_UNUSED unsigned int depth,
+				   fr_dcursor_t *cursor, void *encode_ctx)
 {
-	int			len;
-	fr_type_t		attr_type;
-#ifndef NDEBUG
-	fr_type_t		vsa_type;
-#endif
-	uint8_t			*start = out;
-	VALUE_PAIR const	*vp = fr_pair_cursor_current(cursor);
+	ssize_t			slen;
+	uint8_t			hlen;
+	size_t			vendor_hdr;
+	bool			extra;
+	int			my_depth;
+	fr_dict_attr_t const	*da;
+	fr_dbuff_marker_t	hdr, length_field;
+	fr_pair_t const		*vp = fr_dcursor_current(cursor);
+	fr_dbuff_t		work_dbuff;
 
-	VP_VERIFY(vp);
-	FR_PROTO_STACK_PRINT(tlv_stack, depth);
+	PAIR_VERIFY(vp);
+	FR_PROTO_STACK_PRINT(da_stack, depth);
 
-	if ((tlv_stack[depth]->type != FR_TYPE_EXTENDED) && (tlv_stack[depth]->type != FR_TYPE_LONG_EXTENDED)) {
-		fr_strerror_printf("%s : Called for non-extended attribute type %s",
-				   __FUNCTION__, fr_int2str(dict_attr_types, tlv_stack[depth]->type, "?Unknown?"));
-		return -1;
+	extra = flag_long_extended(&da_stack->da[0]->flags);
+
+	/*
+	 *	The data used here can be more than 255 bytes, but only for the
+	 *	"long" extended type.
+	 */
+	if (extra) {
+		work_dbuff = FR_DBUFF_BIND_CURRENT(dbuff);
+	} else {
+		work_dbuff = FR_DBUFF_MAX_BIND_CURRENT(dbuff, UINT8_MAX);
 	}
-
-	/*
-	 *	Encode which extended attribute it is.
-	 */
-	out[0] = tlv_stack[depth++]->attr & 0xff;
-
-	/*
-	 *	@fixme: check depth of stack
-	 */
-	attr_type = tlv_stack[0]->type;
-#ifndef NDEBUG
-	vsa_type = tlv_stack[1]->type;
-#endif
+	fr_dbuff_marker(&hdr, &work_dbuff);
 
 	/*
 	 *	Encode the header for "short" or "long" attributes
 	 */
-	if (attr_type == FR_TYPE_EXTENDED) {
-		if (outlen < 3) return 0;
-
-		out[1] = 3;
-		out[2] = tlv_stack[depth]->attr & 0xff;
-
-	} else {
-		if (outlen < 4) return 0;
-
-		out[1] = 4;
-		out[2] = tlv_stack[depth]->attr & 0xff;
-		out[3] = 0;	/* flags start off at zero */
-	}
-
-	FR_PROTO_STACK_PRINT(tlv_stack, depth);
-	FR_PROTO_HEX_DUMP("Extended header", out, out[1]);
+	hlen = 3 + extra;
+	FR_DBUFF_IN_BYTES_RETURN(&work_dbuff, (uint8_t)da_stack->da[0]->attr);
+	fr_dbuff_marker(&length_field, &work_dbuff);
+	FR_DBUFF_IN_BYTES_RETURN(&work_dbuff, hlen); /* this gets overwritten later*/
 
 	/*
-	 *	Handle EVS
+	 *	Encode which extended attribute it is.
 	 */
-	if (tlv_stack[depth]->type == FR_TYPE_EVS) {
-		uint8_t *evs = out + out[1];
-		uint32_t lvalue;
+	FR_DBUFF_IN_BYTES_RETURN(&work_dbuff, (uint8_t)da_stack->da[1]->attr);
 
-		if (outlen < (size_t) (out[1] + 5)) return 0;
+	if (extra) FR_DBUFF_IN_BYTES_RETURN(&work_dbuff, 0x00);	/* flags start off at zero */
 
-		depth++;	/* skip EVS */
+	FR_PROTO_STACK_PRINT(da_stack, depth);
 
-		lvalue = htonl(tlv_stack[depth++]->attr);
-		memcpy(evs, &lvalue, 4);
+	/*
+	 *	Handle VSA as "VENDOR + attr"
+	 */
+	if (da_stack->da[1]->type == FR_TYPE_VSA) {
+		fr_assert(da_stack->da[2]);
+		fr_assert(da_stack->da[2]->type == FR_TYPE_VENDOR);
 
-		evs[4] = tlv_stack[depth]->attr & 0xff;
+		FR_DBUFF_IN_RETURN(&work_dbuff, (uint32_t) da_stack->da[2]->attr);
 
-		out[1] += 5;
+		fr_assert(da_stack->da[3]);
 
-		FR_PROTO_STACK_PRINT(tlv_stack, depth);
-		FR_PROTO_HEX_DUMP("EVS", out, out[1]);
+		FR_DBUFF_IN_BYTES_RETURN(&work_dbuff, (uint8_t)da_stack->da[3]->attr);
 
+		hlen += 5;
+		vendor_hdr = 5;
+
+		FR_PROTO_STACK_PRINT(da_stack, depth);
+		FR_PROTO_HEX_DUMP(fr_dbuff_current(&hdr), hlen, "header extended vendor specific");
+
+		my_depth = 3;
+	} else {
+		vendor_hdr = 0;
+		FR_PROTO_HEX_DUMP(fr_dbuff_current(&hdr), hlen, "header extended");
+
+		my_depth = 1;
 	}
 
 	/*
-	 *	"outlen" can be larger than 255 here, but only for the
-	 *	"long" extended type.
+	 *	We're at the point where we need to encode something.
 	 */
-	if ((attr_type == FR_TYPE_EXTENDED) && (outlen > 255)) outlen = 255;
+	da = da_stack->da[my_depth];
+	fr_assert(vp->da == da);
 
-	if (tlv_stack[depth]->type == FR_TYPE_TLV) {
-		len = encode_tlv_hdr_internal(out + out[1], outlen - out[1], tlv_stack, depth, cursor, encoder_ctx);
+	if (da->type != FR_TYPE_STRUCT) {
+		slen = encode_value(&work_dbuff, da_stack, my_depth, cursor, encode_ctx);
+
 	} else {
-		len = encode_value(out + out[1], outlen - out[1], tlv_stack, depth, cursor, encoder_ctx);
+		slen = fr_struct_to_network(&work_dbuff, da_stack, my_depth, cursor, encode_ctx, encode_value, encode_child);
 	}
-	if (len <= 0) return len;
+	if (slen <= 0) return slen;
 
 	/*
 	 *	There may be more than 255 octets of data encoded in
 	 *	the attribute.  If so, move the data up in the packet,
 	 *	and copy the existing header over.  Set the "M" flag ONLY
 	 *	after copying the rest of the data.
+	 *
+	 *	Note that we add "vendor_hdr" to the length of the
+	 *	encoded data.  That 5 octet field is logically part of
+	 *	the data, and not part of the header.
 	 */
-	if (len > (255 - out[1])) {
-		return attr_shift(start, start + outlen, out, 4, len, 3, 0);
+	if (slen > (UINT8_MAX - hlen)) {
+		slen = attr_fragment(&work_dbuff, (size_t)vendor_hdr + slen, &hdr, 4, 3, 0);
+		if (slen <= 0) return slen;
+
+		return fr_dbuff_set(dbuff, &work_dbuff);
 	}
 
-	out[1] += len;
+	fr_dbuff_in_bytes(&length_field, (uint8_t) fr_dbuff_used(&work_dbuff));
+	FR_PROTO_HEX_DUMP(fr_dbuff_current(&hdr), hlen, "header extended");
 
-#ifndef NDEBUG
-	if ((fr_debug_lvl > 3) && fr_log_fp) {
-		int jump = 3;
+	return fr_dbuff_set(dbuff, &work_dbuff);
+}
 
-		fprintf(fr_log_fp, "\t\t%02x %02x  ", out[0], out[1]);
-		if (attr_type == FR_TYPE_EXTENDED) {
-			fprintf(fr_log_fp, "%02x  ", out[2]);
+/*
+ *	The encode_extended() function expects to see the TLV or
+ *	STRUCT inside of the extended attribute, in which case it
+ *	creates the attribute header and calls encode_value() for the
+ *	leaf type, or child TLV / struct.
+ *
+ *	If we see VSA or VENDOR, then we recurse past that to a child
+ *	which is either a leaf, or a TLV, or a STRUCT.
+ */
+static ssize_t encode_extended_nested(fr_dbuff_t *dbuff,
+				      fr_da_stack_t *da_stack, unsigned int depth,
+				      fr_dcursor_t *cursor, void *encode_ctx)
+{
+	ssize_t			slen;
+	fr_pair_t		*parent, *vp;
+	fr_dcursor_t		child_cursor;
+	fr_dbuff_t		work_dbuff = FR_DBUFF(dbuff);
+
+	parent = fr_dcursor_current(cursor);
+	fr_assert(fr_type_is_structural(parent->vp_type));
+
+	(void) fr_pair_dcursor_child_iter_init(&child_cursor, &parent->vp_group, cursor);
+
+	FR_PROTO_STACK_PRINT(da_stack, depth);
+
+	while ((vp = fr_dcursor_current(&child_cursor)) != NULL) {
+		if ((vp->vp_type == FR_TYPE_VSA) || (vp->vp_type == FR_TYPE_VENDOR)) {
+			slen = encode_extended_nested(&work_dbuff, da_stack, depth + 1, &child_cursor, encode_ctx);
 
 		} else {
-			fprintf(fr_log_fp, "%02x %02x  ", out[2], out[3]);
-			jump = 4;
+			fr_proto_da_stack_build(da_stack, vp->da);
+			slen = encode_extended(&work_dbuff, da_stack, depth, &child_cursor, encode_ctx);
+			if (slen < 0) return slen;
 		}
 
-		if (vsa_type == FR_TYPE_EVS) {
-			fprintf(fr_log_fp, "%02x%02x%02x%02x (%u)  %02x  ",
-				out[jump], out[jump + 1],
-				out[jump + 2], out[jump + 3],
-				((out[jump + 1] << 16) |
-				 (out[jump + 2] << 8) |
-				 out[jump + 3]),
-				out[jump + 4]);
-			jump += 5;
-		}
-
-		FR_PROTO_HEX_DUMP("Done extended header", out + jump, len);
+		if (slen < 0) return slen;
 	}
-#endif
 
-	return (out + out[1]) - start;
+	vp = fr_dcursor_next(cursor);
+
+	fr_proto_da_stack_build(da_stack, vp ? vp->da : NULL);
+
+	return fr_dbuff_set(dbuff, &work_dbuff);
 }
+
 
 /** Encode an RFC format attribute, with the "concat" flag set
  *
  * If there isn't enough freespace in the packet, the data is
  * truncated to fit.
+ *
+ * The attribute is split on 253 byte boundaries, with a header
+ * prepended to each chunk.
  */
-static ssize_t encode_concat(uint8_t *out, size_t outlen,
-			     fr_dict_attr_t const **tlv_stack, unsigned int depth,
-			     vp_cursor_t *cursor, UNUSED void *encoder_ctx)
+static ssize_t encode_concat(fr_dbuff_t *dbuff,
+			     fr_da_stack_t *da_stack, unsigned int depth,
+			     fr_dcursor_t *cursor, UNUSED void *encode_ctx)
 {
-	uint8_t			*ptr = out;
-	uint8_t			const *p;
-	size_t			len, left;
-	VALUE_PAIR const	*vp = fr_pair_cursor_current(cursor);
+	uint8_t const		*p;
+	size_t			data_len;
+	fr_pair_t const		*vp = fr_dcursor_current(cursor);
+	fr_dbuff_t		work_dbuff = FR_DBUFF(dbuff);
+	fr_dbuff_marker_t	hdr;
 
-	FR_PROTO_STACK_PRINT(tlv_stack, depth);
+	FR_PROTO_STACK_PRINT(da_stack, depth);
 
 	p = vp->vp_octets;
-	len = fr_radius_attr_len(vp);
+	data_len = vp->vp_length;
+	fr_dbuff_marker(&hdr, &work_dbuff);
 
-	while (len > 0) {
-		if (outlen <= 2) break;
+	while (data_len > 0) {
+		size_t frag_len = (data_len > RADIUS_MAX_STRING_LENGTH) ? RADIUS_MAX_STRING_LENGTH : data_len;
 
-		ptr[0] = tlv_stack[depth]->attr & 0xff;
-		ptr[1] = 2;
+		fr_dbuff_set(&hdr, &work_dbuff);
+		FR_DBUFF_IN_BYTES_RETURN(&work_dbuff, (uint8_t) da_stack->da[depth]->attr, 0x00);
 
-		left = len;
+		FR_DBUFF_IN_MEMCPY_RETURN(&work_dbuff, p, frag_len);
 
-		/* no more than 253 octets */
-		if (left > 253) left = 253;
+		fr_dbuff_advance(&hdr, 1);
+		fr_dbuff_in(&hdr, (uint8_t) (2 + frag_len));
 
-		/* no more than "freespace" octets */
-		if (outlen < (left + 2)) left = outlen - 2;
+		FR_PROTO_HEX_DUMP(fr_dbuff_current(&hdr) - 1, 2 + frag_len, "encode_concat fragment");
 
-		memcpy(ptr + 2, p, left);
-
-#ifndef NDEBUG
-		if ((fr_debug_lvl > 3) && fr_log_fp) {
-			fprintf(fr_log_fp, "\t\t%02x %02x  ", ptr[0], ptr[1]);
-			FR_PROTO_HEX_DUMP("Done concat", ptr + 2, len);
-		}
-#endif
-		ptr[1] += left;
-		ptr += ptr[1];
-		p += left;
-		outlen -= left;
-		len -= left;
+		p += frag_len;
+		data_len -= frag_len;
 	}
 
-	vp = next_encodable(cursor);
+	vp = fr_dcursor_next(cursor);
 
 	/*
 	 *	@fixme: attributes with 'concat' MUST of type
 	 *	'octets', and therefore CANNOT have any TLV data in them.
 	 */
-	fr_proto_tlv_stack_build(tlv_stack, vp ? vp->da : NULL);
+	fr_proto_da_stack_build(da_stack, vp ? vp->da : NULL);
 
-	return ptr - out;
+	return fr_dbuff_set(dbuff, &work_dbuff);
 }
 
-/** Encode an RFC format TLV.
+/** Encode an RFC format attribute.
  *
  * This could be a standard attribute, or a TLV data type.
  * If it's a standard attribute, then vp->da->attr == attribute.
  * Otherwise, attribute may be something else.
  */
-static ssize_t encode_rfc_hdr_internal(uint8_t *out, size_t outlen,
-				       fr_dict_attr_t const **tlv_stack, unsigned int depth,
-				       vp_cursor_t *cursor, void *encoder_ctx)
+static ssize_t encode_child(fr_dbuff_t *dbuff,
+				 fr_da_stack_t *da_stack, unsigned int depth,
+				 fr_dcursor_t *cursor, void *encode_ctx)
 {
-	ssize_t len;
+	ssize_t 		slen;
+	uint8_t			hlen;
+	fr_dbuff_marker_t	hdr;
+	fr_dbuff_t		work_dbuff = FR_DBUFF_MAX(dbuff, UINT8_MAX);
 
-	FR_PROTO_STACK_PRINT(tlv_stack, depth);
+	FR_PROTO_STACK_PRINT(da_stack, depth);
 
-	switch (tlv_stack[depth]->type) {
-	case FR_TYPE_STRUCTURAL:
-		fr_strerror_printf("%s: Called with structural type %s", __FUNCTION__,
-				   fr_int2str(dict_attr_types, tlv_stack[depth]->type, "?Unknown?"));
-		return -1;
+	fr_assert(da_stack->da[depth] != NULL);
 
-	default:
-		if (((tlv_stack[depth]->vendor == 0) && (tlv_stack[depth]->attr == 0)) ||
-		    (tlv_stack[depth]->attr > 255)) {
-			fr_strerror_printf("%s: Called with non-standard attribute %u", __FUNCTION__,
-					   tlv_stack[depth]->attr);
-			return -1;
-		}
-		break;
-	}
+	fr_dbuff_marker(&hdr, &work_dbuff);
 
-	if (outlen <= 2) return 0;
+	hlen = 2;
+	FR_DBUFF_IN_BYTES_RETURN(&work_dbuff, (uint8_t)da_stack->da[depth]->attr, hlen);
 
-	out[0] = tlv_stack[depth]->attr & 0xff;
-	out[1] = 2;
+	slen = encode_value(&work_dbuff, da_stack, depth, cursor, encode_ctx);
+	if (slen <= 0) return slen;
 
-	if (outlen > 255) outlen = 255;
+	fr_dbuff_advance(&hdr, 1);
+	fr_dbuff_in_bytes(&hdr, (uint8_t)(hlen + slen));
 
-	len = encode_value(out + out[1], outlen - out[1], tlv_stack, depth, cursor, encoder_ctx);
-	if (len <= 0) return len;
+	FR_PROTO_HEX_DUMP(fr_dbuff_start(&work_dbuff), 2, "header rfc");
 
-	out[1] += len;
-
-#ifndef NDEBUG
-	if ((fr_debug_lvl > 3) && fr_log_fp) {
-		fprintf(fr_log_fp, "\t\t%02x %02x  ", out[0], out[1]);
-		FR_PROTO_HEX_DUMP("Done RFC header", out + 2, len);
-	}
-#endif
-
-	return out[1];
+	return fr_dbuff_set(dbuff, &work_dbuff);
 }
 
 
-/** Encode a VSA which is a TLV
- *
- * If it's in the RFC format, call encode_rfc_hdr_internal.  Otherwise, encode it here.
+/** Encode one full Vendor-Specific + Vendor-ID + Vendor-Attr + Vendor-Length + ...
  */
-static ssize_t encode_vendor_attr_hdr(uint8_t *out, size_t outlen,
-				      fr_dict_attr_t const **tlv_stack, unsigned int depth,
-				      vp_cursor_t *cursor, void *encoder_ctx)
+static ssize_t encode_vendor_attr(fr_dbuff_t *dbuff,
+				  fr_da_stack_t *da_stack, unsigned int depth,
+				  fr_dcursor_t *cursor, void *encode_ctx)
 {
-	ssize_t			len;
+	ssize_t			slen;
 	size_t			hdr_len;
+	fr_dbuff_marker_t	hdr, length_field, vsa_length_field;
 	fr_dict_attr_t const	*da, *dv;
+	fr_dbuff_t		work_dbuff;
 
-	FR_PROTO_STACK_PRINT(tlv_stack, depth);
+	FR_PROTO_STACK_PRINT(da_stack, depth);
 
-	dv = tlv_stack[depth++];
+	dv = da_stack->da[depth++];
 
 	if (dv->type != FR_TYPE_VENDOR) {
-		fr_strerror_printf("Expected Vendor");
-		return -1;
+		fr_strerror_const("Expected Vendor");
+		return PAIR_ENCODE_FATAL_ERROR;
 	}
 
-	da = tlv_stack[depth];
+	/*
+	 *	Now we encode one vendor attribute.
+	 */
+	da = da_stack->da[depth];
+	fr_assert(da != NULL);
 
-	if ((da->type != FR_TYPE_TLV) && (dv->flags.type_size == 1) && (dv->flags.length == 1)) {
-		return encode_rfc_hdr_internal(out, outlen, tlv_stack, depth, cursor, encoder_ctx);
+	/*
+	 *	Most VSAs get limited to the one attribute.  Only refs
+	 *	(e.g. DHCPv4, DHCpv6) can get fragmented.
+	 */
+	if (da->type != FR_TYPE_GROUP) {
+		work_dbuff = FR_DBUFF_MAX(dbuff, UINT8_MAX);
+	} else {
+		work_dbuff = FR_DBUFF(dbuff);
 	}
+
+	fr_dbuff_marker(&hdr, &work_dbuff);
+
+	/*
+	 *	Build the Vendor-Specific header
+	 */
+	FR_DBUFF_IN_BYTES_RETURN(&work_dbuff, FR_VENDOR_SPECIFIC);
+
+	fr_dbuff_marker(&length_field, &work_dbuff);
+	FR_DBUFF_IN_BYTES_RETURN(&work_dbuff, 0);
+
+	FR_DBUFF_IN_RETURN(&work_dbuff, (uint32_t)dv->attr);	/* Copy in the 32bit vendor ID */
+
 
 	hdr_len = dv->flags.type_size + dv->flags.length;
 
@@ -1169,292 +1014,427 @@ static ssize_t encode_vendor_attr_hdr(uint8_t *out, size_t outlen,
 	switch (dv->flags.type_size) {
 	default:
 		fr_strerror_printf("%s: Internal sanity check failed, type %u", __FUNCTION__, (unsigned) dv->flags.type_size);
-		return -1;
+		return PAIR_ENCODE_FATAL_ERROR;
 
 	case 4:
-		out[0] = 0;	/* attr must be 24-bit */
-		out[1] = (da->attr >> 16) & 0xff;
-		out[2] = (da->attr >> 8) & 0xff;
-		out[3] = da->attr & 0xff;
+		fr_dbuff_in(&work_dbuff, (uint32_t)da->attr);
 		break;
 
 	case 2:
-		out[0] = (da->attr >> 8) & 0xff;
-		out[1] = da->attr & 0xff;
+		fr_dbuff_in(&work_dbuff, (uint16_t)da->attr);
 		break;
 
 	case 1:
-		out[0] = da->attr & 0xff;
+		fr_dbuff_in(&work_dbuff, (uint8_t)da->attr);
 		break;
 	}
 
+	/*
+	 *	The length fields will get over-written later.
+	 */
 	switch (dv->flags.length) {
 	default:
 		fr_strerror_printf("%s: Internal sanity check failed, length %u", __FUNCTION__, (unsigned) dv->flags.length);
-		return -1;
+		return PAIR_ENCODE_FATAL_ERROR;
 
 	case 0:
 		break;
 
 	case 2:
-		out[dv->flags.type_size] = 0;
-		out[dv->flags.type_size + 1] = dv->flags.type_size + 2;
-		break;
+		fr_dbuff_in_bytes(&work_dbuff, 0);
+		FALL_THROUGH;
 
 	case 1:
-		out[dv->flags.type_size] = dv->flags.type_size + 1;
+		/*
+		 *	Length fields are set to zero, because they
+		 *	will get over-ridden later.
+		 */
+		fr_dbuff_marker(&vsa_length_field, &work_dbuff);
+		fr_dbuff_in_bytes(&work_dbuff, 0);
 		break;
-
 	}
 
-	if (outlen > 255) outlen = 255;
+	slen = encode_value(&work_dbuff, da_stack, depth, cursor, encode_ctx);
+	if (slen <= 0) return slen;
 
 	/*
-	 *	Because we've now encoded the attribute header,
-	 *	if this is a TLV, we must process it via the
-	 *	internal tlv function, else we get a double TLV header.
+	 *	There may be more than 253 octets of data encoded in
+	 *	the attribute.  If so, move the data up in the packet,
+	 *	and copy the existing header over.  Set the "C" flag
+	 *	ONLY after copying the rest of the data.
+	 *
+	 *	Note that we do NOT check 'slen' here, as it's only
+	 *	the size of the sub-sub attribute, and doesn't include
+	 *	the RADIUS attribute header, or Vendor-ID.
 	 */
-	if (tlv_stack[depth]->type == FR_TYPE_TLV) {
-		len = encode_tlv_hdr_internal(out + hdr_len, outlen - hdr_len, tlv_stack, depth, cursor, encoder_ctx);
+	if (fr_dbuff_used(&work_dbuff) > UINT8_MAX) {
+		size_t length_offset = 0;
+
+		if (dv->flags.length) length_offset = 6 + hdr_len - 1;
+
+		slen = attr_fragment(&work_dbuff, (size_t)slen, &hdr, 6 + hdr_len, 0, length_offset);
+		if (slen <= 0) return slen;
 	} else {
-		len = encode_value(out + hdr_len, outlen - hdr_len, tlv_stack, depth, cursor, encoder_ctx);
-	}
-	if (len <= 0) return len;
-
-	if (dv->flags.length) out[hdr_len - 1] += len;
-
-#ifndef NDEBUG
-	if ((fr_debug_lvl > 3) && fr_log_fp) {
-		switch (dv->flags.type_size) {
-		default:
-			break;
-
-		case 4:
-			if ((fr_debug_lvl > 3) && fr_log_fp)
-				fprintf(fr_log_fp, "\t\t%02x%02x%02x%02x ", out[0], out[1], out[2], out[3]);
-			break;
-
-		case 2:
-			if ((fr_debug_lvl > 3) && fr_log_fp) fprintf(fr_log_fp, "\t\t%02x%02x ", out[0], out[1]);
-			break;
-
-		case 1:
-			if ((fr_debug_lvl > 3) && fr_log_fp) fprintf(fr_log_fp, "\t\t%02x ", out[0]);
-			break;
+		if (dv->flags.length) {
+			fr_dbuff_in(&vsa_length_field, (uint8_t)(hdr_len + slen));
 		}
 
-		switch (dv->flags.length) {
-		default:
-			break;
-
-		case 0:
-			fprintf(fr_log_fp, "  ");
-			break;
-
-		case 1:
-			fprintf(fr_log_fp, "%02x  ", out[dv->flags.type_size]);
-			break;
-
-		case 2:
-			fprintf(fr_log_fp, "%02x%02x  ", out[dv->flags.type_size], out[dv->flags.type_size] + 1);
-			break;
-		}
-
-		FR_PROTO_HEX_DUMP("Done RFC header", out + hdr_len, len);
+		fr_dbuff_in(&length_field, (uint8_t) fr_dbuff_used(&work_dbuff));
 	}
-#endif
 
-	return hdr_len + len;
+	FR_PROTO_HEX_DUMP(fr_dbuff_current(&hdr), 6 + hdr_len, "header vsa");
+
+	return fr_dbuff_set(dbuff, &work_dbuff);
 }
 
 /** Encode a WiMAX attribute
  *
  */
-static int encode_wimax_hdr(uint8_t *out, size_t outlen,
-			    fr_dict_attr_t const **tlv_stack, unsigned int depth,
-			    vp_cursor_t *cursor, void *encoder_ctx)
+static ssize_t encode_wimax(fr_dbuff_t *dbuff,
+				fr_da_stack_t *da_stack, unsigned int depth,
+				fr_dcursor_t *cursor, void *encode_ctx)
 {
-	int			len;
-	uint32_t		lvalue;
-	uint8_t			*start = out;
-	VALUE_PAIR const	*vp = fr_pair_cursor_current(cursor);
+	ssize_t			slen;
+	fr_dbuff_t		work_dbuff = FR_DBUFF(dbuff);
+	fr_dbuff_marker_t	hdr, length_field, vsa_length_field;
+	fr_dict_attr_t const	*dv;
+	fr_pair_t const		*vp = fr_dcursor_current(cursor);
 
-	VP_VERIFY(vp);
-	FR_PROTO_STACK_PRINT(tlv_stack, depth);
+	fr_dbuff_marker(&hdr, &work_dbuff);
 
-	/*
-	 *	Not enough freespace for:
-	 *		attr, len, vendor-id, vsa, vsalen, continuation
-	 */
-	if (outlen < 9) return 0;
+	PAIR_VERIFY(vp);
+	FR_PROTO_STACK_PRINT(da_stack, depth);
 
-	if (tlv_stack[depth++]->attr != FR_VENDOR_SPECIFIC) {
-		fr_strerror_printf("%s: level[1] of tlv_stack is incorrect, must be Vendor-Specific (26)",
-				   __FUNCTION__);
-		return -1;
+	dv = da_stack->da[depth++];
+
+	if (dv->type != FR_TYPE_VENDOR) {
+		fr_strerror_const("Expected Vendor");
+		return PAIR_ENCODE_FATAL_ERROR;
 	}
-	FR_PROTO_STACK_PRINT(tlv_stack, depth);
 
-	if (tlv_stack[depth++]->attr != VENDORPEC_WIMAX) {
-		fr_strerror_printf("%s: level[2] of tlv_stack is incorrect, must be Wimax vendor %i", __FUNCTION__,
-				   VENDORPEC_WIMAX);
-		return -1;
-	}
-	FR_PROTO_STACK_PRINT(tlv_stack, depth);
+	FR_PROTO_STACK_PRINT(da_stack, depth);
 
 	/*
 	 *	Build the Vendor-Specific header
 	 */
-	out = start;
-	out[0] = FR_VENDOR_SPECIFIC;
-	out[1] = 9;
-	lvalue = htonl(vp->da->vendor);
-	memcpy(out + 2, &lvalue, 4);
+	FR_DBUFF_IN_BYTES_RETURN(&work_dbuff, FR_VENDOR_SPECIFIC);
+	fr_dbuff_marker(&length_field, &work_dbuff);
+	FR_DBUFF_IN_BYTES_RETURN(&work_dbuff, 0x09);
+
+	FR_DBUFF_IN_RETURN(&work_dbuff, (uint32_t) dv->attr);
 
 	/*
 	 *	Encode the first attribute
 	 */
-	out[6] = tlv_stack[depth]->attr;
-	out[7] = 3;
-	out[8] = 0;		/* continuation byte */
+	FR_DBUFF_IN_BYTES_RETURN(&work_dbuff, (uint8_t)da_stack->da[depth]->attr);
+
+	fr_dbuff_marker(&vsa_length_field, &work_dbuff);
+	FR_DBUFF_IN_BYTES_RETURN(&work_dbuff, 0x03, 0x00); /* length + continuation, both may be overwritten later */
 
 	/*
-	 *	"outlen" can be larger than 255 because of the "continuation" byte.
+	 *	We don't bound the size of work_dbuff; it can use more than UINT8_MAX bytes
+	 *	because of the "continuation" byte.
 	 */
-
-	if (tlv_stack[depth]->type == FR_TYPE_TLV) {
-		len = encode_tlv_hdr_internal(out + out[1], outlen - out[1], tlv_stack, depth, cursor, encoder_ctx);
-		if (len <= 0) return len;
-	} else {
-		len = encode_value(out + out[1], outlen - out[1], tlv_stack, depth, cursor, encoder_ctx);
-		if (len <= 0) return len;
-	}
+	slen = encode_value(&work_dbuff, da_stack, depth, cursor, encode_ctx);
+	if (slen <= 0) return slen;
 
 	/*
-	 *	There may be more than 252 octets of data encoded in
+	 *	There may be more than 253 octets of data encoded in
 	 *	the attribute.  If so, move the data up in the packet,
 	 *	and copy the existing header over.  Set the "C" flag
 	 *	ONLY after copying the rest of the data.
+	 *
+	 *	Note that we do NOT check 'slen' here, as it's only
+	 *	the size of the sub-sub attribute, and doesn't include
+	 *	the RADIUS attribute header, or Vendor-ID.
 	 */
-	if (len > (255 - out[1])) {
-		return attr_shift(start, start + outlen, out, out[1], len, 8, 7);
+	if (fr_dbuff_used(&work_dbuff) > UINT8_MAX) {
+		slen = attr_fragment(&work_dbuff, (size_t)slen, &hdr, 9, 8, 7);
+		if (slen <= 0) return slen;
+
+		return fr_dbuff_set(dbuff, &work_dbuff);
 	}
 
-	out[1] += len;
-	out[7] += len;
+	fr_dbuff_in_bytes(&vsa_length_field, (uint8_t) (fr_dbuff_used(&work_dbuff) - 6));
+	fr_dbuff_in_bytes(&length_field, (uint8_t) fr_dbuff_used(&work_dbuff));
 
-#ifndef NDEBUG
-	if ((fr_debug_lvl > 3) && fr_log_fp) {
-		fprintf(fr_log_fp, "\t\t%02x %02x  %02x%02x%02x%02x (%u)  %02x %02x %02x   ",
-			out[0], out[1],
-			out[2], out[3], out[4], out[5],
-			(out[3] << 16) | (out[4] << 8) | out[5],
-			out[6], out[7], out[8]);
-		FR_PROTO_HEX_DUMP("Done wimax header", out + 9, len);
+	FR_PROTO_HEX_DUMP(fr_dbuff_current(&hdr), 9, "header wimax");
+
+	return fr_dbuff_set(dbuff, &work_dbuff);
+}
+
+static ssize_t encode_vendor(fr_dbuff_t *dbuff,
+				 fr_da_stack_t *da_stack, unsigned int depth,
+				 fr_dcursor_t *cursor, void *encode_ctx)
+{
+	fr_dict_attr_t const	*da = da_stack->da[depth];
+	ssize_t			slen;
+	fr_pair_t		*vp;
+	fr_dict_vendor_t const	*dv;
+	fr_dcursor_t		child_cursor;
+	fr_dbuff_t		work_dbuff;
+
+	FR_PROTO_STACK_PRINT(da_stack, depth);
+
+	if (da->type != FR_TYPE_VENDOR) {
+		fr_strerror_printf("%s: Expected type \"vendor\" got \"%s\"", __FUNCTION__,
+				   fr_type_to_str(da->type));
+		return PAIR_ENCODE_FATAL_ERROR;
 	}
-#endif
 
-	return (out + out[1]) - start;
+	dv = fr_dict_vendor_by_da(da_stack->da[depth]);
+
+	/*
+	 *	Flat hierarchy, encode one attribute at a time.
+	 *
+	 *	Note that there's no attempt to encode multiple VSAs
+	 *	into one attribute.  We can add that back as a flag,
+	 *	once all of the nested attribute conversion has been
+	 *	done.
+	 */
+	if (da_stack->da[depth + 1]) {
+		if (dv && dv->continuation) {
+			return encode_wimax(dbuff, da_stack, depth, cursor, encode_ctx);
+		}
+
+		return encode_vendor_attr(dbuff, da_stack, depth, cursor, encode_ctx);
+	}
+
+	/*
+	 *	Loop over the children of this attribute of type Vendor.
+	 */
+	vp = fr_dcursor_current(cursor);
+	fr_assert(vp->da == da);
+	work_dbuff = FR_DBUFF(dbuff);
+
+	fr_pair_dcursor_child_iter_init(&child_cursor, &vp->vp_group, cursor);
+	while ((vp = fr_dcursor_current(&child_cursor)) != NULL) {
+		fr_proto_da_stack_build(da_stack, vp->da);
+
+		if (dv && dv->continuation) {
+			slen = encode_wimax(&work_dbuff, da_stack, depth, &child_cursor, encode_ctx);
+		} else {
+			slen = encode_vendor_attr(&work_dbuff, da_stack, depth, &child_cursor, encode_ctx);
+		}
+		if (slen < 0) return slen;
+	}
+
+	vp = fr_dcursor_next(cursor);
+	fr_proto_da_stack_build(da_stack, vp ? vp->da : NULL);
+
+	return fr_dbuff_set(dbuff, &work_dbuff);
 }
 
 /** Encode a Vendor-Specific attribute
  *
  */
-static int encode_vsa_hdr(uint8_t *out, size_t outlen,
-			  fr_dict_attr_t const **tlv_stack, unsigned int depth,
-			  vp_cursor_t *cursor, void *encoder_ctx)
+static ssize_t encode_vsa(fr_dbuff_t *dbuff,
+			      fr_da_stack_t *da_stack, unsigned int depth,
+			      fr_dcursor_t *cursor, void *encode_ctx)
 {
-	ssize_t			len;
-	uint32_t		lvalue;
-	fr_dict_attr_t const	*da = tlv_stack[depth];
+	ssize_t			slen;
+	fr_pair_t		*vp;
+	fr_dcursor_t		child_cursor;
+	fr_dict_attr_t const	*da = da_stack->da[depth];
+	fr_dbuff_t		work_dbuff;
 
-	FR_PROTO_STACK_PRINT(tlv_stack, depth);
+	FR_PROTO_STACK_PRINT(da_stack, depth);
 
 	if (da->type != FR_TYPE_VSA) {
 		fr_strerror_printf("%s: Expected type \"vsa\" got \"%s\"", __FUNCTION__,
-				   fr_int2str(dict_attr_types, da->type, "?Unknown?"));
-		return -1;
+				   fr_type_to_str(da->type));
+		return PAIR_ENCODE_FATAL_ERROR;
 	}
 
 	/*
-	 *	Double-check for WiMAX format.
+	 *	Loop over the contents of Vendor-Specific, each of
+	 *	which MUST be of type FR_TYPE_VENDOR.
 	 */
-	if (da->vendor == VENDORPEC_WIMAX) return encode_wimax_hdr(out, outlen, tlv_stack, depth + 1, cursor, encoder_ctx);
-
-	/*
-	 *	Not enough freespace for: attr, len, vendor-id
-	 */
-	if (outlen < 6) return 0;
-
-	/*
-	 *	Build the Vendor-Specific header
-	 */
-	out[0] = FR_VENDOR_SPECIFIC;
-	out[1] = 6;
-
-	/*
-	 *	Now process the vendor ID part (which is one attribute deeper)
-	 */
-	da = tlv_stack[++depth];
-	FR_PROTO_STACK_PRINT(tlv_stack, depth);
-
-	if (da->type != FR_TYPE_VENDOR) {
-		fr_strerror_printf("%s: Expected type \"vsa\" got \"%s\"", __FUNCTION__,
-				   fr_int2str(dict_attr_types, da->type, "?Unknown?"));
-		return -1;
+	if (da_stack->da[depth + 1]) {
+		return encode_vendor(dbuff, da_stack, depth + 1, cursor, encode_ctx);
 	}
 
-	lvalue = htonl(da->attr);
-	memcpy(out + 2, &lvalue, 4);	/* Copy in the 32bit vendor ID */
+	work_dbuff = FR_DBUFF(dbuff);
 
-	if (outlen > 255) outlen = 255;
-
-	len = encode_vendor_attr_hdr(out + out[1], outlen - out[1], tlv_stack, depth, cursor, encoder_ctx);
-	if (len < 0) return len;
-
-#ifndef NDEBUG
-	if ((fr_debug_lvl > 3) && fr_log_fp) {
-		fprintf(fr_log_fp, "\t\t%02x %02x  %02x%02x%02x%02x (%u)  ",
-			out[0], out[1],
-			out[2], out[3], out[4], out[5],
-			(out[3] << 16) | (out[4] << 8) | out[5]);
-		FR_PROTO_HEX_DUMP("Done VSA header", out + 6, len);
+	vp = fr_dcursor_current(cursor);
+	if (vp->da != da_stack->da[depth]) {
+		fr_strerror_printf("%s: Can't encode empty Vendor-Specific", __FUNCTION__);
+		return 0;
 	}
-#endif
-	out[1] += len;
 
-	return out[1];
+	/*
+	 *	Loop over the children of this Vendor-Specific
+	 *	attribute.
+	 */
+	fr_pair_dcursor_child_iter_init(&child_cursor, &vp->vp_group, cursor);
+	while ((vp = fr_dcursor_current(&child_cursor)) != NULL) {
+		fr_proto_da_stack_build(da_stack, vp->da);
+
+		fr_assert(da_stack->da[depth + 1]->type == FR_TYPE_VENDOR);
+
+		slen = encode_vendor(&work_dbuff, da_stack, depth + 1, &child_cursor, encode_ctx);
+		if (slen < 0) return slen;
+	}
+
+	/*
+	 *	Fix up the da stack, and return the data we've encoded.
+	 */
+	vp = fr_dcursor_next(cursor);
+	fr_proto_da_stack_build(da_stack, vp ? vp->da : NULL);
+
+	FR_PROTO_HEX_DUMP(fr_dbuff_start(&work_dbuff), 6, "header vsa");
+
+	return fr_dbuff_set(dbuff, &work_dbuff);
+}
+
+/** Encode NAS-Filter-Rule
+ *
+ *  Concatenating the string attributes together, separated by a 0x00 byte,
+ */
+static ssize_t encode_nas_filter_rule(fr_dbuff_t *dbuff,
+				      fr_da_stack_t *da_stack, NDEBUG_UNUSED unsigned int depth,
+				      fr_dcursor_t *cursor, UNUSED void *encode_ctx)
+{
+	fr_dbuff_t		work_dbuff = FR_DBUFF(dbuff);
+	fr_dbuff_marker_t	hdr, frag_hdr;
+	fr_pair_t		*vp = fr_dcursor_current(cursor);
+	size_t			attr_len = 2;
+
+	FR_PROTO_STACK_PRINT(da_stack, depth);
+
+	fr_assert(vp);
+	fr_assert(vp->da);
+
+	fr_dbuff_marker(&hdr, &work_dbuff);
+	fr_dbuff_marker(&frag_hdr, &work_dbuff);
+	fr_dbuff_advance(&hdr, 1);
+	FR_DBUFF_IN_BYTES_RETURN(&work_dbuff, (uint8_t)vp->da->attr, 0x00);
+
+	fr_assert(vp->da == attr_nas_filter_rule);
+
+	while (true) {
+		size_t data_len = vp->vp_length;
+		size_t frag_len;
+		char const *p = vp->vp_strvalue;
+
+		/*
+		 *	Keep encoding this attribute until it's done.
+		 */
+		while (data_len > 0) {
+			frag_len = data_len;
+
+			/*
+			 *	This fragment doesn't overflow the
+			 *	attribute.  Copy it over, update the
+			 *	length, but leave the marker at the
+			 *	current header.
+			 */
+			if ((attr_len + frag_len) <= UINT8_MAX) {
+				FR_DBUFF_IN_MEMCPY_RETURN(&work_dbuff, p, frag_len);
+				attr_len += frag_len;
+
+				fr_dbuff_set(&frag_hdr, &hdr);
+				fr_dbuff_in(&frag_hdr, (uint8_t) attr_len); /* there's no fr_dbuff_in_no_advance() */
+				break;
+			}
+
+			/*
+			 *	This fragment overflows the attribute.
+			 *	Copy the fragment in, and create a new
+			 *	attribute header.
+			 */
+			frag_len = UINT8_MAX - attr_len;
+			FR_DBUFF_IN_MEMCPY_RETURN(&work_dbuff, p, frag_len);
+			fr_dbuff_in(&hdr, (uint8_t) UINT8_MAX);
+
+			fr_dbuff_marker(&hdr, &work_dbuff);
+			fr_dbuff_advance(&hdr, 1);
+			FR_DBUFF_IN_BYTES_RETURN(&work_dbuff, (uint8_t)vp->da->attr, 0x02);
+			attr_len = 2;
+
+			p += frag_len;
+			data_len -= frag_len;
+		}
+
+		/*
+		 *	If we have nothing more to do here, then stop.
+		 */
+		vp = fr_dcursor_next(cursor);
+		if (!vp || (vp->da != attr_nas_filter_rule)) {
+			break;
+		}
+
+		/*
+		 *	We have to add a zero byte.  If it doesn't
+		 *	overflow the current attribute, then just add
+		 *	it in.
+		 */
+		if (attr_len < UINT8_MAX) {
+			attr_len++;
+			FR_DBUFF_IN_BYTES_RETURN(&work_dbuff, 0x00);
+
+			fr_dbuff_set(&frag_hdr, &hdr);
+			fr_dbuff_in(&frag_hdr, (uint8_t) attr_len); /* there's no fr_dbuff_in_no_advance() */
+			continue;
+		}
+
+		/*
+		 *	The zero byte causes the current attribute to
+		 *	overflow.  Create a new header with the zero
+		 *	byte already populated, and keep going.
+		 */
+		fr_dbuff_marker(&hdr, &work_dbuff);
+		fr_dbuff_advance(&hdr, 1);
+		FR_DBUFF_IN_BYTES_RETURN(&work_dbuff, (uint8_t)vp->da->attr, 0x00, 0x00);
+		attr_len = 3;
+	}
+
+	vp = fr_dcursor_current(cursor);
+	fr_proto_da_stack_build(da_stack, vp ? vp->da : NULL);
+
+	return fr_dbuff_set(dbuff, &work_dbuff);
 }
 
 /** Encode an RFC standard attribute 1..255
  *
+ *  This function is not the same as encode_child(), because this
+ *  one treats some "top level" attributes as special.  e.g.
+ *  Message-Authenticator.
  */
-static int encode_rfc_hdr(uint8_t *out, size_t outlen, fr_dict_attr_t const **tlv_stack, unsigned int depth,
-			  vp_cursor_t *cursor, void *encoder_ctx)
+static ssize_t encode_rfc(fr_dbuff_t *dbuff, fr_da_stack_t *da_stack, unsigned int depth,
+			      fr_dcursor_t *cursor, void *encode_ctx)
 {
-	VALUE_PAIR const *vp = fr_pair_cursor_current(cursor);
+	fr_pair_t const	*vp = fr_dcursor_current(cursor);
+	fr_dbuff_t		work_dbuff = FR_DBUFF(dbuff);
+	fr_dbuff_marker_t	start;
+	fr_radius_encode_ctx_t	*packet_ctx = encode_ctx;
+
+	fr_dbuff_marker(&start, &work_dbuff);
 
 	/*
 	 *	Sanity checks
 	 */
-	VP_VERIFY(vp);
-	FR_PROTO_STACK_PRINT(tlv_stack, depth);
+	PAIR_VERIFY(vp);
+	FR_PROTO_STACK_PRINT(da_stack, depth);
 
-	switch (tlv_stack[depth]->type) {
-	case FR_TYPE_STRUCTURAL:
+	switch (da_stack->da[depth]->type) {
+	case FR_TYPE_TLV:
+	case FR_TYPE_VSA:
+	case FR_TYPE_VENDOR:
+		/* FR_TYPE_STRUCT is actually allowed... */
 		fr_strerror_printf("%s: Expected leaf type got \"%s\"", __FUNCTION__,
-				   fr_int2str(dict_attr_types, tlv_stack[depth]->type, "?Unknown?"));
-		return -1;
+				   fr_type_to_str(da_stack->da[depth]->type));
+		return PAIR_ENCODE_FATAL_ERROR;
 
 	default:
 		/*
 		 *	Attribute 0 is fine as a TLV leaf, or VSA, but not
 		 *	in the original standards space.
 		 */
-		if (((tlv_stack[depth]->vendor == 0) && (tlv_stack[depth]->attr == 0)) ||
-		    (tlv_stack[depth]->attr > 255)) {
+		if (((fr_dict_vendor_num_by_da(da_stack->da[depth]) == 0) && (da_stack->da[depth]->attr == 0)) ||
+		    (da_stack->da[depth]->attr > UINT8_MAX)) {
 			fr_strerror_printf("%s: Called with non-standard attribute %u", __FUNCTION__, vp->da->attr);
-			return -1;
+			return 0;
 		}
 		break;
 	}
@@ -1463,86 +1443,133 @@ static int encode_rfc_hdr(uint8_t *out, size_t outlen, fr_dict_attr_t const **tl
 	 *	Only CUI is allowed to have zero length.
 	 *	Thank you, WiMAX!
 	 */
-	if ((vp->da->attr == FR_CHARGEABLE_USER_IDENTITY) && (vp->vp_length == 0)) {
-		out[0] = FR_CHARGEABLE_USER_IDENTITY;
-		out[1] = 2;
+	if ((vp->da == attr_chargeable_user_identity) && (vp->vp_length == 0)) {
+		fr_dbuff_in_bytes(&work_dbuff, (uint8_t)vp->da->attr, 0x02);
 
-		vp = next_encodable(cursor);
-		fr_proto_tlv_stack_build(tlv_stack, vp ? vp->da : NULL);
-		return out[1];
+		FR_PROTO_HEX_DUMP(fr_dbuff_current(&start), 2, "header rfc");
+
+		vp = fr_dcursor_next(cursor);
+		fr_proto_da_stack_build(da_stack, vp ? vp->da : NULL);
+		return fr_dbuff_set(dbuff, &work_dbuff);
 	}
 
 	/*
 	 *	Message-Authenticator is hard-coded.
 	 */
-	if (!vp->da->vendor && (vp->da->attr == FR_MESSAGE_AUTHENTICATOR)) {
-		if (outlen < 18) return -1;
+	if (vp->da == attr_message_authenticator) {
+		if (!packet_ctx->seen_message_authenticator) {
+			FR_DBUFF_IN_BYTES_RETURN(&work_dbuff, (uint8_t)vp->da->attr, 18);
+			FR_DBUFF_MEMSET_RETURN(&work_dbuff, 0, RADIUS_MESSAGE_AUTHENTICATOR_LENGTH);
 
-		out[0] = FR_MESSAGE_AUTHENTICATOR;
-		out[1] = 18;
-		memset(out + 2, 0, 16);
-#ifndef NDEBUG
-		if ((fr_debug_lvl > 3) && fr_log_fp) {
-			fprintf(fr_log_fp, "\t\t50 12 ...\n");
+			FR_PROTO_HEX_DUMP(fr_dbuff_current(&start) + 2, RADIUS_MESSAGE_AUTHENTICATOR_LENGTH,
+					  "message-authenticator");
+			FR_PROTO_HEX_DUMP(fr_dbuff_current(&start), 2, "header rfc");
+
+			packet_ctx->seen_message_authenticator = true;
 		}
-#endif
-		vp = next_encodable(cursor);
-		fr_proto_tlv_stack_build(tlv_stack, vp ? vp->da : NULL);
-		return out[1];
+
+		vp = fr_dcursor_next(cursor);
+		fr_proto_da_stack_build(da_stack, vp ? vp->da : NULL);
+		return fr_dbuff_set(dbuff, &work_dbuff);
 	}
 
-	return encode_rfc_hdr_internal(out, outlen, tlv_stack, depth, cursor, encoder_ctx);
+	/*
+	 *	NAS-Filter-Rule has a stupid format in order to save
+	 *	one byte per attribute.
+	 */
+	if (vp->da == attr_nas_filter_rule) {
+		return encode_nas_filter_rule(dbuff, da_stack, depth, cursor, encode_ctx);
+	}
+
+	/*
+	 *	Once we've checked for various top-level magic, RFC attributes are just TLVs.
+	 */
+	return encode_child(dbuff, da_stack, depth, cursor, encode_ctx);
 }
 
 /** Encode a data structure into a RADIUS attribute
  *
  * This is the main entry point into the encoder.  It sets up the encoder array
- * we use for tracking our TLV/VSA/EVS nesting and then calls the appropriate
+ * we use for tracking our TLV/VSA nesting and then calls the appropriate
  * dispatch function.
  *
- * @param[out] out		Where to write encoded data.
- * @param[in] outlen		Length of the out buffer.
+ * @param[out] dbuff		Where to write encoded data.
  * @param[in] cursor		Specifying attribute to encode.
- * @param[in] encoder_ctx	Additional data such as the shared secret to use.
+ * @param[in] encode_ctx	Additional data such as the shared secret to use.
  * @return
  *	- >0 The number of bytes written to out.
  *	- 0 Nothing to encode (or attribute skipped).
  *	- <0 an error occurred.
  */
-ssize_t fr_radius_encode_pair(uint8_t *out, size_t outlen, vp_cursor_t *cursor, void *encoder_ctx)
+ssize_t fr_radius_encode_pair(fr_dbuff_t *dbuff, fr_dcursor_t *cursor, void *encode_ctx)
 {
-	VALUE_PAIR const *vp;
-	int ret;
-	size_t attr_len;
+	fr_pair_t const		*vp;
+	ssize_t			slen;
+	fr_dbuff_t		work_dbuff = FR_DBUFF(dbuff);
 
-	fr_dict_attr_t const *tlv_stack[FR_DICT_MAX_TLV_STACK + 1];
-	fr_dict_attr_t const *da = NULL;
+	fr_da_stack_t		da_stack;
+	fr_dict_attr_t const	*da = NULL;
 
-	if (!cursor || !out || (outlen <= 2)) return -1;
+	if (!cursor) return PAIR_ENCODE_FATAL_ERROR;
 
-	vp = first_encodable(cursor);
+	vp = fr_dcursor_current(cursor);
 	if (!vp) return 0;
 
-	VP_VERIFY(vp);
+	PAIR_VERIFY(vp);
 
 	if (vp->da->depth > FR_DICT_MAX_TLV_STACK) {
 		fr_strerror_printf("%s: Attribute depth %i exceeds maximum nesting depth %i",
 				   __FUNCTION__, vp->da->depth, FR_DICT_MAX_TLV_STACK);
-		return -1;
+		return PAIR_ENCODE_FATAL_ERROR;
 	}
 
 	/*
-	 *	We allow zero-length strings in "unlang", but skip
-	 *	them (except for CUI, thanks WiMAX!) on all other
-	 *	attributes.
+	 *	Tags are *top-level*, and are never nested.
 	 */
-	if (fr_radius_attr_len(vp) == 0) {
-		if ((vp->da->vendor != 0) ||
-		    ((vp->da->attr != FR_CHARGEABLE_USER_IDENTITY) &&
-		     (vp->da->attr != FR_MESSAGE_AUTHENTICATOR))) {
-			next_encodable(cursor);
+	if ((vp->vp_type == FR_TYPE_GROUP) && vp->da->flags.internal &&
+	    (vp->da->attr > FR_TAG_BASE) && (vp->da->attr < (FR_TAG_BASE + 0x20))) {
+		fr_radius_encode_ctx_t	*packet_ctx = encode_ctx;
+
+		packet_ctx->tag = vp->da->attr - FR_TAG_BASE;
+		fr_assert(packet_ctx->tag > 0);
+		fr_assert(packet_ctx->tag < 0x20);
+
+		// recurse to encode the children of this attribute
+		slen = encode_pairs(&work_dbuff, &vp->vp_group, encode_ctx);
+		packet_ctx->tag = 0;
+		if (slen < 0) return slen;
+
+		fr_dcursor_next(cursor); /* skip the tag attribute */
+		return fr_dbuff_set(dbuff, &work_dbuff);
+	}
+
+	/*
+	 *	Check for zero-length attributes.
+	 */
+	switch (vp->vp_type) {
+	default:
+		break;
+
+		/*
+		 *	Only variable length data types can be
+		 *	variable sized.  All others have fixed size.
+		 */
+	case FR_TYPE_STRING:
+	case FR_TYPE_OCTETS:
+		/*
+		 *	Zero-length strings are allowed for CUI
+		 *	(thanks WiMAX!), and for
+		 *	Message-Authenticator, because we will
+		 *	automagically generate that one ourselves.
+		 */
+		if ((vp->vp_length == 0) &&
+		    (vp->da != attr_chargeable_user_identity) &&
+		    (vp->da != attr_message_authenticator)) {
+			fr_dcursor_next(cursor);
+			fr_strerror_const("Zero length string attributes not allowed");
 			return 0;
 		}
+		break;
 	}
 
 	/*
@@ -1550,113 +1577,207 @@ ssize_t fr_radius_encode_pair(uint8_t *out, size_t outlen, vp_cursor_t *cursor, 
 	 *	255 bytes, so each call to an encode function can
 	 *	only use 255 bytes of buffer space at a time.
 	 */
-	attr_len = (outlen > UINT8_MAX) ? UINT8_MAX : outlen;
 
 	/*
 	 *	Fast path for the common case.
 	 */
-	if (vp->da->parent->flags.is_root && !vp->da->flags.concat && (vp->vp_type != FR_TYPE_TLV)) {
-		tlv_stack[0] = vp->da;
-		tlv_stack[1] = NULL;
-		FR_PROTO_STACK_PRINT(tlv_stack, 0);
-		return encode_rfc_hdr(out, attr_len, tlv_stack, 0, cursor, encoder_ctx);
+	if (vp->da->parent->flags.is_root && !vp->da->flags.subtype) {
+		switch (vp->vp_type) {
+		case FR_TYPE_LEAF:
+			da_stack.da[0] = vp->da;
+			da_stack.da[1] = NULL;
+			da_stack.depth = 1;
+			FR_PROTO_STACK_PRINT(&da_stack, 0);
+			slen = encode_rfc(&work_dbuff, &da_stack, 0, cursor, encode_ctx);
+			if (slen < 0) return slen;
+			return fr_dbuff_set(dbuff, &work_dbuff);
+
+		default:
+			break;
+		}
 	}
 
 	/*
 	 *	Do more work to set up the stack for the complex case.
 	 */
-	fr_proto_tlv_stack_build(tlv_stack, vp->da);
-	FR_PROTO_STACK_PRINT(tlv_stack, 0);
+	fr_proto_da_stack_build(&da_stack, vp->da);
+	FR_PROTO_STACK_PRINT(&da_stack, 0);
 
-	da = tlv_stack[0];
+	/*
+	 *	Top-level attributes get treated specially.  Things
+	 *	like VSAs inside of extended attributes are handled
+	 *	inside of type-specific encoders.
+	 */
+	da = da_stack.da[0];
 	switch (da->type) {
-	default:
-		if (da->flags.concat) {
+	case FR_TYPE_OCTETS:
+		if (flag_concat(&da->flags)) {
 			/*
 			 *	Attributes like EAP-Message are marked as
 			 *	"concat", which means that they are fragmented
 			 *	using a different scheme than the "long
 			 *	extended" one.
 			 */
-			ret = encode_concat(out, outlen, tlv_stack, 0, cursor, encoder_ctx);
+			slen = encode_concat(&work_dbuff, &da_stack, 0, cursor, encode_ctx);
+			if (slen < 0) return slen;
 			break;
 		}
-		ret = encode_rfc_hdr(out, attr_len, tlv_stack, 0, cursor, encoder_ctx);
+		FALL_THROUGH;
+
+	default:
+		slen = encode_rfc(&work_dbuff, &da_stack, 0, cursor, encode_ctx);
+		if (slen < 0) return slen;
 		break;
 
 	case FR_TYPE_VSA:
-		if (vp->da->vendor == VENDORPEC_WIMAX) {
-			/*
-			 *	WiMAX has a non-standard format for
-			 *	its VSAs.  And, it can do "long"
-			 *	attributes by fragmenting them inside
-			 *	of the WiMAX VSA space.
-			 */
-			ret = encode_wimax_hdr(out, outlen, tlv_stack, 0, cursor, encoder_ctx);
-			break;
-		}
-		ret = encode_vsa_hdr(out, attr_len, tlv_stack, 0, cursor, encoder_ctx);
+		slen = encode_vsa(&work_dbuff, &da_stack, 0, cursor, encode_ctx);
+		if (slen < 0) return slen;
 		break;
 
 	case FR_TYPE_TLV:
-		ret = encode_tlv_hdr(out, attr_len, tlv_stack, 0, cursor, encoder_ctx);
+		if (!flag_extended(&da->flags)) {
+			slen = encode_child(&work_dbuff, &da_stack, 0, cursor, encode_ctx);
+
+		} else if (vp->da != da) {
+			fr_strerror_printf("extended attributes must be nested");
+			return PAIR_ENCODE_FATAL_ERROR;
+
+		} else {
+			slen = encode_extended_nested(&work_dbuff, &da_stack, 0, cursor, encode_ctx);
+		}
+		if (slen < 0) return slen;
 		break;
 
-	case FR_TYPE_EXTENDED:
-		ret = encode_extended_hdr(out, attr_len, tlv_stack, 0, cursor, encoder_ctx);
-		break;
-
-	case FR_TYPE_LONG_EXTENDED:
-		/*
-		 *	These attributes can be longer than 253
-		 *	octets.  We therefore fragment the data across
-		 *	multiple attributes.
-		 */
-		ret = encode_extended_hdr(out, outlen, tlv_stack, 0, cursor, encoder_ctx);
-		break;
-
-	case FR_TYPE_INVALID:
+	case FR_TYPE_NULL:
 	case FR_TYPE_VENDOR:
-	case FR_TYPE_TIMEVAL:
-	case FR_TYPE_FLOAT64:
-	case FR_TYPE_EVS:
 	case FR_TYPE_MAX:
 		fr_strerror_printf("%s: Cannot encode attribute %s", __FUNCTION__, vp->da->name);
-		return -1;
+		return PAIR_ENCODE_FATAL_ERROR;
 	}
-
-	if (ret < 0) return ret;
 
 	/*
 	 *	We couldn't do it, so we didn't do anything.
 	 */
-	if (fr_pair_cursor_current(cursor) == vp) {
+	if (fr_dcursor_current(cursor) == vp) {
 		fr_strerror_printf("%s: Nested attribute structure too large to encode", __FUNCTION__);
+		return PAIR_ENCODE_FATAL_ERROR;
+	}
+
+	return fr_dbuff_set(dbuff, &work_dbuff);
+}
+
+ssize_t	fr_radius_encode_foreign(fr_dbuff_t *dbuff, fr_pair_list_t const *list)
+{
+       	fr_radius_ctx_t common_ctx = {};
+	fr_radius_encode_ctx_t encode_ctx = {
+		.common = &common_ctx,
+	};
+
+	/*
+	 *	Just in case we need random numbers.
+	 */
+	encode_ctx.rand_ctx.a = fr_rand();
+	encode_ctx.rand_ctx.b = fr_rand();
+
+	/*
+	 *	Encode the pairs.
+	 */
+	return encode_pairs(dbuff, list, &encode_ctx);
+}
+
+
+static int encode_test_ctx(void **out, TALLOC_CTX *ctx)
+{
+	static uint8_t vector[RADIUS_AUTH_VECTOR_LENGTH] = {
+		0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+		0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f };
+
+	fr_radius_encode_ctx_t	*test_ctx;
+	fr_radius_ctx_t		*common;
+
+	test_ctx = talloc_zero(ctx, fr_radius_encode_ctx_t);
+	if (!test_ctx) return -1;
+
+	test_ctx->common = common = talloc_zero(test_ctx, fr_radius_ctx_t);
+
+	common->secret = talloc_strdup(test_ctx->common, "testing123");
+	common->secret_length = talloc_array_length(test_ctx->common->secret) - 1;
+
+	/*
+	 *	We don't want to automatically add Message-Authenticator
+	 */
+	common->secure_transport = true;
+
+	test_ctx->request_authenticator = vector;
+	test_ctx->rand_ctx.a = 6809;
+	test_ctx->rand_ctx.b = 2112;
+
+	*out = test_ctx;
+
+	return 0;
+}
+
+static ssize_t fr_radius_encode_proto(TALLOC_CTX *ctx, fr_pair_list_t *vps, uint8_t *data, size_t data_len, void *proto_ctx)
+{
+	fr_radius_encode_ctx_t	*packet_ctx = talloc_get_type_abort(proto_ctx, fr_radius_encode_ctx_t);
+	int packet_type = FR_RADIUS_CODE_ACCESS_REQUEST;
+	fr_pair_t *vp;
+	ssize_t slen;
+
+	vp = fr_pair_find_by_da(vps, NULL, attr_packet_type);
+	if (vp) packet_type = vp->vp_uint32;
+
+	/*
+	 *	Force specific values for testing.
+	 */
+	if ((packet_type == FR_RADIUS_CODE_ACCESS_REQUEST) || (packet_type == FR_RADIUS_CODE_STATUS_SERVER)) {
+		vp = fr_pair_find_by_da(vps, NULL, attr_packet_authentication_vector);
+		if (!vp) {
+			int i;
+			uint8_t vector[RADIUS_AUTH_VECTOR_LENGTH];
+
+			for (i = 0; i < RADIUS_AUTH_VECTOR_LENGTH; i++) {
+				data[4 + i] = fr_fast_rand(&packet_ctx->rand_ctx);
+			}
+
+			fr_pair_list_append_by_da_len(ctx, vp, vps, attr_packet_authentication_vector, vector, sizeof(vector), false);
+		}
+	}
+
+	packet_ctx->code = packet_type;
+
+	/*
+	 *	@todo - pass in packet_ctx to this function, so that we
+	 *	can leverage a consistent random number generator.
+	 */
+	slen = fr_radius_encode(&FR_DBUFF_TMP(data, data_len), vps, packet_ctx);
+	if (slen <= 0) return slen;
+
+	if (fr_radius_sign(data, NULL, (uint8_t const *) packet_ctx->common->secret, talloc_array_length(packet_ctx->common->secret) - 1) < 0) {
 		return -1;
 	}
 
-	return ret;
+	return slen;
 }
 
-static void *encode_test_ctx (UNUSED TALLOC_CTX *ctx)
-{
-	static uint8_t vector[] = { 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f };
-
-	static fr_radius_ctx_t	test_ctx = {
-		.vector = vector
-	};
-
-	test_ctx.secret = talloc_strdup(ctx, "testing123");
-	test_ctx.root = fr_dict_root(fr_dict_internal);
-
-	return &test_ctx;
-}
+/*
+ *	No one else should be using this.
+ */
+extern void *fr_radius_next_encodable(fr_dlist_head_t *list, void *to_eval, void *uctx);
 
 /*
  *	Test points
  */
-extern fr_test_point_pair_encode_t radius_tp_encode;
-fr_test_point_pair_encode_t radius_tp_encode = {
+extern fr_test_point_pair_encode_t radius_tp_encode_pair;
+fr_test_point_pair_encode_t radius_tp_encode_pair = {
 	.test_ctx	= encode_test_ctx,
-	.func		= fr_radius_encode_pair
+	.func		= fr_radius_encode_pair,
+	.next_encodable	= fr_radius_next_encodable,
+};
+
+
+extern fr_test_point_proto_encode_t radius_tp_encode_proto;
+fr_test_point_proto_encode_t radius_tp_encode_proto = {
+	.test_ctx	= encode_test_ctx,
+	.func		= fr_radius_encode_proto
 };

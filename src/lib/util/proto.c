@@ -14,98 +14,166 @@
  *   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
-/**
- * $Id$
+/** Protocol encoder/decoder support functions
  *
- * @file proto.c
- * @brief functions common to protocol encoders/decoders.
+ * @file src/lib/util/proto.c
  *
  * @copyright 2015 The FreeRADIUS server project
  */
-#include <freeradius-devel/libradius.h>
-
-static unsigned int proto_log_indent = 30;
-static char spaces[] = "                                                 ";
+#include <freeradius-devel/util/pair.h>
+#include <freeradius-devel/util/print.h>
+#include <freeradius-devel/util/proto.h>
 
 void fr_proto_print(char const *file, int line, char const *fmt, ...)
 {
-	va_list ap;
-	size_t		len;
-	char		prefix[256];
-
-	len = snprintf(prefix, sizeof(prefix), "%s:%i", file, line);
-	if (len > proto_log_indent) proto_log_indent = len;
-
-	fprintf(fr_log_fp, "msg: %s%.*s: ", prefix, (int)(proto_log_indent - len), spaces);
+	va_list		ap;
+	char		*buff;
 
 	va_start(ap, fmt);
-	vfprintf(fr_log_fp, fmt, ap);
+	buff = talloc_vasprintf(NULL, fmt, ap);
 	va_end(ap);
 
-	fprintf(fr_log_fp, "\n");
-	fflush(fr_log_fp);
+	fr_log(&default_log, L_DBG, file, line, "msg: %pV", fr_box_strvalue_buffer(buff));
+
+	talloc_free(buff);
 }
 
-void fr_proto_print_hex_data(char const *file, int line, char const *msg, uint8_t const *data, size_t data_len)
+DIAG_OFF(format-nonliteral)
+void fr_proto_print_hex_data(char const *file, int line, uint8_t const *data, size_t data_len, char const *fmt, ...)
 {
-	size_t		i;
-	size_t		len;
-	char		prefix[256];
+	va_list		ap;
+	char		*msg;
 
-	len = snprintf(prefix, sizeof(prefix), "%s:%i", file, line);
-	if (len > proto_log_indent) proto_log_indent = len;
-
-	if (msg) fprintf(fr_log_fp, "hex: %s%.*s: -- %s --\n", prefix, (int)(proto_log_indent - len), spaces, msg);
-	for (i = 0; i < data_len; i++) {
-		if ((i & 0x0f) == 0) fprintf(fr_log_fp, "hex: %s%.*s: %04x: ", prefix,
-					     (int)(proto_log_indent - len), spaces, (unsigned int) i);
-		fprintf(fr_log_fp, "%02x ", data[i]);
-		if ((i & 0x0f) == 0x0f) fprintf(fr_log_fp, "\n");
+	if (fmt) {
+		va_start(ap, fmt);
+		msg = talloc_vasprintf(NULL, fmt, ap);
+		va_end(ap);
+		fr_log(&default_log, L_DBG, file, line, "hex: -- %s --", msg);
+		talloc_free(msg);
 	}
-	if ((data_len == 0x0f) || ((data_len & 0x0f) != 0x0f)) fprintf(fr_log_fp, "\n");
-	fflush(fr_log_fp);
+	fr_log_hex(&default_log, L_DBG, file, line, data, data_len, "hex: ");
 }
 
-void fr_proto_tlv_stack_print(char const *file, int line, char const *func, fr_dict_attr_t const **tlv_stack, unsigned int depth)
+void fr_proto_print_hex_marker(char const *file, int line, uint8_t const *data, size_t data_len, ssize_t slen, char const *fmt, ...)
 {
-	int		i;
-	char		prefix[256];
-	size_t		len;
+	va_list		ap;
+	char		*msg;
 
-	len = snprintf(prefix, sizeof(prefix), "%s:%i", file, line);
-	if (len > proto_log_indent) proto_log_indent = len;
+	if (fmt) {
+		va_start(ap, fmt);
+		msg = talloc_vasprintf(NULL, fmt, ap);
+		va_end(ap);
+		fr_log(&default_log, L_DBG, file, line, "hex: -- %s --", msg);
+		talloc_free(msg);
+	}
+	fr_log_hex_marker(&default_log, L_DBG, file, line, data, data_len, slen, "current position", "hex: ");
+}
+DIAG_ON(format-nonliteral)
 
-	for (i = 0; (i < FR_DICT_MAX_TLV_STACK) && tlv_stack[i]; i++);
-	if (!i) return;
+void fr_proto_da_stack_print(char const *file, int line, char const *func, fr_da_stack_t *da_stack, unsigned int depth)
+{
+	int		i = da_stack->depth;
 
-	fprintf(fr_log_fp, "stk: %s%.*s: Currently in %s\n",
-		prefix, (int)(proto_log_indent - len), spaces, func);
+	fr_log(&default_log, L_DBG, file, line, "stk: Currently in %s", func);
 	for (i--; i >= 0; i--) {
-		fprintf(fr_log_fp, "stk: %s%.*s: %s [%i] %s: %s, vendor: 0x%x (%u), attr: 0x%x (%u)\n",
-			prefix, (int)(proto_log_indent - len), spaces, (i == (int)depth) ? ">" : " ", i,
-			fr_int2str(dict_attr_types, tlv_stack[i]->type, "?Unknown?"),
-			tlv_stack[i]->name, tlv_stack[i]->vendor, tlv_stack[i]->vendor,
-			tlv_stack[i]->attr, tlv_stack[i]->attr);
+		fr_log(&default_log, L_DBG, file, line,
+		       "stk: %s [%i] %s: %s, vendor: 0x%x (%u), attr: 0x%x (%u)",
+		       (i == (int)depth) ? ">" : " ", i,
+		       fr_type_to_str(da_stack->da[i]->type),
+		       da_stack->da[i]->name,
+		       fr_dict_vendor_num_by_da(da_stack->da[i]), fr_dict_vendor_num_by_da(da_stack->da[i]),
+		       da_stack->da[i]->attr, da_stack->da[i]->attr);
 	}
-	fprintf(fr_log_fp, "\n");
-	fflush(fr_log_fp);
+	fr_log(&default_log, L_DBG, file, line, "stk:");
 }
 
-void fr_proto_tlv_stack_build(fr_dict_attr_t const **tlv_stack, fr_dict_attr_t const *da)
+/** Implements the default iterator to encode pairs belonging to a specific dictionary that are not internal
+ *
+ * @param[in] list	to iterate over.
+ * @param[in] current	The fr_pair_t cursor->current.  Will be advanced and checked to
+ *			see if it matches the specified fr_dict_t.
+ * @param[in] uctx	The fr_dict_t to search for.
+ * @return
+ *	- Next matching fr_pair_t.
+ *	- NULL if not more matching fr_pair_ts could be found.
+ */
+void *fr_proto_next_encodable(fr_dlist_head_t *list, void *current, void *uctx)
 {
-	int i;
-	fr_dict_attr_t const *da_p;
+	fr_pair_t	*c = current;
+	fr_dict_t	*dict = talloc_get_type_abort(uctx, fr_dict_t);
 
-	memset(tlv_stack, 0, sizeof(*tlv_stack) * (FR_DICT_MAX_TLV_STACK + 1));
+	while ((c = fr_dlist_next(list, c))) {
+		PAIR_VERIFY(c);
+		if ((c->da->dict == dict) && (!c->da->flags.internal)) break;
+	}
+
+	return c;
+}
+
+/** Build a complete DA stack from the da back to the root
+ *
+ * @param[out] stack	to populate.
+ * @param[in] da	to build the stack for.
+ */
+void fr_proto_da_stack_build(fr_da_stack_t *stack, fr_dict_attr_t const *da)
+{
+	fr_dict_attr_t const **cached;
 
 	if (!da) return;
 
 	/*
-	 *	We've finished encoding one nested structure
-	 *	now we need to rebuild the tlv_stack and determine
-	 *	where the common point is.
+	 *	See if we have a cached da stack available
 	 */
-	for (i = da->depth, da_p = da;
-	     da_p->parent && (i >= 0);
-	     i--, da_p = da_p->parent) tlv_stack[i - 1] = da_p;
+	cached = fr_dict_attr_da_stack(da);
+	if (cached) {
+		/*
+		 *	da->da_stack[0] is dict->root
+		 */
+		memcpy(&stack->da[0], &cached[1], sizeof(stack->da[0]) * da->depth);
+
+	} else {
+		fr_dict_attr_t const	*da_p, **da_o;
+
+		/*
+		 *	Unknown attributes don't have a da->da_stack.
+		 */
+		da_p = da;
+		da_o = stack->da + (da->depth - 1);
+
+		while (da_o >= stack->da) {
+			*da_o-- = da_p;
+			da_p = da_p->parent;
+		}
+	}
+
+	stack->depth = da->depth;
+	stack->da[stack->depth] = NULL;
+}
+
+/** Complete the DA stack for a child attribute
+ *
+ * @param[out] stack		to populate.
+ * @param[in] parent		to populate from.
+ * @param[in] da		to populate to.
+ */
+void fr_proto_da_stack_build_partial(fr_da_stack_t *stack, fr_dict_attr_t const *parent, fr_dict_attr_t const *da)
+{
+	fr_dict_attr_t const	*da_p, **da_q, **da_o;
+
+	if (!parent || (parent->depth == 0)) {
+		fr_proto_da_stack_build(stack, da);
+		return;
+	}
+
+	da_p = da;
+	da_q = stack->da + (parent->depth - 1);
+	da_o = stack->da + (da->depth - 1);
+
+	while (da_o >= da_q) {
+		*da_o-- = da_p;
+		da_p = da_p->parent;
+	}
+
+	stack->depth = da->depth;
+	stack->da[stack->depth] = NULL;
 }

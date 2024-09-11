@@ -20,66 +20,58 @@
  * @file protocols/radius/base.c
  * @brief Functions to send/receive radius packets.
  *
- * @copyright 2000-2003,2006  The FreeRADIUS server project
+ * @copyright 2000-2003,2006 The FreeRADIUS server project
  */
 
 RCSID("$Id$")
 
-#include <freeradius-devel/libradius.h>
-
-#include <freeradius-devel/md5.h>
-#include <freeradius-devel/udp.h>
-
 #include <fcntl.h>
 #include <ctype.h>
 
-/** RADIUS on-the-wire format attribute sizes
- *
- * Holds the min/max sizes of all supported RADIUS attribute values as they
- * would be found in a RADIUS packet.
- *
- * These sizes may be different than the sizes of INTERNAL formats, PRESENTATION
- * formats and generic NETWORK formats.
- */
-size_t const fr_radius_attr_sizes[FR_TYPE_MAX + 1][2] = {
-	[FR_TYPE_INVALID]		= {~0, 0},	//!< Ensure array starts at 0 (umm?)
+#include "attrs.h"
 
-	[FR_TYPE_STRING]		= {0, ~0},
-	[FR_TYPE_OCTETS]		= {0, ~0},
+#include <freeradius-devel/io/pair.h>
+#include <freeradius-devel/util/md5.h>
+#include <freeradius-devel/util/net.h>
+#include <freeradius-devel/util/proto.h>
+#include <freeradius-devel/util/udp.h>
+#include <freeradius-devel/protocol/radius/freeradius.internal.h>
 
-	[FR_TYPE_IPV4_ADDR]		= {4, 4},
-	[FR_TYPE_IPV4_PREFIX]		= {6, 6},
-	[FR_TYPE_IPV6_ADDR]		= {16, 16},
-	[FR_TYPE_IPV6_PREFIX]		= {2, 18},
-	[FR_TYPE_COMBO_IP_PREFIX]	= {6, 18},
-	[FR_TYPE_COMBO_IP_ADDR]		= {4, 16},
-	[FR_TYPE_IFID]			= {8, 8},
-	[FR_TYPE_ETHERNET]		= {6, 6},
+static uint32_t instance_count = 0;
 
-	[FR_TYPE_BOOL]			= {1, 1},
-	[FR_TYPE_UINT8]			= {1, 1},
-	[FR_TYPE_UINT16]		= {2, 2},
-	[FR_TYPE_UINT32]		= {4, 4},
-	[FR_TYPE_UINT64]		= {8, 8},
+fr_dict_t const *dict_freeradius;
+fr_dict_t const *dict_radius;
 
-	[FR_TYPE_INT8]			= {1, 1},
-	[FR_TYPE_INT16]			= {2, 2},
-	[FR_TYPE_INT32]			= {4, 4},
-	[FR_TYPE_INT64]			= {8, 8},
+extern fr_dict_autoload_t libfreeradius_radius_dict[];
+fr_dict_autoload_t libfreeradius_radius_dict[] = {
+	{ .out = &dict_freeradius, .proto = "freeradius" },
+	{ .out = &dict_radius, .proto = "radius" },
+	{ NULL }
+};
 
-	[FR_TYPE_DATE]			= {4, 4},
-	[FR_TYPE_ABINARY]		= {32, ~0},
+fr_dict_attr_t const *attr_packet_type;
+fr_dict_attr_t const *attr_packet_authentication_vector;
+fr_dict_attr_t const *attr_chap_challenge;
+fr_dict_attr_t const *attr_chargeable_user_identity;
+fr_dict_attr_t const *attr_eap_message;
+fr_dict_attr_t const *attr_message_authenticator;
+fr_dict_attr_t const *attr_state;
+fr_dict_attr_t const *attr_vendor_specific;
+fr_dict_attr_t const *attr_nas_filter_rule;
 
-	[FR_TYPE_TLV]			= {2, ~0},
-	[FR_TYPE_STRUCT]		= {1, ~0},
+extern fr_dict_attr_autoload_t libfreeradius_radius_dict_attr[];
+fr_dict_attr_autoload_t libfreeradius_radius_dict_attr[] = {
+	{ .out = &attr_packet_type, .name = "Packet-Type", .type = FR_TYPE_UINT32, .dict = &dict_radius },
+	{ .out = &attr_packet_authentication_vector, .name = "Packet-Authentication-Vector", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
+	{ .out = &attr_chap_challenge, .name = "CHAP-Challenge", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
+	{ .out = &attr_chargeable_user_identity, .name = "Chargeable-User-Identity", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
 
-	[FR_TYPE_EXTENDED]		= {2, ~0},
-	[FR_TYPE_LONG_EXTENDED]		= {3, ~0},
-
-	[FR_TYPE_VSA]			= {4, ~0},
-	[FR_TYPE_EVS]			= {6, ~0},
-
-	[FR_TYPE_MAX]			= {~0, 0}	//!< Ensure array covers all types.
+	{ .out = &attr_eap_message, .name = "EAP-Message", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
+	{ .out = &attr_message_authenticator, .name = "Message-Authenticator", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
+	{ .out = &attr_state, .name = "State", .type = FR_TYPE_OCTETS, .dict = &dict_radius },
+	{ .out = &attr_vendor_specific, .name = "Vendor-Specific", .type = FR_TYPE_VSA, .dict = &dict_radius },
+	{ .out = &attr_nas_filter_rule, .name = "NAS-Filter-Rule", .type = FR_TYPE_STRING, .dict = &dict_radius },
+	{ NULL }
 };
 
 /*
@@ -87,19 +79,36 @@ size_t const fr_radius_attr_sizes[FR_TYPE_MAX + 1][2] = {
  */
 #define FR_DEBUG_STRERROR_PRINTF if (fr_debug_lvl) fr_strerror_printf_push
 
-FR_NAME_NUMBER const fr_request_types[] = {
-	{ "auth",	FR_CODE_ACCESS_REQUEST },
-	{ "challenge",	FR_CODE_ACCESS_CHALLENGE },
-	{ "acct",	FR_CODE_ACCOUNTING_REQUEST },
-	{ "status",	FR_CODE_STATUS_SERVER },
-	{ "disconnect",	FR_CODE_DISCONNECT_REQUEST },
-	{ "coa",	FR_CODE_COA_REQUEST },
-	{ "auto",	FR_CODE_UNDEFINED },
-
-	{ NULL, 0}
+fr_table_num_sorted_t const fr_radius_require_ma_table[] = {
+	{ L("auto"),		FR_RADIUS_REQUIRE_MA_AUTO		},
+	{ L("no"),		FR_RADIUS_REQUIRE_MA_NO			},
+	{ L("yes"),		FR_RADIUS_REQUIRE_MA_YES		},
+	{ L("false"),		FR_RADIUS_REQUIRE_MA_NO			},
+	{ L("true"),		FR_RADIUS_REQUIRE_MA_YES		},
 };
+size_t fr_radius_require_ma_table_len = NUM_ELEMENTS(fr_radius_require_ma_table);
 
-char const *fr_packet_codes[FR_MAX_PACKET_CODE] = {
+fr_table_num_sorted_t const fr_radius_limit_proxy_state_table[] = {
+	{ L("auto"),		FR_RADIUS_LIMIT_PROXY_STATE_AUTO	},
+	{ L("no"),		FR_RADIUS_LIMIT_PROXY_STATE_NO		},
+	{ L("yes"),		FR_RADIUS_LIMIT_PROXY_STATE_YES		},
+	{ L("false"),		FR_RADIUS_LIMIT_PROXY_STATE_NO		},
+	{ L("true"),		FR_RADIUS_LIMIT_PROXY_STATE_YES		},
+};
+size_t fr_radius_limit_proxy_state_table_len = NUM_ELEMENTS(fr_radius_limit_proxy_state_table);
+
+fr_table_num_sorted_t const fr_radius_request_name_table[] = {
+	{ L("acct"),		FR_RADIUS_CODE_ACCOUNTING_REQUEST	},
+	{ L("auth"),		FR_RADIUS_CODE_ACCESS_REQUEST		},
+	{ L("auto"),		FR_RADIUS_CODE_UNDEFINED		},
+	{ L("challenge"),	FR_RADIUS_CODE_ACCESS_CHALLENGE		},
+	{ L("coa"),		FR_RADIUS_CODE_COA_REQUEST		},
+	{ L("disconnect"),	FR_RADIUS_CODE_DISCONNECT_REQUEST	},
+	{ L("status"),		FR_RADIUS_CODE_STATUS_SERVER		}
+};
+size_t fr_radius_request_name_table_len = NUM_ELEMENTS(fr_radius_request_name_table);
+
+char const *fr_radius_packet_name[FR_RADIUS_CODE_MAX] = {
 	"",					//!< 0
 	"Access-Request",
 	"Access-Accept",
@@ -155,40 +164,37 @@ char const *fr_packet_codes[FR_MAX_PACKET_CODE] = {
 	"Protocol-Error",
 };
 
-bool const fr_request_packets[FR_CODE_MAX + 1] = {
-	[FR_CODE_ACCESS_REQUEST] = true,
-	[FR_CODE_ACCOUNTING_REQUEST] = true,
-	[FR_CODE_STATUS_SERVER] = true,
-	[FR_CODE_COA_REQUEST] = true,
-	[FR_CODE_DISCONNECT_REQUEST] = true,
+
+/** If we get a reply, the request must come from one of a small
+ * number of packet types.
+ */
+static const fr_radius_packet_code_t allowed_replies[FR_RADIUS_CODE_MAX] = {
+	[FR_RADIUS_CODE_ACCESS_ACCEPT]		= FR_RADIUS_CODE_ACCESS_REQUEST,
+	[FR_RADIUS_CODE_ACCESS_CHALLENGE]	= FR_RADIUS_CODE_ACCESS_REQUEST,
+	[FR_RADIUS_CODE_ACCESS_REJECT]		= FR_RADIUS_CODE_ACCESS_REQUEST,
+
+	[FR_RADIUS_CODE_ACCOUNTING_RESPONSE]	= FR_RADIUS_CODE_ACCOUNTING_REQUEST,
+
+	[FR_RADIUS_CODE_COA_ACK]		= FR_RADIUS_CODE_COA_REQUEST,
+	[FR_RADIUS_CODE_COA_NAK]		= FR_RADIUS_CODE_COA_REQUEST,
+
+	[FR_RADIUS_CODE_DISCONNECT_ACK]		= FR_RADIUS_CODE_DISCONNECT_REQUEST,
+	[FR_RADIUS_CODE_DISCONNECT_NAK]		= FR_RADIUS_CODE_DISCONNECT_REQUEST,
+
+	[FR_RADIUS_CODE_PROTOCOL_ERROR]		= FR_RADIUS_CODE_PROTOCOL_ERROR,	/* Any */
 };
 
-/*
- *	For request packets which have the Request Authenticator being
- *	all zeros.  We need to decode attributes using a Request
- *	Authenticator of all zeroes, but the actual Request
- *	Authenticator contains the signature of the packet, so we
- *	can't use that.
- */
-static uint8_t nullvector[AUTH_VECTOR_LEN] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-
-/** Return the on-the-wire length of an attribute value
- *
- * @param[in] vp to return the length of.
- * @return the length of the attribute.
- */
-size_t fr_radius_attr_len(VALUE_PAIR const *vp)
+int fr_radius_allow_reply(int code, bool allowed[static FR_RADIUS_CODE_MAX])
 {
-	switch (vp->vp_type) {
-	case FR_TYPE_VARIABLE_SIZE:
-		return vp->vp_length;
+	int i;
 
-	default:
-		return fr_radius_attr_sizes[vp->vp_type][0];
+	if ((code <= 0) || (code >= FR_RADIUS_CODE_MAX)) return -1;
 
-	case FR_TYPE_STRUCTURAL:
-		if (!fr_cond_assert(0)) return 0;
+	for (i = 1; i < FR_RADIUS_CODE_MAX; i++) {
+		allowed[i] |= (allowed_replies[i] == (fr_radius_packet_code_t) code);
 	}
+
+	return 0;
 }
 
 /**  Do Ascend-Send / Recv-Secret calculation.
@@ -198,17 +204,28 @@ size_t fr_radius_attr_len(VALUE_PAIR const *vp)
  * We put them into MD5 in the reverse order from that used when
  * encrypting passwords to RADIUS.
  */
-void fr_radius_ascend_secret(uint8_t *digest, uint8_t const *vector, char const *secret, uint8_t const *value)
+ssize_t fr_radius_ascend_secret(fr_dbuff_t *dbuff, uint8_t const *in, size_t inlen,
+				char const *secret, uint8_t const *vector)
 {
-	FR_MD5_CTX context;
-	int	     i;
+	fr_md5_ctx_t		*md5_ctx;
+	size_t			i;
+	uint8_t			digest[MD5_DIGEST_LENGTH];
+	fr_dbuff_t		work_dbuff = FR_DBUFF(dbuff);
 
-	fr_md5_init(&context);
-	fr_md5_update(&context, vector, AUTH_VECTOR_LEN);
-	fr_md5_update(&context, (uint8_t const *) secret, talloc_array_length(secret) - 1);
-	fr_md5_final(digest, &context);
+	FR_DBUFF_EXTEND_LOWAT_OR_RETURN(&work_dbuff, sizeof(digest));
 
-	for (i = 0; i < AUTH_VECTOR_LEN; i++ ) digest[i] ^= value[i];
+	md5_ctx = fr_md5_ctx_alloc_from_list();
+	fr_md5_update(md5_ctx, vector, RADIUS_AUTH_VECTOR_LENGTH);
+	fr_md5_update(md5_ctx, (uint8_t const *) secret, talloc_array_length(secret) - 1);
+	fr_md5_final(digest, md5_ctx);
+	fr_md5_ctx_free_from_list(&md5_ctx);
+
+	if (inlen > sizeof(digest)) inlen = sizeof(digest);
+	for (i = 0; i < inlen; i++) digest[i] ^= in[i];
+
+	fr_dbuff_in_memcpy(&work_dbuff, digest, sizeof(digest));
+
+	return fr_dbuff_set(dbuff, &work_dbuff);
 }
 
 /** Basic validation of RADIUS packet header
@@ -223,7 +240,7 @@ void fr_radius_ascend_secret(uint8_t *digest, uint8_t const *vector, char const 
  * @return
  *	- -1 on failure.
  *	- 1 on decode error.
- *	- >= RADIUS_HDR_LEN on success. This is the packet length as specified in the header.
+ *	- >= RADIUS_HEADER_LENGTH on success. This is the packet length as specified in the header.
  */
 ssize_t fr_radius_recv_header(int sockfd, fr_ipaddr_t *src_ipaddr, uint16_t *src_port, unsigned int *code)
 {
@@ -260,8 +277,8 @@ invalid:
 	 *	The length in the packet says it's less than
 	 *	a RADIUS header length: discard it.
 	 */
-	if (packet_len < RADIUS_HDR_LEN) {
-		FR_DEBUG_STRERROR_PRINTF("Expected at least " STRINGIFY(RADIUS_HDR_LEN)  " bytes of packet "
+	if (packet_len < RADIUS_HEADER_LENGTH) {
+		FR_DEBUG_STRERROR_PRINTF("Expected at least " STRINGIFY(RADIUS_HEADER_LENGTH)  " bytes of packet "
 					 "data, got %zu bytes", packet_len);
 		goto invalid;
 	}
@@ -287,23 +304,34 @@ invalid:
 
 /** Sign a previously encoded packet
  *
- * @param packet the raw RADIUS packet (request or response)
- * @param original the raw original request (if this is a response)
- * @param secret the shared secret
- * @param secret_len the length of the secret
+ * Calculates the request/response authenticator for packets which need it, and fills
+ * in the message-authenticator value if the attribute is present in the encoded packet.
+ *
+ * @param[in,out] packet	(request or response).
+ * @param[in] vector		original packet vector to use
+ * @param[in] secret		to sign the packet with.
+ * @param[in] secret_len	The length of the secret.
  * @return
  *	- <0 on error
  *	- 0 on success
  */
-int fr_radius_sign(uint8_t *packet, uint8_t const *original,
+int fr_radius_sign(uint8_t *packet, uint8_t const *vector,
 		   uint8_t const *secret, size_t secret_len)
 {
-	uint8_t *msg, *end;
-	size_t packet_len = (packet[2] << 8) | packet[3];
-	FR_MD5_CTX	context;
+	uint8_t		*msg, *end;
+	size_t		packet_len = fr_nbo_to_uint16(packet + 2);
 
-	if (packet_len < RADIUS_HDR_LEN) {
-		fr_strerror_printf("Packet must be encoded before calling fr_radius_sign()");
+	/*
+	 *	No real limit on secret length, this is just
+	 *	to catch uninitialised fields.
+	 */
+	if (!fr_cond_assert(secret_len <= UINT16_MAX)) {
+		fr_strerror_printf("Secret is too long.  Expected <= %u, got %zu", UINT16_MAX, secret_len);
+		return -1;
+	}
+
+	if (packet_len < RADIUS_HEADER_LENGTH) {
+		fr_strerror_const("Packet must be encoded before calling fr_radius_sign()");
 		return -1;
 	}
 
@@ -312,7 +340,7 @@ int fr_radius_sign(uint8_t *packet, uint8_t const *original,
 	 *	calculated before we calculate the Request
 	 *	Authenticator or the Response Authenticator.
 	 */
-	msg = packet + RADIUS_HDR_LEN;
+	msg = packet + RADIUS_HEADER_LENGTH;
 	end = packet + packet_len;
 
 	while (msg < end) {
@@ -331,36 +359,31 @@ int fr_radius_sign(uint8_t *packet, uint8_t const *original,
 		}
 
 		if (msg[1] < 18) {
-			fr_strerror_printf("Message-Authenticator is too small");
+			fr_strerror_const("Message-Authenticator is too small");
 			return -1;
 		}
 
 		switch (packet[0]) {
-		case FR_CODE_ACCOUNTING_RESPONSE:
-		case FR_CODE_DISCONNECT_ACK:
-		case FR_CODE_DISCONNECT_NAK:
-		case FR_CODE_COA_ACK:
-		case FR_CODE_COA_NAK:
-			if (!original) goto need_original;
-			if (original[0] == FR_CODE_STATUS_SERVER) goto do_ack;
-			/* FALL-THROUGH */
-
-		case FR_CODE_ACCOUNTING_REQUEST:
-		case FR_CODE_DISCONNECT_REQUEST:
-		case FR_CODE_COA_REQUEST:
-			memset(packet + 4, 0, AUTH_VECTOR_LEN);
+		case FR_RADIUS_CODE_ACCOUNTING_REQUEST:
+		case FR_RADIUS_CODE_DISCONNECT_REQUEST:
+		case FR_RADIUS_CODE_COA_REQUEST:
+			memset(packet + 4, 0, RADIUS_AUTH_VECTOR_LENGTH);
 			break;
 
-		case FR_CODE_ACCESS_ACCEPT:
-		case FR_CODE_ACCESS_REJECT:
-		case FR_CODE_ACCESS_CHALLENGE:
-		do_ack:
-			if (!original) goto need_original;
-			memcpy(packet + 4, original + 4, AUTH_VECTOR_LEN);
+		case FR_RADIUS_CODE_ACCESS_ACCEPT:
+		case FR_RADIUS_CODE_ACCESS_REJECT:
+		case FR_RADIUS_CODE_ACCESS_CHALLENGE:
+		case FR_RADIUS_CODE_ACCOUNTING_RESPONSE:
+		case FR_RADIUS_CODE_DISCONNECT_ACK:
+		case FR_RADIUS_CODE_DISCONNECT_NAK:
+		case FR_RADIUS_CODE_COA_ACK:
+		case FR_RADIUS_CODE_COA_NAK:
+			if (!vector) goto need_original;
+			memcpy(packet + 4, vector, RADIUS_AUTH_VECTOR_LENGTH);
 			break;
 
-		case FR_CODE_ACCESS_REQUEST:
-		case FR_CODE_STATUS_SERVER:
+		case FR_RADIUS_CODE_ACCESS_REQUEST:
+		case FR_RADIUS_CODE_STATUS_SERVER:
 			/* packet + 4 MUST be the Request Authenticator filled with random data */
 			break;
 
@@ -373,7 +396,7 @@ int fr_radius_sign(uint8_t *packet, uint8_t const *original,
 		 *	calculate the HMAC, and put it into the
 		 *	Message-Authenticator attribute.
 		 */
-		memset(msg + 2, 0, AUTH_VECTOR_LEN);
+		memset(msg + 2, 0, RADIUS_AUTH_VECTOR_LENGTH);
 		fr_hmac_md5(msg + 2, packet, packet_len, secret, secret_len);
 		break;
 	}
@@ -382,27 +405,27 @@ int fr_radius_sign(uint8_t *packet, uint8_t const *original,
 	 *	Initialize the request authenticator.
 	 */
 	switch (packet[0]) {
-	case FR_CODE_ACCOUNTING_REQUEST:
-	case FR_CODE_DISCONNECT_REQUEST:
-	case FR_CODE_COA_REQUEST:
-		memset(packet + 4, 0, AUTH_VECTOR_LEN);
+	case FR_RADIUS_CODE_ACCOUNTING_REQUEST:
+	case FR_RADIUS_CODE_DISCONNECT_REQUEST:
+	case FR_RADIUS_CODE_COA_REQUEST:
+		memset(packet + 4, 0, RADIUS_AUTH_VECTOR_LENGTH);
 		break;
 
-	case FR_CODE_ACCESS_ACCEPT:
-	case FR_CODE_ACCESS_REJECT:
-	case FR_CODE_ACCESS_CHALLENGE:
-	case FR_CODE_ACCOUNTING_RESPONSE:
-	case FR_CODE_DISCONNECT_ACK:
-	case FR_CODE_DISCONNECT_NAK:
-	case FR_CODE_COA_ACK:
-	case FR_CODE_COA_NAK:
-	case FR_CODE_PROTOCOL_ERROR:
-		if (!original) {
+	case FR_RADIUS_CODE_ACCESS_ACCEPT:
+	case FR_RADIUS_CODE_ACCESS_REJECT:
+	case FR_RADIUS_CODE_ACCESS_CHALLENGE:
+	case FR_RADIUS_CODE_ACCOUNTING_RESPONSE:
+	case FR_RADIUS_CODE_DISCONNECT_ACK:
+	case FR_RADIUS_CODE_DISCONNECT_NAK:
+	case FR_RADIUS_CODE_COA_ACK:
+	case FR_RADIUS_CODE_COA_NAK:
+	case FR_RADIUS_CODE_PROTOCOL_ERROR:
+		if (!vector) {
 		need_original:
-			fr_strerror_printf("Cannot sign response packet without a request packet");
+			fr_strerror_const("Cannot sign response packet without a request packet");
 			return -1;
 		}
-		memcpy(packet + 4, original + 4, AUTH_VECTOR_LEN);
+		memcpy(packet + 4, vector, RADIUS_AUTH_VECTOR_LENGTH);
 		break;
 
 		/*
@@ -410,8 +433,8 @@ int fr_radius_sign(uint8_t *packet, uint8_t const *original,
 		 *	We don't need to sign anything else, so
 		 *	return.
 		 */
-	case FR_CODE_ACCESS_REQUEST:
-	case FR_CODE_STATUS_SERVER:
+	case FR_RADIUS_CODE_ACCESS_REQUEST:
+	case FR_RADIUS_CODE_STATUS_SERVER:
 		return 0;
 
 	default:
@@ -423,10 +446,15 @@ int fr_radius_sign(uint8_t *packet, uint8_t const *original,
 	/*
 	 *	Request / Response Authenticator = MD5(packet + secret)
 	 */
-	fr_md5_init(&context);
-	fr_md5_update(&context, packet, packet_len);
-	fr_md5_update(&context, secret, secret_len);
-	fr_md5_final(packet + 4, &context);
+	{
+		fr_md5_ctx_t	*md5_ctx;
+
+		md5_ctx = fr_md5_ctx_alloc_from_list();
+		fr_md5_update(md5_ctx, packet, packet_len);
+		fr_md5_update(md5_ctx, secret, secret_len);
+		fr_md5_final(packet + 4, md5_ctx);
+		fr_md5_ctx_free_from_list(&md5_ctx);
+	}
 
 	return 0;
 }
@@ -437,14 +465,14 @@ int fr_radius_sign(uint8_t *packet, uint8_t const *original,
  * @param[in] packet		to check.
  * @param[in,out] packet_len_p	The size of the packet data.
  * @param[in] max_attributes	to allow in the packet.
- * @param[in] require_ma	whether we require Message-Authenticator.
+ * @param[in] require_message_authenticator	whether we require Message-Authenticator.
  * @param[in] reason		if not NULL, will have the failure reason written to where it points.
  * @return
  *	- True on success.
  *	- False on failure.
  */
 bool fr_radius_ok(uint8_t const *packet, size_t *packet_len_p,
-		  uint32_t max_attributes, bool require_ma, decode_fail_t *reason)
+		  uint32_t max_attributes, bool require_message_authenticator, decode_fail_t *reason)
 {
 	uint8_t	const		*attr, *end;
 	size_t			totallen;
@@ -460,7 +488,7 @@ bool fr_radius_ok(uint8_t const *packet, size_t *packet_len_p,
 	 *
 	 *	"The minimum length is 20 ..."
 	 */
-	if (packet_len < RADIUS_HDR_LEN) {
+	if (packet_len < RADIUS_HEADER_LENGTH) {
 		FR_DEBUG_STRERROR_PRINTF("packet is too short (received %zu < minimum 20)",
 					 packet_len);
 		failure = DECODE_FAIL_MIN_LENGTH_PACKET;
@@ -473,14 +501,14 @@ bool fr_radius_ok(uint8_t const *packet, size_t *packet_len_p,
 	 *	i.e. We've received 128 bytes, and the packet header
 	 *	says it's 256 bytes long.
 	 */
-	totallen = (packet[2] << 8) | packet[3];
+	totallen = fr_nbo_to_uint16(packet + 2);
 
 	/*
 	 *	Code of 0 is not understood.
-	 *	Code of 16 or greate is not understood.
+	 *	Code of 16 or greater is not understood.
 	 */
 	if ((packet[0] == 0) ||
-	    (packet[0] >= FR_MAX_PACKET_CODE)) {
+	    (packet[0] >= FR_RADIUS_CODE_MAX)) {
 		FR_DEBUG_STRERROR_PRINTF("unknown packet code %d", packet[0]);
 		failure = DECODE_FAIL_UNKNOWN_PACKET_CODE;
 		goto finish;
@@ -490,7 +518,7 @@ bool fr_radius_ok(uint8_t const *packet, size_t *packet_len_p,
 	 *	Message-Authenticator is required in Status-Server
 	 *	packets, otherwise they can be trivially forged.
 	 */
-	if (packet[0] == FR_CODE_STATUS_SERVER) require_ma = true;
+	if (packet[0] == FR_RADIUS_CODE_STATUS_SERVER) require_message_authenticator = true;
 
 	/*
 	 *	Repeat the length checks.  This time, instead of
@@ -503,7 +531,7 @@ bool fr_radius_ok(uint8_t const *packet, size_t *packet_len_p,
 	 *
 	 *	"The minimum length is 20 ..."
 	 */
-	if (totallen < RADIUS_HDR_LEN) {
+	if (totallen < RADIUS_HEADER_LENGTH) {
 		FR_DEBUG_STRERROR_PRINTF("length in header is too small (length %zu < minimum 20)",
 					 totallen);
 		failure = DECODE_FAIL_MIN_LENGTH_FIELD;
@@ -533,7 +561,7 @@ bool fr_radius_ok(uint8_t const *packet, size_t *packet_len_p,
 	 *
 	 *	i.e. No response to the NAS.
 	 */
-	if (packet_len < totallen) {
+	if (totallen > packet_len) {
 		FR_DEBUG_STRERROR_PRINTF("packet is truncated (received %zu <  packet header length of %zu)",
 					 packet_len, totallen);
 		failure = DECODE_FAIL_MIN_LENGTH_MISMATCH;
@@ -546,7 +574,7 @@ bool fr_radius_ok(uint8_t const *packet, size_t *packet_len_p,
 	 *	"Octets outside the range of the Length field MUST be
 	 *	treated as padding and ignored on reception."
 	 */
-	if (packet_len > totallen) {
+	if (totallen < packet_len) {
 		*packet_len_p = packet_len = totallen;
 	}
 
@@ -562,7 +590,7 @@ bool fr_radius_ok(uint8_t const *packet, size_t *packet_len_p,
 	 *	or with an intentional attack.  Either way, we do NOT want
 	 *	to be vulnerable to this problem.
 	 */
-	attr = packet + RADIUS_HDR_LEN;
+	attr = packet + RADIUS_HEADER_LENGTH;
 	end = packet + packet_len;
 	num_attributes = 0;
 
@@ -615,25 +643,16 @@ bool fr_radius_ok(uint8_t const *packet, size_t *packet_len_p,
 		default:	/* don't do anything by default */
 			break;
 
-#if 0
-			/*
-			 *	Track this for prioritizing ongoing EAP sessions.
-			 */
-		case FR_STATE:
-			if (attr[1] > 2) packet->rounds = attr[2];
-			break;
-#endif
-
 			/*
 			 *	If there's an EAP-Message, we require
 			 *	a Message-Authenticator.
 			 */
 		case FR_EAP_MESSAGE:
-			require_ma = true;
+			require_message_authenticator = true;
 			break;
 
 		case FR_MESSAGE_AUTHENTICATOR:
-			if (attr[1] != 2 + AUTH_VECTOR_LEN) {
+			if (attr[1] != 2 + RADIUS_AUTH_VECTOR_LENGTH) {
 				FR_DEBUG_STRERROR_PRINTF("Message-Authenticator has invalid length (%d != 18) at offset %zd",
 					   attr[1] - 2, attr - packet);
 				failure = DECODE_FAIL_MA_INVALID_LENGTH;
@@ -682,8 +701,8 @@ bool fr_radius_ok(uint8_t const *packet, size_t *packet_len_p,
 	 *	Similarly, Status-Server packets MUST contain
 	 *	Message-Authenticator attributes.
 	 */
-	if (require_ma && !seen_ma) {
-		FR_DEBUG_STRERROR_PRINTF("we equire Message-Authenticator attribute, but it is not in the packet");
+	if (require_message_authenticator && !seen_ma) {
+		FR_DEBUG_STRERROR_PRINTF("we require Message-Authenticator attribute, but it is not in the packet");
 		failure = DECODE_FAIL_MA_MISSING;
 		goto finish;
 	}
@@ -703,25 +722,39 @@ finish:
  *  comparing the signature in the packet with the one we calculated.
  *  If they differ, there's a problem.
  *
- * @param packet the raw RADIUS packet (request or response)
- * @param original the raw original request (if this is a response)
- * @param secret the shared secret
- * @param secret_len the length of the secret
+ * @param[in] packet				the raw RADIUS packet (request or response)
+ * @param[in] vector				the original packet vector
+ * @param[in] secret				the shared secret
+ * @param[in] secret_len			the length of the secret
+ * @param[in] require_message_authenticator	whether we require Message-Authenticator.
+ * @param[in] limit_proxy_state			whether we allow Proxy-State without Message-Authenticator.
  * @return
- *	- <0 on error
- *	- 0 on success
+ *	- -2 if the message authenticator or request authenticator was invalid.
+ *	- -1 if we were unable to verify the shared secret, or the packet
+ *	     was in some other way malformed.
+ *	- 0 on success.
  */
-int fr_radius_verify(uint8_t *packet, uint8_t const *original,
-		     uint8_t const *secret, size_t secret_len)
+int fr_radius_verify(uint8_t *packet, uint8_t const *vector,
+		     uint8_t const *secret, size_t secret_len,
+		     bool require_message_authenticator, bool limit_proxy_state)
 {
-	int rcode;
-	uint8_t *msg, *end;
-	size_t packet_len = (packet[2] << 8) | packet[3];
-	uint8_t request_authenticator[AUTH_VECTOR_LEN];
-	uint8_t message_authenticator[AUTH_VECTOR_LEN];
+	bool		found_message_authenticator = false;
+	bool		found_proxy_state = false;
+	int		rcode;
+	int		code;
+	uint8_t		*msg, *end;
+	size_t		packet_len = fr_nbo_to_uint16(packet + 2);
+	uint8_t		request_authenticator[RADIUS_AUTH_VECTOR_LENGTH];
+	uint8_t		message_authenticator[RADIUS_AUTH_VECTOR_LENGTH];
 
-	if (packet_len < RADIUS_HDR_LEN) {
+	if (packet_len < RADIUS_HEADER_LENGTH) {
 		fr_strerror_printf("invalid packet length %zd", packet_len);
+		return -1;
+	}
+
+	code = packet[0];
+	if (!code || (code >= FR_RADIUS_CODE_MAX)) {
+		fr_strerror_printf("Unknown reply code %d", code);
 		return -1;
 	}
 
@@ -732,7 +765,7 @@ int fr_radius_verify(uint8_t *packet, uint8_t const *original,
 	 *	calculated before we calculate the Request
 	 *	Authenticator or the Response Authenticator.
 	 */
-	msg = packet + RADIUS_HDR_LEN;
+	msg = packet + RADIUS_HEADER_LENGTH;
 	end = packet + packet_len;
 
 	while (msg < end) {
@@ -740,6 +773,13 @@ int fr_radius_verify(uint8_t *packet, uint8_t const *original,
 
 		if (msg[0] != FR_MESSAGE_AUTHENTICATOR) {
 			if (msg[1] < 2) goto invalid_attribute;
+
+			/*
+			 *	If we're not allowing Proxy-State without
+			 *	Message-authenticator, we need to record
+			 *	the fact we found Proxy-State.
+			 */
+			if (limit_proxy_state && (msg[0] == FR_PROXY_STATE)) found_proxy_state = true;
 
 			if ((msg + msg[1]) > end) {
 			invalid_attribute:
@@ -751,7 +791,7 @@ int fr_radius_verify(uint8_t *packet, uint8_t const *original,
 		}
 
 		if (msg[1] < 18) {
-			fr_strerror_printf("too small Message-Authenticator");
+			fr_strerror_const("too small Message-Authenticator");
 			return -1;
 		}
 
@@ -759,18 +799,29 @@ int fr_radius_verify(uint8_t *packet, uint8_t const *original,
 		 *	Found it, save a copy.
 		 */
 		memcpy(message_authenticator, msg + 2, sizeof(message_authenticator));
+		found_message_authenticator = true;
 		break;
 	}
 
+	if (packet[0] == FR_RADIUS_CODE_ACCESS_REQUEST) {
+		if (limit_proxy_state && found_proxy_state && !found_message_authenticator) {
+			fr_strerror_const("Proxy-State is not allowed without Message-Authenticator");
+			return -1;
+		}
+
+	    	if (require_message_authenticator && !found_message_authenticator) {
+			fr_strerror_const("Access-Request is missing the required Message-Authenticator attribute");
+			return -1;
+		}
+	}
+
 	/*
-	 *	Implement verification as a signature, followed by
-	 *	checking our signature against the sent one.  This is
-	 *	slightly more CPU work than having verify-specific
-	 *	functions, but it ends up being cleaner in the code.
+	 *	Overwrite the contents of Message-Authenticator
+	 *	with the one we calculate.
 	 */
-	rcode = fr_radius_sign(packet, original, secret, secret_len);
+	rcode = fr_radius_sign(packet, vector, secret, secret_len);
 	if (rcode < 0) {
-		fr_strerror_printf_push("Failed calculating correct authenticator");
+		fr_strerror_const_push("Failed calculating correct authenticator");
 		return -1;
 	}
 
@@ -780,21 +831,25 @@ int fr_radius_verify(uint8_t *packet, uint8_t const *original,
 	 *	If it's invalid, restore the original
 	 *	Message-Authenticator and Request Authenticator
 	 *	fields.
+	 *
+	 *	If it's valid the original and calculated
+	 *	message authenticators are the same, so we don't
+	 *	need to do anything.
 	 */
 	if ((msg < end) &&
 	    (fr_digest_cmp(message_authenticator, msg + 2, sizeof(message_authenticator)) != 0)) {
 		memcpy(msg + 2, message_authenticator, sizeof(message_authenticator));
 		memcpy(packet + 4, request_authenticator, sizeof(request_authenticator));
 
-		fr_strerror_printf("invalid Message-Authenticator (shared secret is incorrect)");
-		return -1;
+		fr_strerror_const("invalid Message-Authenticator (shared secret is incorrect)");
+		return -2;
 	}
 
 	/*
 	 *	These are random numbers, so there's no point in
 	 *	comparing them.
 	 */
-	if ((packet[0] == FR_CODE_ACCESS_REQUEST) || (packet[0] == FR_CODE_STATUS_SERVER)) {
+	if ((packet[0] == FR_RADIUS_CODE_ACCESS_REQUEST) || (packet[0] == FR_RADIUS_CODE_STATUS_SERVER)) {
 		return 0;
 	}
 
@@ -803,219 +858,267 @@ int fr_radius_verify(uint8_t *packet, uint8_t const *original,
 	 */
 	if (fr_digest_cmp(request_authenticator, packet + 4, sizeof(request_authenticator)) != 0) {
 		memcpy(packet + 4, request_authenticator, sizeof(request_authenticator));
-		if (original) {
-			fr_strerror_printf("invalid Response Authenticator (shared secret is incorrect)");
+		if (vector) {
+			fr_strerror_const("invalid Response Authenticator (shared secret is incorrect)");
 		} else {
-			fr_strerror_printf("invalid Request Authenticator (shared secret is incorrect)");
+			fr_strerror_const("invalid Request Authenticator (shared secret is incorrect)");
 		}
-		return -1;
+		return -2;
 	}
 
 	return 0;
 }
 
-/** Encode VPS into a raw RADIUS packet.
- *
- */
-ssize_t fr_radius_encode(uint8_t *packet, size_t packet_len, uint8_t const *original,
-			 char const *secret, UNUSED size_t secret_len, int code, int id, VALUE_PAIR *vps)
-{
-	uint8_t			*ptr;
-	int			total_length;
-	int			len;
-	VALUE_PAIR const	*vp;
-	vp_cursor_t		cursor;
-	fr_radius_ctx_t		packet_ctx;
+void *fr_radius_next_encodable(fr_dlist_head_t *list, void *current, void *uctx);
 
-	packet_ctx.secret = secret;
-	packet_ctx.vector = packet + 4;
+void *fr_radius_next_encodable(fr_dlist_head_t *list, void *current, void *uctx)
+{
+	fr_pair_t	*c = current;
+	fr_dict_t	*dict = talloc_get_type_abort(uctx, fr_dict_t);
+
+	while ((c = fr_dlist_next(list, c))) {
+		PAIR_VERIFY(c);
+		if ((c->da->dict == dict) &&
+		    (!c->da->flags.internal || ((c->da->attr > FR_TAG_BASE) && (c->da->attr < (FR_TAG_BASE + 0x20))))) {
+			break;
+		}
+	}
+
+	return c;
+}
+
+
+static const bool disallow_tunnel_passwords[FR_RADIUS_CODE_MAX] = {
+	[ FR_RADIUS_CODE_ACCESS_REQUEST ] = true,
+	// can be in Access-Accept
+	[ FR_RADIUS_CODE_ACCESS_REJECT ] = true,
+	[ FR_RADIUS_CODE_ACCESS_CHALLENGE ] = true,
+
+	[ FR_RADIUS_CODE_ACCOUNTING_REQUEST ] = true,
+	[ FR_RADIUS_CODE_ACCOUNTING_RESPONSE ] = true,
+
+	[ FR_RADIUS_CODE_STATUS_SERVER ] = true,
+
+	[ FR_RADIUS_CODE_COA_ACK ] = true,
+	[ FR_RADIUS_CODE_COA_NAK ] = true,
+
+	[ FR_RADIUS_CODE_DISCONNECT_REQUEST ] = true,
+	[ FR_RADIUS_CODE_DISCONNECT_ACK ] = true,
+	[ FR_RADIUS_CODE_DISCONNECT_NAK ] = true,
+
+	[ FR_RADIUS_CODE_PROTOCOL_ERROR ] = true,
+};
+
+ssize_t fr_radius_encode(fr_dbuff_t *dbuff, fr_pair_list_t *vps, fr_radius_encode_ctx_t *packet_ctx)
+{
+	ssize_t			slen;
+	fr_pair_t const		*vp;
+	fr_dcursor_t		cursor;
+	fr_dbuff_t		work_dbuff, length_dbuff;
+
+	packet_ctx->disallow_tunnel_passwords = disallow_tunnel_passwords[packet_ctx->code];
 
 	/*
 	 *	The RADIUS header can't do more than 64K of data.
 	 */
-	if (packet_len > 65535) packet_len = 65535;
+	work_dbuff = FR_DBUFF_MAX(dbuff, 65535);
 
-	switch (code) {
-	case FR_CODE_ACCESS_REQUEST:
-	case FR_CODE_STATUS_SERVER:
+	FR_DBUFF_IN_BYTES_RETURN(&work_dbuff, packet_ctx->code, packet_ctx->id);
+	length_dbuff = FR_DBUFF(&work_dbuff);
+	FR_DBUFF_IN_RETURN(&work_dbuff, (uint16_t) RADIUS_HEADER_LENGTH);
+
+	switch (packet_ctx->code) {
+	case FR_RADIUS_CODE_ACCESS_REQUEST:
+	case FR_RADIUS_CODE_STATUS_SERVER:
+		packet_ctx->request_authenticator = fr_dbuff_current(&work_dbuff);
+
+		/*
+		 *	Allow over-rides of the authentication vector for testing.
+		 */
+		vp = fr_pair_find_by_da(vps, NULL, attr_packet_authentication_vector);
+		if (vp && (vp->vp_length >= RADIUS_AUTH_VECTOR_LENGTH)) {
+			FR_DBUFF_IN_MEMCPY_RETURN(&work_dbuff, vp->vp_octets, RADIUS_AUTH_VECTOR_LENGTH);
+		} else {
+			int i;
+
+			for (i = 0; i < 4; i++) {
+				FR_DBUFF_IN_RETURN(&work_dbuff, (uint32_t) fr_rand());
+			}
+		}
 		break;
 
-	case FR_CODE_ACCESS_ACCEPT:
-	case FR_CODE_ACCESS_REJECT:
-	case FR_CODE_ACCESS_CHALLENGE:
-	case FR_CODE_ACCOUNTING_RESPONSE:
-	case FR_CODE_COA_ACK:
-	case FR_CODE_COA_NAK:
-	case FR_CODE_DISCONNECT_ACK:
-	case FR_CODE_DISCONNECT_NAK:
-	case FR_CODE_PROTOCOL_ERROR:
-		if (!original) {
-			fr_strerror_printf("Cannot encode response without request");
+	case FR_RADIUS_CODE_ACCESS_REJECT:
+	case FR_RADIUS_CODE_ACCESS_CHALLENGE:
+	case FR_RADIUS_CODE_ACCOUNTING_RESPONSE:
+	case FR_RADIUS_CODE_COA_ACK:
+	case FR_RADIUS_CODE_COA_NAK:
+	case FR_RADIUS_CODE_DISCONNECT_ACK:
+	case FR_RADIUS_CODE_DISCONNECT_NAK:
+	case FR_RADIUS_CODE_PROTOCOL_ERROR:
+	case FR_RADIUS_CODE_ACCESS_ACCEPT:
+		if (!packet_ctx->request_authenticator) {
+			fr_strerror_const("Cannot encode response without request");
 			return -1;
 		}
-		packet_ctx.vector = original + 4;
-		memcpy(packet + 4, packet_ctx.vector, AUTH_VECTOR_LEN);
+		FR_DBUFF_IN_MEMCPY_RETURN(&work_dbuff, packet_ctx->request_authenticator, RADIUS_AUTH_VECTOR_LENGTH);
 		break;
 
-	case FR_CODE_ACCOUNTING_REQUEST:
-		packet_ctx.vector = nullvector;
-		memcpy(packet + 4, packet_ctx.vector, AUTH_VECTOR_LEN);
-		break;
+	case FR_RADIUS_CODE_ACCOUNTING_REQUEST:
+	case FR_RADIUS_CODE_DISCONNECT_REQUEST:
+		/*
+		 *	Tunnel-Password encoded attributes are allowed
+		 *	in CoA-Request packets, by RFC 5176 Section
+		 *	3.6.  HOWEVER, the tunnel passwords are
+		 *	"encrypted" using the Request Authenticator,
+		 *	which is all zeros!  That makes them much
+		 *	easier to decrypt.  The only solution here is
+		 *	to say "don't do that!"
+		 */
+	case FR_RADIUS_CODE_COA_REQUEST:
+		packet_ctx->request_authenticator = fr_dbuff_current(&work_dbuff);
 
-	case FR_CODE_COA_REQUEST:
-	case FR_CODE_DISCONNECT_REQUEST:
-		packet_ctx.vector = nullvector;
-		memcpy(packet + 4, packet_ctx.vector, AUTH_VECTOR_LEN);
+		FR_DBUFF_MEMSET_RETURN(&work_dbuff, 0, RADIUS_AUTH_VECTOR_LENGTH);
 		break;
 
 	default:
-		fr_strerror_printf("Cannot encode unknown packet code %d", code);
+		fr_strerror_printf("Cannot encode unknown packet code %d", packet_ctx->code);
 		return -1;
 	}
 
-	packet[0] = code;
-	packet[1] = id;
-	packet[2] = 0;
-	packet[3] = total_length = RADIUS_HDR_LEN;
-
 	/*
-	 *	Load up the configuration values for the user
+	 *	Always add Message-Authenticator after the packet
+	 *	header for insecure transport protocols.
 	 */
-	ptr = packet + RADIUS_HDR_LEN;
+	if (!packet_ctx->common->secure_transport) switch (packet_ctx->code) {
+	case FR_RADIUS_CODE_ACCESS_REQUEST:
+	case FR_RADIUS_CODE_ACCESS_ACCEPT:
+	case FR_RADIUS_CODE_ACCESS_REJECT:
+	case FR_RADIUS_CODE_ACCESS_CHALLENGE:
+	case FR_RADIUS_CODE_STATUS_SERVER:
+		FR_DBUFF_IN_BYTES_RETURN(&work_dbuff, FR_MESSAGE_AUTHENTICATOR, 0x12,
+					 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+					 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
+		packet_ctx->seen_message_authenticator = true;
+	}
 
 	/*
 	 *	If we're sending Protocol-Error, add in
 	 *	Original-Packet-Code manually.  If the user adds it
 	 *	later themselves, well, too bad.
 	 */
-	if (code == FR_CODE_PROTOCOL_ERROR) {
-		size_t room;
-
-		room = (packet + packet_len) - ptr;
-		if (room < 7) {
-			fr_strerror_printf("Insufficient room to encode attributes");
-			return -1;
-		}
-
-		ptr[0] = 241;
-		ptr[1] = 7;
-		ptr[2] = 4;	/* Original-Packet-Code */
-		ptr[3] = 0;
-		ptr[4] = 0;
-		ptr[5] = 0;
-		ptr[6] = original[0];
-
-		ptr += 7;
-		total_length += 7;
+	if (packet_ctx->code == FR_RADIUS_CODE_PROTOCOL_ERROR) {
+		FR_DBUFF_IN_BYTES_RETURN(&work_dbuff, FR_EXTENDED_ATTRIBUTE_1, 0x07, 0x04 /* Original-Packet-Code */,
+					 0x00, 0x00, 0x00, packet_ctx->request_code);
 	}
 
 	/*
 	 *	Loop over the reply attributes for the packet.
 	 */
-	fr_pair_cursor_init(&cursor, &vps);
-	while ((vp = fr_pair_cursor_current(&cursor))) {
-		size_t		last_len, room;
-		char const	*last_name = NULL;
-
-		VP_VERIFY(vp);
-
-		room = (packet + packet_len) - ptr;
+	fr_pair_dcursor_iter_init(&cursor, vps, fr_radius_next_encodable, dict_radius);
+	while ((vp = fr_dcursor_current(&cursor))) {
+		PAIR_VERIFY(vp);
 
 		/*
-		 *	Ignore non-wire attributes, but allow extended
-		 *	attributes.
-		 *
-		 *	@fixme We should be able to get rid of this check
-		 *	and just look at da->flags.internal
+		 *	Encode an individual VP
 		 */
-		if (vp->da->flags.internal || ((vp->da->vendor == 0) && (vp->da->attr >= 256))) {
-#ifndef NDEBUG
-			/*
-			 *	Permit the admin to send BADLY formatted
-			 *	attributes with a debug build.
-			 */
-			if (vp->da->attr == FR_RAW_ATTRIBUTE) {
-				if (vp->vp_length > room) {
-					len = room;
-				} else {
-					len = vp->vp_length;
-				}
-
-				memcpy(ptr, vp->vp_octets, len);
-				fr_pair_cursor_next(&cursor);
-				goto next;
-			}
-#endif
-			fr_pair_cursor_next(&cursor);
-			continue;
-		}
-
-		/*
-		 *	Set the Message-Authenticator to the correct
-		 *	length and initial value.
-		 */
-		if (!vp->da->vendor && (vp->da->attr == FR_MESSAGE_AUTHENTICATOR)) {
-			last_len = 16;
-		} else {
-			last_len = vp->vp_length;
-		}
-		last_name = vp->da->name;
-
-		if (room <= 2) break;
-
-		len = fr_radius_encode_pair(ptr, room, &cursor, &packet_ctx);
-		if (len < 0) return -1;
-
-		/*
-		 *	Failed to encode the attribute, likely because
-		 *	the packet is full.
-		 */
-		if (len == 0) {
-			if (last_len != 0) {
-				fr_strerror_printf("WARNING: Failed encoding attribute %s\n", last_name);
-				break;
-			} else {
-				fr_strerror_printf("WARNING: Skipping zero-length attribute %s\n", last_name);
-			}
-		}
-
-#ifndef NDEBUG
-	next:			/* Used only for Raw-Attribute */
-#endif
-		ptr += len;
-		total_length += len;
+		slen = fr_radius_encode_pair(&work_dbuff, &cursor, packet_ctx);
+		if (slen < 0) return slen;
 	} /* done looping over all attributes */
 
 	/*
-	 *	Fill in the rest of the fields, and copy the data over
-	 *	from the local stack to the newly allocated memory.
-	 *
-	 *	Yes, all this 'memcpy' is slow, but it means
-	 *	that we only allocate the minimum amount of
-	 *	memory for a request.
+	 *	Add Proxy-State to the end of the packet if the caller requested it.
 	 */
-	packet[2] = (total_length >> 8) & 0xff;
-	packet[3] = total_length & 0xff;
+	if (packet_ctx->add_proxy_state) {
+		FR_DBUFF_IN_BYTES_RETURN(&work_dbuff, FR_PROXY_STATE, 6);
+		FR_DBUFF_IN_RETURN(&work_dbuff, packet_ctx->common->proxy_state);
+	}
 
-	return total_length;
+	/*
+	 *	Fill in the length field we zeroed out earlier.
+	 *
+	 */
+	fr_dbuff_in(&length_dbuff, (uint16_t) (fr_dbuff_used(&work_dbuff)));
+
+	FR_PROTO_HEX_DUMP(fr_dbuff_start(&work_dbuff), fr_dbuff_used(&work_dbuff), "%s encoded packet", __FUNCTION__);
+
+	return fr_dbuff_set(dbuff, &work_dbuff);
 }
 
-/** Decode a raw RADIUS packet into VPs.
- *
- */
-ssize_t	fr_radius_decode(TALLOC_CTX *ctx, uint8_t *packet, size_t packet_len, uint8_t const *original,
-			 char const *secret, UNUSED size_t secret_len, VALUE_PAIR **vps)
+ssize_t	fr_radius_decode(TALLOC_CTX *ctx, fr_pair_list_t *out,
+			 uint8_t *packet, size_t packet_len,
+			 fr_radius_decode_ctx_t *decode_ctx)
 {
 	ssize_t			slen;
-	vp_cursor_t		cursor;
 	uint8_t const		*attr, *end;
-	fr_radius_ctx_t		packet_ctx;
+	static const uint8_t   	zeros[RADIUS_AUTH_VECTOR_LENGTH] = {};
 
-	packet_ctx.secret = secret;
-	packet_ctx.vector = original + 4;
-	packet_ctx.root = fr_dict_root(fr_dict_internal);
+	if (!decode_ctx->request_authenticator) {
+		switch (packet[0]) {
+		case FR_RADIUS_CODE_ACCESS_REQUEST:
+		case FR_RADIUS_CODE_STATUS_SERVER:
+			decode_ctx->request_authenticator = packet + 4;
+			break;
 
-	fr_pair_cursor_init(&cursor, vps);
+		case FR_RADIUS_CODE_ACCOUNTING_REQUEST:
+		case FR_RADIUS_CODE_COA_REQUEST:
+		case FR_RADIUS_CODE_DISCONNECT_REQUEST:
+			decode_ctx->request_authenticator = zeros;
+			break;
+
+		default:
+			fr_strerror_const("No authentication vector passed for packet decode");
+			return -1;
+		}
+	}
+
+	if (decode_ctx->request_code) {
+		unsigned int code = packet[0];
+
+		/*
+		 *	Quiet the compiler, which gets excited about an out
+		 *	of bounds access in allowed_replies
+		 */
+		if (!fr_cond_assert(code < FR_RADIUS_CODE_MAX)) {
+			return DECODE_FAIL_UNKNOWN_PACKET_CODE; /* checked by fr_radius_ok() */
+		}
+		if (!fr_cond_assert(decode_ctx->request_code < FR_RADIUS_CODE_MAX)) {
+			return DECODE_FAIL_UNKNOWN_PACKET_CODE; /* checked by fr_radius_ok() */
+		}
+
+		if (!allowed_replies[code]) {
+			fr_strerror_printf("%s packet received unknown reply code %s",
+					   fr_radius_packet_name[decode_ctx->request_code], fr_radius_packet_name[code]);
+			return DECODE_FAIL_UNKNOWN_PACKET_CODE;
+		}
+
+		/*
+		 *	Protocol error can reply to any packet.
+		 *
+		 *	Status-Server can get any reply.
+		 *
+		 *	Otherwise the reply code must be associated with the request code we sent.
+		 */
+		if ((code != FR_RADIUS_CODE_PROTOCOL_ERROR) && (decode_ctx->request_code != FR_RADIUS_CODE_STATUS_SERVER) &&
+		    (allowed_replies[code] != decode_ctx->request_code)) {
+			fr_strerror_printf("%s packet received invalid reply code %s",
+					   fr_radius_packet_name[decode_ctx->request_code], fr_radius_packet_name[code]);
+			return DECODE_FAIL_UNKNOWN_PACKET_CODE;
+		}
+	}
+
+	/*
+	 *	We can skip verification for dynamic client checks, and where packets are unsigned as with
+	 *	RADIUS/1.1.
+	 */
+	if (decode_ctx->verify) {
+		if (!decode_ctx->request_authenticator) decode_ctx->request_authenticator = zeros;
+
+		if (fr_radius_verify(packet, decode_ctx->request_authenticator,
+				     (uint8_t const *) decode_ctx->common->secret, decode_ctx->common->secret_length,
+				     decode_ctx->require_message_authenticator, decode_ctx->limit_proxy_state) < 0) {
+			return -1;
+		}
+	}
 
 	attr = packet + 20;
 	end = packet + packet_len;
@@ -1025,16 +1128,19 @@ ssize_t	fr_radius_decode(TALLOC_CTX *ctx, uint8_t *packet, size_t packet_len, ui
 	 *	he doesn't, all hell breaks loose.
 	 */
 	while (attr < end) {
-		slen = fr_radius_decode_pair(ctx, &cursor, attr, (end - attr), &packet_ctx);
+		slen = fr_radius_decode_pair(ctx, out, attr, (end - attr), decode_ctx);
 		if (slen < 0) return slen;
 
 		/*
 		 *	If slen is larger than the room in the packet,
 		 *	all kinds of bad things happen.
 		 */
-		 if (!fr_cond_assert(slen <= (end - attr))) return -1;
+		 if (!fr_cond_assert(slen <= (end - attr))) {
+			 return -slen;
+		 }
 
 		attr += slen;
+		talloc_free_children(decode_ctx->tmp_ctx);
 	}
 
 	/*
@@ -1043,73 +1149,244 @@ ssize_t	fr_radius_decode(TALLOC_CTX *ctx, uint8_t *packet, size_t packet_len, ui
 	return packet_len;
 }
 
-
-static void print_hex_data(uint8_t const *ptr, int attrlen, int depth)
-{
-	int i;
-	static char const tabs[] = "\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t";
-
-	for (i = 0; i < attrlen; i++) {
-		if ((i > 0) && ((i & 0x0f) == 0x00))
-			fprintf(fr_log_fp, "%.*s", depth, tabs);
-		fprintf(fr_log_fp, "%02x ", ptr[i]);
-		if ((i & 0x0f) == 0x0f) fprintf(fr_log_fp, "\n");
-	}
-	if ((i & 0x0f) != 0) fprintf(fr_log_fp, "\n");
-}
-
-
-/** Print a raw RADIUS packet as hex.
+/** Simple wrapper for callers who just need a shared secret
  *
  */
-void fr_radius_print_hex(FILE *fp, uint8_t const *packet, size_t packet_len)
+ssize_t	fr_radius_decode_simple(TALLOC_CTX *ctx, fr_pair_list_t *out,
+				uint8_t *packet, size_t packet_len,
+				uint8_t const *vector, char const *secret)
 {
-	int i;
-	uint8_t const *attr, *end;
+	ssize_t rcode;
+	fr_radius_ctx_t		common_ctx = {};
+	fr_radius_decode_ctx_t	packet_ctx = {};
 
-	if ((packet[0] > 0) && (packet[0] < FR_MAX_PACKET_CODE)) {
-		fprintf(fp, "  Code:\t\t%s\n", fr_packet_codes[packet[0]]);
-	} else {
-		fprintf(fp, "  Code:\t\t%u\n", packet[0]);
-	}
+	common_ctx.secret = secret;
+	common_ctx.secret_length = strlen(secret);
 
-	fprintf(fp, "  Id:\t\t%u\n", packet[1]);
-	fprintf(fp, "  Length:\t%u\n", ((packet[2] << 8) |
-				   (packet[3])));
-	fprintf(fp, "  Vector:\t");
+	packet_ctx.common = &common_ctx;
+	packet_ctx.tmp_ctx = talloc(ctx, uint8_t);
+	packet_ctx.request_authenticator = vector;
+	packet_ctx.end = packet + packet_len;
 
-	for (i = 4; i < 20; i++) {
-		fprintf(fp, "%02x", packet[i]);
-	}
-	fprintf(fp, "\n");
+	rcode = fr_radius_decode(ctx, out, packet, packet_len, &packet_ctx);
+	talloc_free(packet_ctx.tmp_ctx);
 
-	if (packet_len <= 20) return;
-
-	for (attr = packet + 20, end = packet + packet_len;
-	     attr < end;
-	     attr += attr[1]) {
-		int offset;
-		unsigned int vendor = 0;
-
-		fprintf(fp, "\t\t");
-
-		fprintf(fp, "%02x  %02x  ", attr[0], attr[1]);
-
-#ifndef NDEBUG
-		if (attr[1] < 2) break; /* Coverity */
-#endif
-
-		if ((attr[0] == FR_VENDOR_SPECIFIC) &&
-		    (attr[1] > 6)) {
-			vendor = (attr[2] << 25) | (attr[3] << 16) | (attr[4] << 8) | attr[5];
-			fprintf(fp, "%02x%02x%02x%02x (%u)  ",
-				attr[2], attr[3], attr[4], attr[5], vendor);
-			offset = 6;
-		} else {
-			offset = 2;
-		}
-
-		print_hex_data(attr + offset, attr[1] - offset, 3);
-	}
+	return rcode;
 }
 
+int fr_radius_global_init(void)
+{
+	if (instance_count > 0) {
+		instance_count++;
+		return 0;
+	}
+
+	instance_count++;
+
+	if (fr_dict_autoload(libfreeradius_radius_dict) < 0) {
+	fail:
+		instance_count--;
+		return -1;
+	}
+
+	if (fr_dict_attr_autoload(libfreeradius_radius_dict_attr) < 0) {
+		fr_dict_autofree(libfreeradius_radius_dict);
+		goto fail;
+	}
+
+	return 0;
+}
+
+void fr_radius_global_free(void)
+{
+	if (--instance_count != 0) return;
+
+	fr_dict_autofree(libfreeradius_radius_dict);
+}
+
+static fr_table_num_ordered_t const subtype_table[] = {
+	{ L("long-extended"),  		FLAG_LONG_EXTENDED_ATTR },
+	{ L("extended"),       		FLAG_EXTENDED_ATTR },
+	{ L("concat"),			FLAG_CONCAT },
+	{ L("has_tag"),			FLAG_HAS_TAG },
+	{ L("abinary"),			FLAG_ABINARY },
+	{ L("has_tag,encrypt=2"),	FLAG_TAGGED_TUNNEL_PASSWORD },
+
+	{ L("encrypt=1"),		FLAG_ENCRYPT_USER_PASSWORD },
+	{ L("encrypt=2"),		FLAG_ENCRYPT_TUNNEL_PASSWORD },
+	{ L("encrypt=3"),		FLAG_ENCRYPT_ASCEND_SECRET },
+
+	/*
+	 *	And some humanly-readable names
+	 */
+	{ L("encrypt=User-Password"),	FLAG_ENCRYPT_USER_PASSWORD },
+	{ L("encrypt=Tunnel-Password"),	FLAG_ENCRYPT_TUNNEL_PASSWORD },
+	{ L("encrypt=Ascend-Secret"),	FLAG_ENCRYPT_ASCEND_SECRET },
+};
+
+static bool attr_valid(UNUSED fr_dict_t *dict, fr_dict_attr_t const *parent,
+		       UNUSED char const *name, UNUSED int attr, fr_type_t type, fr_dict_attr_flags_t *flags)
+{
+	if (parent->type == FR_TYPE_STRUCT) {
+		if (flag_extended(flags)) {
+			fr_strerror_const("Attributes of type 'extended' cannot be used inside of a 'struct'");
+			return false;
+		}
+
+		/*
+		 *	The "extra" flag signifies that the subtype
+		 *	field is being used by the dictionaries
+		 *	itself, for key fields, etc.
+		 */
+		if (flags->extra) return true;
+
+		/*
+		 *	All other flags are invalid inside of a struct.
+		 */
+		if (flags->subtype) {
+			fr_strerror_const("Attributes inside of a 'struct' MUST NOT have flags set");
+			return false;
+		}
+
+		return true;
+	}
+
+	/*
+	 *	The 'extra flag is only for inside of structs and TLVs
+	 *	with refs.  It shouldn't appear anywhere else.
+	 */
+	if (flags->extra) {
+		fr_strerror_const("Unsupported extension.");
+		return false;
+	}
+
+	if (flags->length > 253) {
+		fr_strerror_printf("Attributes cannot be more than 253 octets in length");
+		return false;
+	}
+
+	/*
+	 *	No special flags, so we're OK.
+	 *
+	 *	If there is a subtype, it can only be of one kind.
+	 */
+	if (!flags->subtype) return true;
+
+	if (flags->subtype > FLAG_ENCRYPT_ASCEND_SECRET) {
+		fr_strerror_printf("Invalid flag value %u", flags->subtype);
+		return false;
+	}
+
+	/*
+	 *	Secret things are secret.
+	 */
+	if (flags->subtype > FLAG_TAGGED_TUNNEL_PASSWORD) {
+		flags->secret = true;
+	}
+
+	if (flag_concat(flags)) {
+		if (!parent->flags.is_root) {
+			fr_strerror_const("Attributes with the 'concat' flag MUST be at the root of the dictionary");
+			return false;
+		}
+
+		if (type != FR_TYPE_OCTETS) {
+			fr_strerror_const("Attributes with the 'concat' flag MUST be of data type 'octets'");
+			return false;
+		}
+
+		return true;	/* can't use any other flag */
+	}
+
+	/*
+	 *	Tagged attributes can only be of two data types.  They
+	 *	can, however, be VSAs.
+	 */
+	if (flag_has_tag(flags)) {
+		if ((type != FR_TYPE_UINT32) && (type != FR_TYPE_STRING)) {
+			fr_strerror_printf("The 'has_tag' flag can only be used for attributes of type 'integer' "
+					   "or 'string'");
+			return false;
+		}
+
+		if (!(parent->flags.is_root ||
+		      ((parent->type == FR_TYPE_VENDOR) &&
+		       (parent->parent && parent->parent->type == FR_TYPE_VSA)))) {
+			fr_strerror_const("The 'has_tag' flag can only be used with RFC and VSA attributes");
+			return false;
+		}
+
+		return true;
+	}
+
+	if (flag_extended(flags)) {
+		if (type != FR_TYPE_TLV) {
+			fr_strerror_const("The 'long' or 'extended' flag can only be used for attributes of type 'tlv'");
+			return false;
+		}
+
+		if (!parent->flags.is_root) {
+			fr_strerror_const("The 'long' flag can only be used for top-level RFC attributes");
+			return false;
+		}
+
+		return true;
+	}
+
+	/*
+	 *	Stupid hacks for MS-CHAP-MPPE-Keys.  The User-Password
+	 *	encryption method has no provisions for encoding the
+	 *	length of the data.  For User-Password, the data is
+	 *	(presumably) all printable non-zero data.  For
+	 *	MS-CHAP-MPPE-Keys, the data is binary crap.  So... we
+	 *	MUST specify a length in the dictionary.
+	 */
+	if ((flags->subtype == FLAG_ENCRYPT_USER_PASSWORD) && (type != FR_TYPE_STRING)) {
+		if (type != FR_TYPE_OCTETS) {
+			fr_strerror_printf("The 'encrypt=1' flag can only be used with "
+					   "attributes of type 'string'");
+			return false;
+		}
+
+		if (flags->length == 0) {
+			fr_strerror_printf("The 'encrypt=1' flag MUST be used with an explicit length for "
+					   "'octets' data types");
+			return false;
+		}
+	}
+
+	switch (type) {
+	case FR_TYPE_STRING:
+		break;
+
+	case FR_TYPE_TLV:
+	case FR_TYPE_IPV4_ADDR:
+	case FR_TYPE_UINT32:
+	case FR_TYPE_OCTETS:
+		if (flags->subtype != FLAG_ENCRYPT_ASCEND_SECRET) break;
+		FALL_THROUGH;
+
+	default:
+		fr_strerror_printf("The 'encrypt' flag cannot be used with attributes of type '%s'",
+				   fr_type_to_str(type));
+		return false;
+	}
+
+	return true;
+}
+
+extern fr_dict_protocol_t libfreeradius_radius_dict_protocol;
+fr_dict_protocol_t libfreeradius_radius_dict_protocol = {
+	.name = "radius",
+	.default_type_size = 1,
+	.default_type_length = 1,
+	.subtype_table = subtype_table,
+	.subtype_table_len = NUM_ELEMENTS(subtype_table),
+	.attr_valid = attr_valid,
+
+	.init = fr_radius_global_init,
+	.free = fr_radius_global_free,
+
+	.decode = fr_radius_decode_foreign,
+	.encode = fr_radius_encode_foreign,
+};

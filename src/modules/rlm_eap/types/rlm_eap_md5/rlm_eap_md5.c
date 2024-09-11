@@ -17,30 +17,108 @@
  *   along with this program; if not, write to the Free Software
  *   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  *
- * Copyright 2000,2001,2006  The FreeRADIUS server project
- * Copyright 2001  hereUare Communications, Inc. <raghud@hereuare.com>
+ * @copyright 2000,2001,2006 The FreeRADIUS server project
+ * @copyright 2001 hereUare Communications, Inc. (raghud@hereuare.com)
  */
 
 RCSID("$Id$")
 
-#include <stdio.h>
-#include <stdlib.h>
+#include <freeradius-devel/server/password.h>
+#include <freeradius-devel/util/debug.h>
+#include <freeradius-devel/util/md5.h>
+#include <freeradius-devel/util/rand.h>
 
 #include "eap_md5.h"
 
-#include <freeradius-devel/rad_assert.h>
-#include <freeradius-devel/md5.h>
+static fr_dict_t const *dict_freeradius;
 
-static rlm_rcode_t mod_process(UNUSED void *arg, eap_session_t *eap_session);
+extern fr_dict_autoload_t rlm_eap_md5_dict[];
+fr_dict_autoload_t rlm_eap_md5_dict[] = {
+	{ .out = &dict_freeradius, .proto = "freeradius" },
+	{ NULL }
+};
+
+static fr_dict_attr_t const *attr_cleartext_password;
+
+extern fr_dict_attr_autoload_t rlm_eap_md5_dict_attr[];
+fr_dict_attr_autoload_t rlm_eap_md5_dict_attr[] = {
+	{ .out = &attr_cleartext_password, .name = "Password.Cleartext", .type = FR_TYPE_STRING, .dict = &dict_freeradius },
+	{ NULL }
+};
+
+/*
+ *	Authenticate a previously sent challenge.
+ */
+static unlang_action_t mod_process(rlm_rcode_t *p_result, UNUSED module_ctx_t const *mctx, request_t *request)
+{
+	eap_session_t		*eap_session = eap_session_get(request->parent);
+	MD5_PACKET		*packet;
+	MD5_PACKET		*reply;
+	fr_pair_t		*known_good;
+	fr_dict_attr_t	const	*allowed_passwords[] = { attr_cleartext_password };
+	bool			ephemeral;
+
+	/*
+	 *	Get the Password.Cleartext for this user.
+	 */
+	fr_assert(eap_session->request != NULL);
+
+	known_good = password_find(&ephemeral, request, request->parent,
+				   allowed_passwords, NUM_ELEMENTS(allowed_passwords),
+				   false);
+	if (!known_good) {
+		REDEBUG("No \"known good\" password found for user");
+		RETURN_MODULE_FAIL;
+	}
+
+	/*
+	 *	Extract the EAP-MD5 packet.
+	 */
+	packet = eap_md5_extract(request, eap_session->this_round);
+	if (!packet) {
+		if (ephemeral) TALLOC_FREE(known_good);
+		RETURN_MODULE_INVALID;
+	}
+
+	/*
+	 *	Create a reply, and initialize it.
+	 */
+	MEM(reply = talloc(packet, MD5_PACKET));
+	reply->id = eap_session->this_round->request->id;
+	reply->length = 0;
+
+	/*
+	 *	Verify the received packet against the previous packet
+	 *	(i.e. challenge) which we sent out.
+	 */
+	if (eap_md5_verify(request, packet, known_good, eap_session->opaque)) {
+		reply->code = FR_MD5_SUCCESS;
+	} else {
+		reply->code = FR_MD5_FAILURE;
+	}
+
+	/*
+	 *	Compose the EAP-MD5 packet out of the data structure,
+	 *	and free it.
+	 */
+	eap_md5_compose(eap_session->this_round, reply);
+	talloc_free(packet);
+
+	if (ephemeral) TALLOC_FREE(known_good);
+
+	RETURN_MODULE_OK;
+}
 
 /*
  *	Initiate the EAP-MD5 session by sending a challenge to the peer.
  */
-static rlm_rcode_t mod_session_init(UNUSED void *instance, eap_session_t *eap_session)
+static unlang_action_t mod_session_init(rlm_rcode_t *p_result, UNUSED module_ctx_t const *mctx, request_t *request)
 {
-	int		i;
+	eap_session_t	*eap_session = eap_session_get(request->parent);
 	MD5_PACKET	*reply;
-	REQUEST		*request = eap_session->request;
+	int		i;
+
+	fr_assert(eap_session != NULL);
 
 	/*
 	 *	Allocate an EAP-MD5 packet.
@@ -85,65 +163,7 @@ static rlm_rcode_t mod_session_init(UNUSED void *instance, eap_session_t *eap_se
 	 */
 	eap_session->process = mod_process;
 
-	return RLM_MODULE_OK;
-}
-
-/*
- *	Authenticate a previously sent challenge.
- */
-static rlm_rcode_t mod_process(UNUSED void *arg, eap_session_t *eap_session)
-{
-	MD5_PACKET	*packet;
-	MD5_PACKET	*reply;
-	VALUE_PAIR	*password;
-	REQUEST		*request = eap_session->request;
-
-	/*
-	 *	Get the Cleartext-Password for this user.
-	 */
-	rad_assert(eap_session->request != NULL);
-
-	password = fr_pair_find_by_num(eap_session->request->control, 0, FR_CLEARTEXT_PASSWORD, TAG_ANY);
-	if (!password) {
-		REDEBUG2("Cleartext-Password is required for EAP-MD5 authentication");
-		return RLM_MODULE_REJECT;
-	}
-
-	/*
-	 *	Extract the EAP-MD5 packet.
-	 */
-	packet = eap_md5_extract(eap_session->this_round);
-	if (!packet) return RLM_MODULE_INVALID;
-
-	/*
-	 *	Create a reply, and initialize it.
-	 */
-	reply = talloc(packet, MD5_PACKET);
-	if (!reply) {
-		talloc_free(packet);
-		return RLM_MODULE_FAIL;
-	}
-	reply->id = eap_session->this_round->request->id;
-	reply->length = 0;
-
-	/*
-	 *	Verify the received packet against the previous packet
-	 *	(i.e. challenge) which we sent out.
-	 */
-	if (eap_md5_verify(packet, password, eap_session->opaque)) {
-		reply->code = FR_MD5_SUCCESS;
-	} else {
-		reply->code = FR_MD5_FAILURE;
-	}
-
-	/*
-	 *	Compose the EAP-MD5 packet out of the data structure,
-	 *	and free it.
-	 */
-	eap_md5_compose(eap_session->this_round, reply);
-	talloc_free(packet);
-
-	return RLM_MODULE_OK;
+	RETURN_MODULE_HANDLED;
 }
 
 /*
@@ -152,10 +172,10 @@ static rlm_rcode_t mod_process(UNUSED void *arg, eap_session_t *eap_session)
  */
 extern rlm_eap_submodule_t rlm_eap_md5;
 rlm_eap_submodule_t rlm_eap_md5 = {
-	.name		= "eap_md5",
-
-	.provides	= { FR_EAP_MD5 },
-	.magic		= RLM_MODULE_INIT,
+	.common = {
+		.magic		= MODULE_MAGIC_INIT,
+		.name		= "eap_md5"
+	},
+	.provides	= { FR_EAP_METHOD_MD5 },
 	.session_init	= mod_session_init,	/* Initialise a new EAP session */
-	.process	= mod_process		/* Process next round of EAP method */
 };

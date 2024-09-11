@@ -3,8 +3,9 @@
 #
 # Version:      $Id$
 #
-TARGET		:= libfreeradius-ethernet.a
+TARGET		:= libfreeradius-ethernet$(L)
 
 SOURCES		:= ethernet.c
 
-TGT_PREREQS	:= $(LIBFREERADIUS_SERVER) libfreeradius-io.a libfreeradius-util.a
+SRC_CFLAGS	:= -DNO_ASSERT
+TGT_PREREQS	:= $(LIBFREERADIUS_SERVER) libfreeradius-io$(L)

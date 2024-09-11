@@ -1,22 +1,28 @@
-TARGET	:= libfreeradius-io.a
+TARGET	:= libfreeradius-io$(L)
 
-SOURCES	:=	ring_buffer.c message.c atomic_queue.c queue.c time.c channel.c worker.c \
-		schedule.c network.c control.c
+SOURCES	:= \
+	app_io.c \
+	atomic_queue.c \
+	channel.c \
+	control.c \
+	load.c \
+	master.c \
+	message.c \
+	network.c \
+	queue.c \
+	ring_buffer.c \
+	schedule.c \
+	worker.c
 
-TGT_PREREQS	:= $(LIBFREERADIUS_SERVER) libfreeradius-util.la
+TGT_PREREQS	:= libfreeradius-util$(L) $(LIBFREERADIUS_SERVER)
 TGT_LDLIBS	:= $(LIBS)
 TGT_LDFLAGS	:= $(LDFLAGS)
 
+HEADERS		:= $(subst src/lib/,,$(wildcard src/lib/io/*.h))
+
 #
-#  Install all of the headers, too.
-#  Each source file has it's own headers.
+#  Create the build directory.
 #
-HEADERS :=	$(SOURCES:.c=.h)
-
-define ADD_UTIL_HEADER
-${SRC_INCLUDE_DIR}/io/${1}: src/include/io/${1}
-
-install.src.include: ${SRC_INCLUDE_DIR}/io/${1}
-endef
-
-$(foreach x,$(HEADERS),$(eval $(call ADD_UTIL_HEADER,$x)))
+.PHONY: src/freeradius-devel/io
+src/freeradius-devel/io:
+	${Q}[ -e $@ ] || ln -s ${top_srcdir}/src/lib/io ${top_srcdir}/src/include

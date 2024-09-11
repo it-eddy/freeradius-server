@@ -2,6 +2,15 @@
 #  Don't bother running the shell commands every time.
 #  If the file exists,
 #
+#  This is run only on the 'ci-debug' branch.  Push to that branch,
+#  and on failure, the log will be spitting out a tmux command which
+#  can be used to access the system.
+#
+#  The shell may have temporary issues (network, etc.) which is added
+#  by GitHub in order to prevent people using CI to host things.  But
+#  it will still work.
+#
+#
 ifeq "$(wildcard $(BUILD_DIR)/tests/tmux.key)" ""
 
 MD5SUM	:= $(shell which md5sum 2>/dev/null)
@@ -13,7 +22,7 @@ ifneq "$(TMUX)" ""
 #
 #  Create a unique TMUX key for this user, directory, and machine
 #
-TMUX_KEY  := $(shell (id;pwd;ifconfig -a) | md5sum | awk '{print $$1}')
+TMUX_KEY  := $(shell { (id; pwd; hostid || ifconfig -a) 2> /dev/null; } | md5sum | awk '{print $$1}')
 
 endif
 endif
@@ -45,7 +54,7 @@ $(BUILD_DIR)/tests/tmux.key:
 	${Q}echo $(TMUX_KEY) > $@
 
 #
-#  Stupid 'make' doesn' know how to create directories.
+#  Stupid 'make' doesn't know how to create directories.
 #
 .PHONY: $(BUILD_DIR)/tests/daemon/
 $(BUILD_DIR)/tests/daemon/:
@@ -57,7 +66,7 @@ $(BUILD_DIR)/tests/daemon/:
 #  If the daemon changes, we kill any running tests, and start over.
 #  If the tmux session isn't running, that's OK, too.
 #
-$(BUILD_DIR)/tests/daemon/radiusd.version: $(TESTBINDIR)/radiusd
+$(BUILD_DIR)/tests/daemon/radiusd.version: $(TEST_BIN_DIR)/radiusd
 	${Q}tmux -L $(TMUX_KEY) send-key C-c 2>/dev/null || true
 	${Q}tmux -L $(TMUX_KEY) kill-server 2>/dev/null || true
 	${Q}rm -f $(BUILD_DIR)/tests/daemon/radiusd.log
@@ -68,7 +77,7 @@ $(BUILD_DIR)/tests/daemon/radiusd.version: $(TESTBINDIR)/radiusd
 #
 $(BUILD_DIR)/tests/daemon/radiusd.log: $(BUILD_DIR)/tests/daemon/radiusd.version
 	${Q}rm -f $@
-	${Q}tmux -L $(TMUX_KEY) new-session -d './$(TESTBIN)/radiusd -i 127.0.0.1 -p $(TMUX_PORT) -fxx -d ./raddb -D share -l $@'
+	${Q}tmux -L $(TMUX_KEY) new-session -d './$(TEST_BIN)/radiusd -i 127.0.0.1 -p $(TMUX_PORT) -fxx -d ./raddb -D share/dictionary -l $@'
 
 radiusd.start: $(BUILD_DIR)/tests/daemon/radiusd.log
 

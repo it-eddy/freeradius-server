@@ -16,6 +16,7 @@ docdir		= @docdir@
 mandir		= @mandir@
 datadir		= @datadir@
 dictdir		= @dictdir@
+mibdir		= @mibdir@
 logdir		= @logdir@
 includedir	= @includedir@
 
@@ -45,9 +46,31 @@ MAKE		= @MAKE@
 # flags set on the command line and the environmental variables
 MAKEFLAGS	= @FR_MAKEFLAGS@
 
+BUILD_SYSTEM	= @BUILD_SYSTEM@
+BUILD_CC	= @BUILD_CC@
+BUILD_RANLIB	= @BUILD_RANLIB@
+BUILD_EXE_EXT	= @BUILD_EXE_EXT@
+BUILD_LIB_EXT	= @BUILD_LIB_EXT@
+
 TARGET_SYSTEM	= @TARGET_SYSTEM@
-CC		= @CC@
-RANLIB		= @RANLIB@
+TARGET_CC       = @TARGET_CC@
+TARGET_RANLIB   = @TARGET_RANLIB@
+TARGET_EXE_EXT	= @TARGET_EXE_EXT@
+TARGET_LIB_EXT	= @TARGET_LIB_EXT@
+
+# Lazy alias seeing as it's used everywhere
+L		= .$(TARGET_LIB_EXT)
+
+ifneq "${TARGET_EXE_EXT}" ""
+E		= .$(TARGET_EXE_EXT)
+else
+E		=
+endif
+
+ifneq (,$(findstring wasm,${TARGET_SYSTEM}))
+TARGET_IS_WASM  = yes
+endif
+
 INCLUDE		= -I. -Isrc \
 		  -include src/freeradius-devel/autoconf.h \
 		  -include src/freeradius-devel/build.h \
@@ -56,7 +79,6 @@ INCLUDE		= -I. -Isrc \
 CFLAGS		= $(INCLUDE) -fno-strict-aliasing @CFLAGS@
 CPPFLAGS	= @CPPFLAGS@
 LIBPREFIX	= @LIBPREFIX@
-EXEEXT		= @EXEEXT@
 
 LIBTOOL		= JLIBTOOL
 ACLOCAL		= @ACLOCAL@
@@ -67,6 +89,11 @@ INSTALL_PROGRAM	= ${INSTALL}
 INSTALL_DATA	= ${INSTALL} -m 644
 INSTALL_SCRIPT	= ${INSTALL_PROGRAM}
 INSTALLSTRIP	= @INSTALLSTRIP@
+
+#
+#  For clang16+.  Shut up a bunch of C++ complaints which are fine for C.b
+#
+# CFLAGS += -Wno-reserved-identifier -Wno-c2x-extensions -Wno-cast-function-type-strict -Wno-extra-semi-stmt -Wno-unsafe-buffer-usage
 
 #
 #  Linker arguments for libraries searched for by the main
@@ -112,12 +139,22 @@ RADIR		= ${radacctdir}
 bm_shared_libs  = yes
 bm_static_libs  = yes
 
-LIBREADLINE	= @LIBREADLINE@
+LIBREADLINE		= @LIBREADLINE@
+LIBREADLINE_PREFIX	= @LIBREADLINE_PREFIX@
+ifneq "$(LIBREADLINE_PREFIX)" ""
+LIBREADLINE_CFLAGS	= -I$(LIBREADLINE_PREFIX)/include
+LIBREADLINE_LDFLAGS	= -L$(LIBREADLINE_PREFIX)/lib
+endif
 
 #
 #  Version to use for packaging and other Make related things
 #
-RADIUSD_VERSION_STRING = @RADIUSD_VERSION_STRING@
+RADIUSD_VERSION = @RADIUSD_VERSION@
+
+RADIUSD_VERSION_MAJOR = @RADIUSD_VERSION_MAJOR@
+RADIUSD_VERSION_MINOR = @RADIUSD_VERSION_MINOR@
+RADIUSD_VERSION_INCRM = @RADIUSD_VERSION_INCRM@
+RADIUSD_VERSION_COMMIT = @RADIUSD_VERSION_COMMIT@
 
 #
 #  This allows dlopen to do runtime checks for version mismatches
@@ -139,9 +176,9 @@ CPPFLAGS		:= $(OPENSSL_CPPFLAGS) $(CPPFLAGS)
 #
 #  Add optional dependency for libfreeradius-server if we're building with OpenSSL
 #
-LIBFREERADIUS_SERVER	:= libfreeradius-tls.a
+LIBFREERADIUS_SERVER	:= libfreeradius-internal.a libfreeradius-tls.a
 endif
-LIBFREERADIUS_SERVER	+= libfreeradius-server.a
+LIBFREERADIUS_SERVER	+= libfreeradius-server.a libfreeradius-unlang.a
 
 ifneq ($(WITH_OPENSSL_MD5),)
 WITH_OPENSSL_DIGEST = 1
@@ -159,6 +196,13 @@ $(error OPENSSL_LIBS must be define in order to use WITH_OPENSSL_*)
 endif
 endif
 
+#
+#  Definitions for the generic logging framework
+#
+LOG_ID_LIB := 0
+LOG_ID_SECTION := 0
+CFLAGS += -DLOG_ID_LIB=$(LOG_ID_LIB) -DLOG_ID_SECTION=$(LOG_ID_SECTION)
+
 # Path to clang, setting this enables the 'scan.*' build targets
 # which perform static analysis on various server components.
 ANALYZE.c       := @clang_path@
@@ -166,5 +210,20 @@ ANALYZE.c       := @clang_path@
 #
 #  Have wrappers for the test tools, so that they run.
 #
-TESTBINDIR = ./$(BUILD_DIR)/bin/local
-TESTBIN    =  $(JLIBTOOL) --quiet --mode=execute $(TESTBINDIR)
+#  We have a hardcoded maximum execution time of 300 seconds
+#  If your test takes > 300 seconds to run, you're doing
+#  something wrong.
+#
+TEST_BIN_DIR        = ./$(BUILD_DIR)/bin/local
+TEST_BIN            = $(JLIBTOOL) $(if ${VERBOSE},--debug,--silent) --timeout=300 --mode=execute $(TEST_BIN_DIR)
+TEST_BIN_NO_TIMEOUT = $(JLIBTOOL) $(if ${VERBOSE},--debug,--silent) --mode=execute $(TEST_BIN_DIR)
+
+#
+#  For creating documentation via doc/all.mk
+#
+ASCIIDOCTOR := @ASCIIDOCTOR@
+PANDOC := @PANDOC@
+PANDOC_ENGINE := @PANDOC_ENGINE@
+DOXYGEN := @DOXYGEN@
+GRAPHVIZ_DOT := @GRAPHVIZ_DOT@
+ANTORA := @ANTORA@

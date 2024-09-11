@@ -19,17 +19,16 @@
  * @file rlm_detail.c
  * @brief Write plaintext versions of packets to flatfiles.
  *
- * @copyright 2000,2006  The FreeRADIUS server project
+ * @copyright 2000,2006 The FreeRADIUS server project
  */
 RCSID("$Id$")
 
-#define LOG_PREFIX "rlm_detail (%s) - "
-#define LOG_PREFIX_ARGS inst->name
-
-#include <freeradius-devel/radiusd.h>
-#include <freeradius-devel/modules.h>
-#include <freeradius-devel/rad_assert.h>
-#include <freeradius-devel/exfile.h>
+#include <freeradius-devel/server/base.h>
+#include <freeradius-devel/server/cf_util.h>
+#include <freeradius-devel/server/exfile.h>
+#include <freeradius-devel/server/module_rlm.h>
+#include <freeradius-devel/util/debug.h>
+#include <freeradius-devel/util/perm.h>
 
 #include <ctype.h>
 #include <fcntl.h>
@@ -43,55 +42,127 @@ RCSID("$Id$")
 #  include <grp.h>
 #endif
 
-#define DIRLEN	8192		//!< Maximum path length.
-
 /** Instance configuration for rlm_detail
  *
  * Holds the configuration and preparsed data for a instance of rlm_detail.
  */
-typedef struct detail_instance {
-	char const	*name;		//!< Instance name.
-	char const	*filename;	//!< File/path to write to.
+typedef struct {
 	uint32_t	perm;		//!< Permissions to use for new files.
-	char const	*group;		//!< Group to use for new files.
+	gid_t		group;		//!< Resolved group.
+	bool		group_is_set;	//!< Whether group was set.
 
-	char const	*header;	//!< Header format.
 	bool		locking;	//!< Whether the file should be locked.
 
 	bool		log_srcdst;	//!< Add IP src/dst attributes to entries.
 
 	bool		escape;		//!< do filename escaping, yes / no
 
-	xlat_escape_t	escape_func; //!< escape function
-
 	exfile_t    	*ef;		//!< Log file handler
-
-	fr_hash_table_t *ht;		//!< Holds suppressed attributes.
 } rlm_detail_t;
 
-static const CONF_PARSER module_config[] = {
-	{ FR_CONF_OFFSET("filename", FR_TYPE_FILE_OUTPUT | FR_TYPE_REQUIRED | FR_TYPE_XLAT, rlm_detail_t, filename), .dflt = "%A/%{Packet-Src-IP-Address}/detail" },
-	{ FR_CONF_OFFSET("header", FR_TYPE_STRING | FR_TYPE_XLAT, rlm_detail_t, header), .dflt = "%t" },
-	{ FR_CONF_OFFSET("permissions", FR_TYPE_UINT32, rlm_detail_t, perm), .dflt = "0600" },
-	{ FR_CONF_OFFSET("group", FR_TYPE_STRING, rlm_detail_t, group) },
-	{ FR_CONF_OFFSET("locking", FR_TYPE_BOOL, rlm_detail_t, locking), .dflt = "no" },
-	{ FR_CONF_OFFSET("escape_filenames", FR_TYPE_BOOL, rlm_detail_t, escape), .dflt = "no" },
-	{ FR_CONF_OFFSET("log_packet_header", FR_TYPE_BOOL, rlm_detail_t, log_srcdst), .dflt = "no" },
+typedef struct {
+	fr_value_box_t	filename;	//!< File / path to write to.
+	tmpl_t		*filename_tmpl;	//!< tmpl used to expand filename (for debug output)
+	fr_value_box_t	header;		//!< Header format
+	fr_hash_table_t	*ht;		//!< Holds suppressed attributes.
+} rlm_detail_env_t;
+
+int detail_group_parse(UNUSED TALLOC_CTX *ctx, void *out, void *parent,
+		       CONF_ITEM *ci, conf_parser_t const *rule);
+
+static const conf_parser_t module_config[] = {
+	{ FR_CONF_OFFSET("permissions", rlm_detail_t, perm), .dflt = "0600" },
+	{ FR_CONF_OFFSET_IS_SET("group", FR_TYPE_VOID, 0, rlm_detail_t, group), .func = detail_group_parse },
+	{ FR_CONF_OFFSET("locking", rlm_detail_t, locking), .dflt = "no" },
+	{ FR_CONF_OFFSET("escape_filenames", rlm_detail_t, escape), .dflt = "no" },
+	{ FR_CONF_OFFSET("log_packet_header", rlm_detail_t, log_srcdst), .dflt = "no" },
 	CONF_PARSER_TERMINATOR
 };
 
+static fr_dict_t const *dict_freeradius;
+static fr_dict_t const *dict_radius;
 
-/*
- *	Clean up.
+extern fr_dict_autoload_t rlm_detail_dict[];
+fr_dict_autoload_t rlm_detail_dict[] = {
+	{ .out = &dict_freeradius, .proto = "freeradius" },
+	{ .out = &dict_radius, .proto = "radius" },
+	{ NULL }
+};
+
+static fr_dict_attr_t const *attr_net;
+static fr_dict_attr_t const *attr_net_src_address;
+static fr_dict_attr_t const *attr_net_dst_address;
+static fr_dict_attr_t const *attr_net_src_port;
+static fr_dict_attr_t const *attr_net_dst_port;
+static fr_dict_attr_t const *attr_protocol;
+
+static fr_dict_attr_t const *attr_user_password;
+
+extern fr_dict_attr_autoload_t rlm_detail_dict_attr[];
+fr_dict_attr_autoload_t rlm_detail_dict_attr[] = {
+	{ .out = &attr_net, .name = "Net", .type = FR_TYPE_TLV, .dict = &dict_freeradius },
+	{ .out = &attr_net_dst_address, .name = "Net.Dst.IP", .type = FR_TYPE_COMBO_IP_ADDR, .dict = &dict_freeradius },
+	{ .out = &attr_net_dst_port, .name = "Net.Dst.Port", .type = FR_TYPE_UINT16, .dict = &dict_freeradius },
+	{ .out = &attr_net_src_address, .name = "Net.Src.IP", .type = FR_TYPE_COMBO_IP_ADDR, .dict = &dict_freeradius },
+	{ .out = &attr_net_src_port, .name = "Net.Src.Port", .type = FR_TYPE_UINT16, .dict = &dict_freeradius },
+	{ .out = &attr_protocol, .name = "Protocol", .type = FR_TYPE_UINT32, .dict = &dict_freeradius },
+
+	{ .out = &attr_user_password, .name = "User-Password", .type = FR_TYPE_STRING, .dict = &dict_radius },
+
+	{ NULL }
+};
+
+/** Print one attribute and value to FP
+ *
+ * Complete string with '\\t' and '\\n' is written to buffer before printing to
+ * avoid issues when running with multiple threads.
+ *
+ * @todo - This function should print *flattened* lists.
+ *
+ * @param fp to output to.
+ * @param vp to print.
  */
-static int mod_detach(void *instance)
+static void CC_HINT(nonnull) fr_pair_fprint(FILE *fp, fr_pair_t const *vp)
 {
-	rlm_detail_t *inst = instance;
+	char		buff[1024];
+	fr_sbuff_t	sbuff = FR_SBUFF_OUT(buff, sizeof(buff));
 
-	if (inst->ht) fr_hash_table_free(inst->ht);
-	return 0;
+	PAIR_VERIFY(vp);
+
+	(void) fr_sbuff_in_char(&sbuff, '\t');
+	(void) fr_pair_print(&sbuff, NULL, vp);
+	(void) fr_sbuff_in_char(&sbuff, '\n');
+
+	fputs(buff, fp);
 }
 
+
+
+/** Generic function for parsing conf pair values as int
+ *
+ * @note This should be used for enum types as c99 6.4.4.3 states that the enumeration
+ * constants are of type int.
+ *
+ */
+int detail_group_parse(UNUSED TALLOC_CTX *ctx, void *out, void *parent,
+		       CONF_ITEM *ci, UNUSED conf_parser_t const *rule)
+{
+	char const 			*group;
+	char				*endptr;
+	gid_t				gid;
+
+	group = cf_pair_value(cf_item_to_pair(ci));
+	gid = strtol(group, &endptr, 10);
+	if (*endptr != '\0') {
+		if (fr_perm_gid_from_str(parent, &gid, group) < 0) {
+			cf_log_err(ci, "Unable to find system group '%s'", group);
+			return -1;
+		}
+	}
+	*((gid_t *)out) = gid;
+
+	return 0;
+}
 
 static uint32_t detail_hash(void const *data)
 {
@@ -99,87 +170,23 @@ static uint32_t detail_hash(void const *data)
 	return fr_hash(&da, sizeof(da));
 }
 
-static int detail_cmp(void const *a, void const *b)
+static int8_t detail_cmp(void const *a, void const *b)
 {
-	return (a < b) - (a > b);
+	return CMP(a, b);
 }
 
 /*
  *	(Re-)read radiusd.conf into memory.
  */
-static int mod_instantiate(void *instance, CONF_SECTION *conf)
+static int mod_instantiate(module_inst_ctx_t const *mctx)
 {
-	rlm_detail_t *inst = instance;
-	CONF_SECTION	*cs;
+	rlm_detail_t	*inst = talloc_get_type_abort(mctx->mi->data, rlm_detail_t);
+	CONF_SECTION	*conf = mctx->mi->conf;
 
-	inst->name = cf_section_name2(conf);
-	if (!inst->name) inst->name = cf_section_name1(conf);
-
-	/*
-	 *	Escape filenames only if asked.
-	 */
-	if (inst->escape) {
-		inst->escape_func = rad_filename_escape;
-	} else {
-		inst->escape_func = rad_filename_make_safe;
-	}
-
-	inst->ef = module_exfile_init(inst, conf, 256, 30, inst->locking, NULL, NULL);
+	inst->ef = module_rlm_exfile_init(inst, conf, 256, fr_time_delta_from_sec(30), inst->locking, NULL, NULL);
 	if (!inst->ef) {
 		cf_log_err(conf, "Failed creating log file context");
 		return -1;
-	}
-
-	/*
-	 *	Suppress certain attributes.
-	 */
-	cs = cf_section_find(conf, "suppress", NULL);
-	if (cs) {
-		CONF_ITEM	*ci;
-
-		inst->ht = fr_hash_table_create(NULL, detail_hash, detail_cmp, NULL);
-
-		for (ci = cf_item_next(cs, NULL);
-		     ci != NULL;
-		     ci = cf_item_next(cs, ci)) {
-			char const	*attr;
-			fr_dict_attr_t const	*da;
-
-			if (!cf_item_is_pair(ci)) continue;
-
-			attr = cf_pair_attr(cf_item_to_pair(ci));
-			if (!attr) continue; /* pair-anoia */
-
-			da = fr_dict_attr_by_name(NULL, attr);
-			if (!da) {
-				cf_log_err(conf, "No such attribute '%s'", attr);
-				return -1;
-			}
-
-			/*
-			 *	Be kind to minor mistakes.
-			 */
-			if (fr_hash_table_finddata(inst->ht, da)) {
-				WARN("Ignoring duplicate entry '%s'", attr);
-				continue;
-			}
-
-
-			if (!fr_hash_table_insert(inst->ht, da)) {
-				ERROR("Failed inserting '%s' into suppression table", attr);
-				return -1;
-			}
-
-			DEBUG("'%s' suppressed, will not appear in detail output", attr);
-		}
-
-		/*
-		 *	If we didn't suppress anything, delete the hash table.
-		 */
-		if (fr_hash_table_num_elements(inst->ht) == 0) {
-			fr_hash_table_free(inst->ht);
-			inst->ht = NULL;
-		}
 	}
 
 	return 0;
@@ -188,14 +195,13 @@ static int mod_instantiate(void *instance, CONF_SECTION *conf)
 /*
  *	Wrapper for VPs allocated on the stack.
  */
-static void detail_fr_pair_fprint(TALLOC_CTX *ctx, FILE *out, VALUE_PAIR const *stacked)
+static void detail_fr_pair_fprint(TALLOC_CTX *ctx, FILE *out, fr_pair_t const *stacked)
 {
-	VALUE_PAIR *vp;
+	fr_pair_t *vp;
 
-	vp = talloc(ctx, VALUE_PAIR);
-	if (!vp) return;
+	vp = fr_pair_copy(ctx, stacked);
+	if (unlikely(vp == NULL)) return;
 
-	memcpy(vp, stacked, sizeof(*vp));
 	vp->op = T_OP_EQ;
 	fr_pair_fprint(out, vp);
 	talloc_free(vp);
@@ -207,19 +213,16 @@ static void detail_fr_pair_fprint(TALLOC_CTX *ctx, FILE *out, VALUE_PAIR const *
  * @param[in] out Where to write entry.
  * @param[in] inst Instance of rlm_detail.
  * @param[in] request The current request.
- * @param[in] packet associated with the request (request, reply, proxy-request, proxy-reply...).
+ * @param[in] header To print above packet
+ * @param[in] packet associated with the request (request, reply...).
+ * @param[in] list of pairs to write.
  * @param[in] compat Write out entry in compatibility mode.
+ * @param[in] ht Hash table containing attributes to be suppressed in the output.
  */
-static int detail_write(FILE *out, rlm_detail_t const *inst, REQUEST *request, RADIUS_PACKET *packet, bool compat)
+static int detail_write(FILE *out, rlm_detail_t const *inst, request_t *request, fr_value_box_t *header,
+			fr_packet_t *packet, fr_pair_list_t *list, bool compat, fr_hash_table_t *ht)
 {
-	VALUE_PAIR *vp;
-	char timestamp[256];
-
-	if (xlat_eval(timestamp, sizeof(timestamp), request, inst->header, NULL, NULL) < 0) {
-		return -1;
-	}
-
-	if (!packet->vps) {
+	if (fr_pair_list_empty(list)) {
 		RWDEBUG("Skipping empty packet");
 		return 0;
 	}
@@ -231,109 +234,83 @@ static int detail_write(FILE *out, rlm_detail_t const *inst, REQUEST *request, R
 	}\
 } while(0)
 
-	WRITE("%s\n", timestamp);
+	WRITE("%s\n", header->vb_strvalue);
 
 	/*
 	 *	Write the information to the file.
 	 */
 	if (!compat) {
+		fr_dict_attr_t const *da;
+		char const *name = NULL;
+
+		da = fr_dict_attr_by_name(NULL, fr_dict_root(request->dict), "Packet-Type");
+		if (da) name = fr_dict_enum_name_by_value(da, fr_box_uint32(packet->code));
+
 		/*
 		 *	Print out names, if they're OK.
 		 *	Numbers, if not.
 		 */
-		if (is_radius_code(packet->code)) {
-			fr_dict_attr_t const	*da;
-
-			da = fr_dict_attr_by_num(NULL, 0, FR_PACKET_TYPE);
-			rad_assert(da != NULL);
-
-			WRITE("\tPacket-Type = %s\n",
-			      fr_dict_enum_alias_by_value(NULL, da, fr_box_uint32(packet->code)));
+		if (name) {
+			WRITE("\tPacket-Type = %s\n", name);
 		} else {
 			WRITE("\tPacket-Type = %u\n", packet->code);
 		}
 	}
 
+	/*
+	 *	Put these at the top as distinct (not nested) VPs.
+	 */
 	if (inst->log_srcdst) {
-		VALUE_PAIR src_vp, dst_vp;
+		fr_pair_t *src_vp, *dst_vp;
 
-		memset(&src_vp, 0, sizeof(src_vp));
-		memset(&dst_vp, 0, sizeof(dst_vp));
+		src_vp = fr_pair_find_by_da_nested(&request->control_pairs, NULL, attr_net_src_address);
+		dst_vp = fr_pair_find_by_da_nested(&request->control_pairs, NULL, attr_net_dst_address);
 
-		switch (packet->src_ipaddr.af) {
-		case AF_INET:
-			src_vp.da = fr_dict_attr_by_num(NULL, 0, FR_PACKET_SRC_IP_ADDRESS);
-			fr_value_box_shallow(&src_vp.data, &packet->src_ipaddr, true);
+		/*
+		 *	These pairs will exist, but Coverity doesn't know that
+		 */
+		if (src_vp) detail_fr_pair_fprint(request, out, src_vp);
+		if (dst_vp) detail_fr_pair_fprint(request, out, dst_vp);
 
-			dst_vp.da = fr_dict_attr_by_num(NULL, 0, FR_PACKET_DST_IP_ADDRESS);
-			fr_value_box_shallow(&dst_vp.data, &packet->dst_ipaddr, true);
-			break;
+		src_vp = fr_pair_find_by_da_nested(&request->control_pairs, NULL, attr_net_src_port);
+		dst_vp = fr_pair_find_by_da_nested(&request->control_pairs, NULL, attr_net_dst_port);
 
-		case AF_INET6:
-			src_vp.da = fr_dict_attr_by_num(NULL, 0, FR_PACKET_SRC_IPV6_ADDRESS);
-			fr_value_box_shallow(&src_vp.data, &packet->src_ipaddr, true);
-
-			dst_vp.da = fr_dict_attr_by_num(NULL, 0, FR_PACKET_DST_IPV6_ADDRESS);
-			fr_value_box_shallow(&dst_vp.data, &packet->dst_ipaddr, true);
-			break;
-
-		default:
-			break;
-		}
-
-		detail_fr_pair_fprint(request, out, &src_vp);
-		detail_fr_pair_fprint(request, out, &dst_vp);
-
-		src_vp.da = fr_dict_attr_by_num(NULL, 0, FR_PACKET_SRC_PORT);
-		fr_value_box_shallow(&src_vp.data, packet->src_port, true);
-
-		dst_vp.da = fr_dict_attr_by_num(NULL, 0, FR_PACKET_DST_PORT);
-		fr_value_box_shallow(&dst_vp.data, packet->dst_port, true);
-
-		detail_fr_pair_fprint(request, out, &src_vp);
-		detail_fr_pair_fprint(request, out, &dst_vp);
+		if (src_vp) detail_fr_pair_fprint(request, out, src_vp);
+		if (dst_vp) detail_fr_pair_fprint(request, out, dst_vp);
 	}
 
-	{
-		fr_cursor_t cursor;
-		/* Write each attribute/value to the log file */
-		for (vp = fr_cursor_init(&cursor, &packet->vps);
-		     vp;
-		     vp = fr_cursor_next(&cursor)) {
-			FR_TOKEN op;
+	/* Write each attribute/value to the log file */
+	fr_pair_list_foreach_leaf(list, vp) {
+		if (ht && fr_hash_table_find(ht, vp->da)) continue;
 
-			if (inst->ht && fr_hash_table_finddata(inst->ht, vp->da)) continue;
+		/*
+		 *	Skip Net.* if we're not logging src/dst
+		 */
+		if (!inst->log_srcdst && (fr_dict_by_da(vp->da) == dict_freeradius)) {
+			fr_dict_attr_t const *da = vp->da;
 
-			/*
-			 *	Don't print passwords in old format...
-			 */
-			if (compat && !vp->da->vendor && (vp->da->attr == FR_USER_PASSWORD)) continue;
+			while (da->depth > attr_net->depth) {
+				da = da->parent;
+			}
 
-			/*
-			 *	Print all of the attributes, operator should always be '='.
-			 */
-			op = vp->op;
-			vp->op = T_OP_EQ;
-			fr_pair_fprint(out, vp);
-			vp->op = op;
+			if (da == attr_net) continue;
 		}
+
+		/*
+		 *	Don't print passwords in old format...
+		 */
+		if (compat && (vp->da == attr_user_password)) continue;
+
+		fr_pair_fprint(out, vp);
 	}
 
 	/*
-	 *	Add non-protocol attributes.
+	 *	Add the original protocol of the request, this should
+	 *	be used by the detail reader to set the default
+	 *	dictionary used for decoding.
 	 */
-	if (compat) {
-#ifdef WITH_PROXY
-		if (request->proxy) {
-			char proxy_buffer[INET6_ADDRSTRLEN];
-
-			inet_ntop(request->proxy->packet->dst_ipaddr.af, &request->proxy->packet->dst_ipaddr.addr,
-				  proxy_buffer, sizeof(proxy_buffer));
-			WRITE("\tFreeradius-Proxied-To = %s\n", proxy_buffer);
-		}
-#endif
-	}
-	WRITE("\tTimestamp = %ld\n", (unsigned long) request->packet->timestamp.tv_sec);
+//	WRITE("\t%s = %s", attr_protocol->name, fr_dict_root(request->dict)->name);
+	WRITE("\tTimestamp = %lu\n", (unsigned long) fr_time_to_sec(request->packet->timestamp));
 
 	WRITE("\n");
 
@@ -343,55 +320,33 @@ static int detail_write(FILE *out, rlm_detail_t const *inst, REQUEST *request, R
 /*
  *	Do detail, compatible with old accounting
  */
-static rlm_rcode_t CC_HINT(nonnull) detail_do(void const *instance, REQUEST *request,
-					      RADIUS_PACKET *packet, bool compat)
+static unlang_action_t CC_HINT(nonnull) detail_do(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request,
+						  fr_packet_t *packet, fr_pair_list_t *list,
+						  bool compat)
 {
-	int		outfd, dupfd;
-	char		buffer[DIRLEN];
+	rlm_detail_env_t	*env = talloc_get_type_abort(mctx->env_data, rlm_detail_env_t);
+	int			outfd, dupfd;
+	FILE			*outfp = NULL;
 
-	FILE		*outfp;
+	rlm_detail_t const *inst = talloc_get_type_abort_const(mctx->mi->data, rlm_detail_t);
 
-#ifdef HAVE_GRP_H
-	gid_t		gid;
-	char		*endptr;
-#endif
+	RDEBUG2("%s expands to %pV", env->filename_tmpl->name, &env->filename);
 
-	rlm_detail_t const *inst = instance;
-
-	/*
-	 *	Generate the path for the detail file.  Use the same
-	 *	format, but truncate at the last /.  Then feed it
-	 *	through xlat_eval() to expand the variables.
-	 */
-	if (xlat_eval(buffer, sizeof(buffer), request, inst->filename, inst->escape_func, NULL) < 0) {
-		return RLM_MODULE_FAIL;
-	}
-
-	RDEBUG2("%s expands to %s", inst->filename, buffer);
-
-	outfd = exfile_open(inst->ef, request, buffer, inst->perm);
+	outfd = exfile_open(inst->ef, env->filename.vb_strvalue, inst->perm, NULL);
 	if (outfd < 0) {
-		RPERROR("Couldn't open file %s", buffer);
+		RPERROR("Couldn't open file %pV", &env->filename);
+		*p_result = RLM_MODULE_FAIL;
 		/* coverity[missing_unlock] */
-		return RLM_MODULE_FAIL;
+		return UNLANG_ACTION_CALCULATE_RESULT;
 	}
 
-	if (inst->group != NULL) {
-		gid = strtol(inst->group, &endptr, 10);
-		if (*endptr != '\0') {
-			if (rad_getgid(request, &gid, inst->group) < 0) {
-				RDEBUG2("Unable to find system group '%s'", inst->group);
-				goto skip_group;
-			}
-		}
-
-		if (chown(buffer, -1, gid) == -1) {
-			RDEBUG2("Unable to change system group of '%s'", buffer);
+	if (inst->group_is_set) {
+		if (chown(env->filename.vb_strvalue, -1, inst->group) == -1) {
+			RERROR("Unable to set detail file group to '%d': %s", inst->group, fr_syserror(errno));
+			goto fail;
 		}
 	}
 
-skip_group:
-	outfp = NULL;
 	dupfd = dup(outfd);
 	if (dupfd < 0) {
 		RERROR("Failed to dup() file descriptor for detail file");
@@ -402,127 +357,164 @@ skip_group:
 	 *	Open the output fp for buffering.
 	 */
 	if ((outfp = fdopen(dupfd, "a")) == NULL) {
-		RERROR("Couldn't open file %s: %s", buffer, fr_syserror(errno));
+		RERROR("Couldn't open file %pV: %s", &env->filename, fr_syserror(errno));
 	fail:
 		if (outfp) fclose(outfp);
-		exfile_close(inst->ef, request, outfd);
-		return RLM_MODULE_FAIL;
+		exfile_close(inst->ef, outfd);
+		RETURN_MODULE_FAIL;
 	}
 
-	if (detail_write(outfp, inst, request, packet, compat) < 0) goto fail;
+	if (detail_write(outfp, inst, request, &env->header, packet, list, compat, env->ht) < 0) goto fail;
 
 	/*
 	 *	Flush everything
 	 */
 	fclose(outfp);
-	exfile_close(inst->ef, request, outfd);
+	exfile_close(inst->ef, outfd);
 
 	/*
 	 *	And everything is fine.
 	 */
-	return RLM_MODULE_OK;
+	RETURN_MODULE_OK;
 }
 
 /*
  *	Accounting - write the detail files.
  */
-static rlm_rcode_t CC_HINT(nonnull) mod_accounting(void *instance, UNUSED void *thread, REQUEST *request)
+static unlang_action_t CC_HINT(nonnull) mod_accounting(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request)
 {
-	return detail_do(instance, request, request->packet, true);
+	return detail_do(p_result, mctx, request, request->packet, &request->request_pairs, true);
 }
 
 /*
  *	Incoming Access Request - write the detail files.
  */
-static rlm_rcode_t CC_HINT(nonnull) mod_authorize(void *instance, UNUSED void *thread, REQUEST *request)
+static unlang_action_t CC_HINT(nonnull) mod_authorize(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request)
 {
-	return detail_do(instance, request, request->packet, false);
+	return detail_do(p_result, mctx, request, request->packet, &request->request_pairs, false);
 }
 
 /*
  *	Outgoing Access-Request Reply - write the detail files.
  */
-static rlm_rcode_t CC_HINT(nonnull) mod_post_auth(void *instance, UNUSED void *thread, REQUEST *request)
+static unlang_action_t CC_HINT(nonnull) mod_post_auth(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request)
 {
-	return detail_do(instance, request, request->reply, false);
+	return detail_do(p_result, mctx, request, request->reply, &request->reply_pairs, false);
 }
 
-#ifdef WITH_COA
-/*
- *	Incoming CoA - write the detail files.
- */
-static rlm_rcode_t CC_HINT(nonnull) mod_recv_coa(void *instance, UNUSED void *thread, REQUEST *request)
+static int call_env_filename_parse(TALLOC_CTX *ctx, void *out, tmpl_rules_t const *t_rules,
+				   CONF_ITEM *ci,
+				   call_env_ctx_t const *cec, UNUSED call_env_parser_t const *rule)
 {
-	return detail_do(instance, request, request->packet, false);
+	rlm_detail_t const	*inst = talloc_get_type_abort_const(cec->mi->data, rlm_detail_t);
+	tmpl_t			*parsed;
+	CONF_PAIR const		*to_parse = cf_item_to_pair(ci);
+	tmpl_rules_t		our_rules;
+
+	our_rules = *t_rules;
+	our_rules.escape.func = (inst->escape) ? rad_filename_box_escape : rad_filename_box_make_safe;
+	our_rules.escape.safe_for = (inst->escape) ? (fr_value_box_safe_for_t)rad_filename_box_escape :
+						     (fr_value_box_safe_for_t)rad_filename_box_make_safe;
+	our_rules.escape.mode = TMPL_ESCAPE_PRE_CONCAT;
+	our_rules.literals_safe_for = our_rules.escape.safe_for;
+
+	if (tmpl_afrom_substr(ctx, &parsed,
+			      &FR_SBUFF_IN(cf_pair_value(to_parse), talloc_array_length(cf_pair_value(to_parse)) - 1),
+			      cf_pair_value_quote(to_parse), NULL, &our_rules) < 0) return -1;
+
+	*(void **)out = parsed;
+	return 0;
 }
 
-/*
- *	Outgoing CoA - write the detail files.
- */
-static rlm_rcode_t CC_HINT(nonnull) mod_send_coa(void *instance, UNUSED void *thread, REQUEST *request)
+static int call_env_suppress_parse(TALLOC_CTX *ctx, call_env_parsed_head_t *out, tmpl_rules_t const *t_rules,
+				   CONF_ITEM *ci,
+				   UNUSED call_env_ctx_t const *cec, UNUSED call_env_parser_t const *rule)
 {
-	return detail_do(instance, request, request->reply, false);
-}
-#endif
+	CONF_SECTION const	*cs = cf_item_to_section(ci);
+	CONF_SECTION const	*parent = cf_item_to_section(cf_parent(ci));
+	call_env_parsed_t	*parsed;
+	CONF_ITEM const		*to_parse = NULL;
+	char const		*attr;
+	fr_dict_attr_t const	*da;
+	fr_hash_table_t		*ht;
 
-/*
- *	Outgoing Access-Request to home server - write the detail files.
- */
-#ifdef WITH_PROXY
-static rlm_rcode_t CC_HINT(nonnull) mod_pre_proxy(void *instance, UNUSED void *thread, REQUEST *request)
-{
-	return detail_do(instance, request, request->proxy->packet, false);
-}
+	MEM(parsed = call_env_parsed_add(ctx, out,
+					 &(call_env_parser_t) { FR_CALL_ENV_PARSE_ONLY_OFFSET("suppress", FR_TYPE_VOID, 0, rlm_detail_env_t, ht )}));
 
+	ht = fr_hash_table_alloc(parsed, detail_hash, detail_cmp, NULL);
 
-/*
- *	Outgoing Access-Request Reply - write the detail files.
- */
-static rlm_rcode_t CC_HINT(nonnull) mod_post_proxy(void *instance, void *thread, REQUEST *request)
-{
-	/*
-	 *	No reply: we must be doing Post-Proxy-Type = Fail.
-	 *
-	 *	Note that we just call the normal accounting function,
-	 *	to minimize the amount of code, and to highlight that
-	 *	it's doing normal accounting.
-	 */
-	if (!request->proxy->reply) {
-		rlm_rcode_t rcode;
+	while ((to_parse = cf_item_next(cs, to_parse))) {
+		if (!cf_item_is_pair(to_parse)) continue;
 
-		rcode = mod_accounting(instance, thread, request);
-		if (rcode == RLM_MODULE_OK) {
-			request->reply->code = FR_CODE_ACCOUNTING_RESPONSE;
+		attr = cf_pair_attr(cf_item_to_pair(to_parse));
+		if (!attr) continue;
+
+		da = fr_dict_attr_search_by_qualified_oid(NULL, t_rules->attr.dict_def, attr, false, false);
+		if (!da) {
+			cf_log_perr(to_parse, "Failed resolving attribute");
+			return -1;
 		}
-		return rcode;
+
+		/*
+		 *	Be kind to minor mistakes
+		 */
+		if (fr_hash_table_find(ht, da)) {
+			cf_log_warn(to_parse, "Ignoring duplicate entry '%s'", attr);
+			continue;
+		}
+
+		if (!fr_hash_table_insert(ht, da)) {
+			cf_log_perr(to_parse, "Failed inserting '%s' into suppression table", attr);
+			return -1;
+		}
+
+		DEBUG("%s - '%s' suppressed, will not appear in detail output", cf_section_name(parent), attr);
 	}
 
-	return detail_do(instance, request, request->proxy->reply, false);
-}
-#endif
+	/*
+	 *	Clear up if nothing is actually to be suppressed
+	 */
+	if (fr_hash_table_num_elements(ht) == 0) {
+		talloc_free(ht);
+		call_env_parsed_free(out, parsed);
+		return 0;
+	}
 
-/* globally exported name */
-extern rad_module_t rlm_detail;
-rad_module_t rlm_detail = {
-	.magic		= RLM_MODULE_INIT,
-	.name		= "detail",
-	.inst_size	= sizeof(rlm_detail_t),
-	.config		= module_config,
-	.instantiate	= mod_instantiate,
-	.detach		= mod_detach,
-	.methods = {
-		[MOD_AUTHORIZE]		= mod_authorize,
-		[MOD_PREACCT]		= mod_accounting,
-		[MOD_ACCOUNTING]	= mod_accounting,
-#ifdef WITH_PROXY
-		[MOD_PRE_PROXY]		= mod_pre_proxy,
-		[MOD_POST_PROXY]	= mod_post_proxy,
-#endif
-		[MOD_POST_AUTH]		= mod_post_auth,
-#ifdef WITH_COA
-		[MOD_RECV_COA]		= mod_recv_coa,
-		[MOD_SEND_COA]		= mod_send_coa
-#endif
-	},
+	fr_hash_table_fill(ht);
+	call_env_parsed_set_data(parsed, ht);
+
+	return 0;
+}
+
+static const call_env_method_t method_env = {
+	FR_CALL_ENV_METHOD_OUT(rlm_detail_env_t),
+	.env = (call_env_parser_t[]){
+		{ FR_CALL_ENV_PARSE_OFFSET("filename", FR_TYPE_STRING, CALL_ENV_FLAG_REQUIRED, rlm_detail_env_t, filename, filename_tmpl),
+		  .pair.func =  call_env_filename_parse },
+		{ FR_CALL_ENV_OFFSET("header", FR_TYPE_STRING, CALL_ENV_FLAG_CONCAT, rlm_detail_env_t, header),
+		  .pair.dflt = "%t", .pair.dflt_quote = T_DOUBLE_QUOTED_STRING },
+		{ FR_CALL_ENV_SUBSECTION_FUNC("suppress", NULL, CALL_ENV_FLAG_NONE, call_env_suppress_parse) },
+		CALL_ENV_TERMINATOR
+	}
 };
 
+/* globally exported name */
+extern module_rlm_t rlm_detail;
+module_rlm_t rlm_detail = {
+	.common = {
+		.magic		= MODULE_MAGIC_INIT,
+		.name		= "detail",
+		.inst_size	= sizeof(rlm_detail_t),
+		.config		= module_config,
+		.instantiate	= mod_instantiate
+	},
+	.method_group = {
+		.bindings = (module_method_binding_t[]){
+			{ .section = SECTION_NAME("accounting", CF_IDENT_ANY), .method = mod_accounting, .method_env = &method_env },
+			{ .section = SECTION_NAME("recv", "accounting-request"), .method = mod_accounting, .method_env = &method_env },
+			{ .section = SECTION_NAME("recv", CF_IDENT_ANY), .method = mod_authorize, .method_env = &method_env },
+			{ .section = SECTION_NAME("send", CF_IDENT_ANY), .method = mod_post_auth, .method_env = &method_env },
+			MODULE_BINDING_TERMINATOR
+		}
+	}
+};

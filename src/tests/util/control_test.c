@@ -17,27 +17,27 @@
  *   along with this program; if not, write to the Free Software
  *   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  *
- * Copyright 2016  Alan DeKok <aland@freeradius.org>
+ * @copyright 2016 Alan DeKok (aland@freeradius.org)
  */
 
 RCSID("$Id$")
 
 #include <freeradius-devel/io/control.h>
-#include <freeradius-devel/io/time.h>
-#include <freeradius-devel/rad_assert.h>
+#include <freeradius-devel/util/debug.h>
+#include <freeradius-devel/util/syserror.h>
+#include <freeradius-devel/util/talloc.h>
+#include <freeradius-devel/util/time.h>
 
 #include <sys/event.h>
 #include <stdio.h>
 #include <string.h>
+#include <pthread.h>
 
 #ifdef HAVE_GETOPT_H
 #  include <getopt.h>
 #endif
 
-#ifdef HAVE_PTHREAD_H
-#  include <pthread.h>
-#endif
-
+#undef MEM
 #define MEM(x) if (!(x)) { fprintf(stderr, "%s[%u] OUT OF MEMORY\n", __FILE__, __LINE__); _exit(EXIT_FAILURE); }
 #define MPRINT1 if (debug_lvl) printf
 #define CONTROL_MAGIC 0xabcd6809
@@ -51,40 +51,31 @@ static fr_control_t	*control = NULL;
 static fr_ring_buffer_t *rb = NULL;
 
 /**********************************************************************/
-typedef struct rad_request REQUEST;
-REQUEST *request_alloc(UNUSED TALLOC_CTX *ctx);
-void request_verify(UNUSED char const *file, UNUSED int line, UNUSED REQUEST *request);
-void talloc_const_free(void const *ptr);
+typedef struct request_s request_t;
+request_t *request_alloc(UNUSED TALLOC_CTX *ctx, UNUSED request_init_args_t const *args);
+void request_verify(UNUSED char const *file, UNUSED int line, UNUSED request_t *request);
 
-REQUEST *request_alloc(UNUSED TALLOC_CTX *ctx)
+request_t *request_alloc(UNUSED TALLOC_CTX *ctx, UNUSED request_init_args_t const *args)
 {
 	return NULL;
 }
 
-void request_verify(UNUSED char const *file, UNUSED int line, UNUSED REQUEST *request)
+void request_verify(UNUSED char const *file, UNUSED int line, UNUSED request_t *request)
 {
 }
 
-void talloc_const_free(void const *ptr)
-{
-	void *tmp;
-	if (!ptr) return;
-
-	memcpy(&tmp, &ptr, sizeof(tmp));
-	talloc_free(tmp);
-}
 /**********************************************************************/
 
-static void NEVER_RETURNS usage(void)
+static NEVER_RETURNS void usage(void)
 {
 	fprintf(stderr, "usage: control_test [OPTS]\n");
 	fprintf(stderr, "  -m <messages>	  Send number of messages.\n");
 	fprintf(stderr, "  -x                     Debugging mode.\n");
 
-	exit(EXIT_FAILURE);
+	fr_exit_now(EXIT_SUCCESS);
 }
 
-typedef struct my_message_t {
+typedef struct {
 	uint32_t		header;
 	size_t			counter;
 } my_message_t;
@@ -93,7 +84,7 @@ static void *control_master(UNUSED void *arg)
 {
 	TALLOC_CTX *ctx;
 
-	MEM(ctx = talloc_init("control_master"));
+	MEM(ctx = talloc_init_const("control_master"));
 
 	MPRINT1("Master started.\n");
 
@@ -111,8 +102,8 @@ static void *control_master(UNUSED void *arg)
 
 		num_events = kevent(kq, NULL, 0, &kev, 1, NULL);
 		if (num_events < 0) {
-			fprintf(stderr, "Failed reading kevent: %s\n", strerror(errno));
-			exit(EXIT_FAILURE);
+			fprintf(stderr, "Failed reading kevent: %s\n", fr_syserror(errno));
+			fr_exit_now(EXIT_FAILURE);
 		}
 
 		MPRINT1("Master draining the control plane.\n");
@@ -125,15 +116,15 @@ static void *control_master(UNUSED void *arg)
 
 			if (data_size < 0) {
 				fprintf(stderr, "Failed reading control message\n");
-				exit(EXIT_FAILURE);
+				fr_exit_now(EXIT_FAILURE);
 			}
 
-			rad_assert(data_size == sizeof(m));
-			rad_assert(id == FR_CONTROL_ID_CHANNEL);
+			fr_assert(data_size == sizeof(m));
+			fr_assert(id == FR_CONTROL_ID_CHANNEL);
 
 			MPRINT1("Master got message %zu.\n", m.counter);
 
-			rad_assert(m.header == CONTROL_MAGIC);
+			fr_assert(m.header == CONTROL_MAGIC);
 
 			if (m.counter == (max_messages - 1)) goto do_exit;
 		}
@@ -152,7 +143,7 @@ static void *control_worker(UNUSED void *arg)
 	size_t i;
 	TALLOC_CTX *ctx;
 
-	MEM(ctx = talloc_init("control_worker"));
+	MEM(ctx = talloc_init_const("control_worker"));
 
 	MPRINT1("\tWorker started.\n");
 
@@ -183,14 +174,14 @@ retry:
 
 int main(int argc, char *argv[])
 {
-	int c;
-	TALLOC_CTX	*autofree = talloc_init("main");
-	pthread_attr_t	attr;
-	pthread_t	master_id, worker_id;
+	int 			c;
+	TALLOC_CTX		*autofree = talloc_autofree_context();
+	pthread_attr_t		attr;
+	pthread_t		master_id, worker_id;
 
 	fr_time_start();
 
-	while ((c = getopt(argc, argv, "hm:o:tx")) != EOF) switch (c) {
+	while ((c = getopt(argc, argv, "hm:o:tx")) != -1) switch (c) {
 		case 'x':
 			debug_lvl++;
 			break;
@@ -210,19 +201,19 @@ int main(int argc, char *argv[])
 #endif
 
 	kq = kqueue();
-	rad_assert(kq >= 0);
+	fr_assert(kq >= 0);
 
-	aq = fr_atomic_queue_create(autofree, aq_size);
-	rad_assert(aq != NULL);
+	aq = fr_atomic_queue_alloc(autofree, aq_size);
+	fr_assert(aq != NULL);
 
 	control = fr_control_create(autofree, kq, aq, 1024);
 	if (!control) {
 		fprintf(stderr, "control_test: Failed to create control plane\n");
-		exit(EXIT_FAILURE);
+		fr_exit_now(EXIT_FAILURE);
 	}
 
 	rb = fr_ring_buffer_create(autofree, FR_CONTROL_MAX_MESSAGES * FR_CONTROL_MAX_SIZE);
-	if (!rb) exit(EXIT_FAILURE);
+	if (!rb) fr_exit_now(EXIT_FAILURE);
 
 	/*
 	 *	Start the two threads, with the channel.
@@ -238,7 +229,5 @@ int main(int argc, char *argv[])
 
 	close(kq);
 
-	talloc_free(autofree);
-
-	return 0;
+	fr_exit_now(EXIT_SUCCESS);
 }

@@ -1,3 +1,4 @@
+#pragma once
 /*
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -13,8 +14,7 @@
  *  along with this program; if not, write to the Free Software
  *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
-#ifndef _FR_RADIUS_RADIUS_H
-#define _FR_RADIUS_RADIUS_H
+
 /*
  * $Id$
  *
@@ -23,38 +23,36 @@
  *
  * @copyright 1999-2017 The FreeRADIUS server project
  */
-#include <freeradius-devel/radius.h>
-#include <freeradius-devel/cursor.h>
-#include <freeradius-devel/packet.h>
-#include <freeradius-devel/fr_log.h>
+#include <freeradius-devel/radius/defs.h>
+#include <freeradius-devel/util/packet.h>
+#include <freeradius-devel/util/rand.h>
+#include <freeradius-devel/util/log.h>
+#include <freeradius-devel/util/dbuff.h>
 
-#define AUTH_VECTOR_LEN		16
-#define CHAP_VALUE_LENGTH       16
-#define FR_MAX_STRING_LEN	254	/* RFC2138: string 0-253 octets */
-#define RADIUS_MAX_ATTRIBUTES	255
+#define RADIUS_AUTH_VECTOR_OFFSET      		4
+#define RADIUS_HEADER_LENGTH			20
+#define RADIUS_MAX_STRING_LENGTH		253
+#define RADIUS_MAX_TUNNEL_PASSWORD_LENGTH	249
+#define RADIUS_AUTH_VECTOR_LENGTH		16
+#define RADIUS_MESSAGE_AUTHENTICATOR_LENGTH	16
+#define RADIUS_MAX_PASS_LENGTH			256
+#define RADIUS_MAX_ATTRIBUTES			255
+#define RADIUS_MAX_PACKET_SIZE			4096
 
-#ifdef _LIBRADIUS
-#  define RADIUS_HDR_LEN	20
-#  define VENDORPEC_USR		429
-#  define VENDORPEC_LUCENT	4846
-#  define VENDORPEC_STARENT	8164
-#  define DEBUG			if (fr_debug_lvl && fr_log_fp) fr_printf_log
-#endif
+#define RADIUS_VENDORPEC_USR			429
+#define RADIUS_VENDORPEC_LUCENT			4846
+#define RADIUS_VENDORPEC_STARENT		8164
 
 /*
  *	protocols/radius/base.c
  */
 
-#define	FR_MAX_PACKET_CODE (53)
-extern char const *fr_packet_codes[FR_MAX_PACKET_CODE];
-#define is_radius_code(_x) ((_x > 0) && (_x < FR_MAX_PACKET_CODE))
 
-#define AUTH_PASS_LEN (AUTH_VECTOR_LEN)
-#define MAX_PASS_LEN (128)
+#define FR_RADIUS_PACKET_CODE_VALID(_x) ((_x > 0) && (_x < FR_RADIUS_CODE_MAX))
+
+#define AUTH_PASS_LEN (RADIUS_AUTH_VECTOR_LENGTH)
+
 #define	FR_TUNNEL_FR_ENC_LENGTH(_x) (2 + 1 + _x + PAD(_x + 1, 16))
-extern size_t const fr_radius_attr_sizes[FR_TYPE_MAX + 1][2];
-extern FR_NAME_NUMBER const fr_request_types[];
-extern bool const fr_request_packets[FR_CODE_MAX + 1];
 
 typedef enum {
 	DECODE_FAIL_NONE = 0,
@@ -70,102 +68,226 @@ typedef enum {
 	DECODE_FAIL_ATTRIBUTE_UNDERFLOW,
 	DECODE_FAIL_TOO_MANY_ATTRIBUTES,
 	DECODE_FAIL_MA_MISSING,
+	DECODE_FAIL_MA_INVALID,
+	DECODE_FAIL_UNKNOWN,
 	DECODE_FAIL_MAX
 } decode_fail_t;
+
+/** Control whether Message-Authenticator is required in Access-Requests
+ *
+ * @note Don't change the enum values.  They allow efficient bistmasking.
+ */
+typedef enum {
+	FR_RADIUS_REQUIRE_MA_NO			= 0x00,		//!< Do not require Message-Authenticator
+	FR_RADIUS_REQUIRE_MA_AUTO		= 0x01,		//!< Only require Message-Authenticator if we've previously
+								///< received a packet from this client with Message-Authenticator.
+								///< @note This isn't used by the radius protocol code, but may be used
+								///< to drive logic in modules.
+	FR_RADIUS_REQUIRE_MA_YES		= 0x02		//!< Require Message-Authenticator
+
+} fr_radius_require_ma_t;
+
+/** Control whether Proxy-State is allowed in Access-Requests
+ *
+ * @note Don't change the enum values.  They allow efficient bistmasking.
+ */
+typedef enum {
+	FR_RADIUS_LIMIT_PROXY_STATE_NO		= 0x00,		//!< Do not limit Proxy-State.  Allow proxy-state to be sent in
+								///< all packets.
+	FR_RADIUS_LIMIT_PROXY_STATE_AUTO	= 0x01,		//!< Do not allow Proxy-State unless:
+								///< - All packets received from a client have containted proxy state.
+								///< - The client has sent a packet with a Message-Authenticator.
+								///< @note This isn't used by the radius protocol code, but may be used
+								///< to drive logic in modules.
+	FR_RADIUS_LIMIT_PROXY_STATE_YES		= 0x02,		//!< Limit Proxy-State.  Do not allow Proxy-State to be sent in
+								///< packets which do not have a Message-Authenticator attribute.
+
+} fr_radius_limit_proxy_state_t;
+
+/** subtype values for RADIUS
+ *
+ *  Order of the flags is important for the flag_foo() checks.
+ */
+enum {
+	FLAG_NONE = 0,					//!< No extra flags
+	FLAG_EXTENDED_ATTR,	      			//!< the attribute is an extended attribute
+	FLAG_LONG_EXTENDED_ATTR,	      		//!< the attribute is a long extended attribute
+	FLAG_CONCAT,					//!< the attribute is concatenated
+	FLAG_HAS_TAG,					//!< the attribute has a tag
+	FLAG_ABINARY,					//!< the attribute is in "abinary" format
+	FLAG_TAGGED_TUNNEL_PASSWORD,   			//!< the attribute has a tag and is encrypted
+
+	FLAG_ENCRYPT_USER_PASSWORD,			//!< Encrypt attribute RFC 2865 style.
+	FLAG_ENCRYPT_TUNNEL_PASSWORD,			//!< Encrypt attribute RFC 2868 style.
+	FLAG_ENCRYPT_ASCEND_SECRET,			//!< Encrypt attribute ascend style.
+};
+
+
+#define flag_has_tag(_flags)	     (!(_flags)->extra && (((_flags)->subtype == FLAG_HAS_TAG) || ((_flags)->subtype == FLAG_TAGGED_TUNNEL_PASSWORD)))
+#define flag_concat(_flags)	     (!(_flags)->extra && (_flags)->subtype == FLAG_CONCAT)
+#define flag_abinary(_flags)	     (!(_flags)->extra && (_flags)->subtype == FLAG_ABINARY)
+#define flag_encrypted(_flags)	     (!(_flags)->extra && (_flags)->subtype >= FLAG_TAGGED_TUNNEL_PASSWORD)
+#define flag_extended(_flags)        (!(_flags)->extra && (((_flags)->subtype == FLAG_EXTENDED_ATTR) || (_flags)->subtype == FLAG_LONG_EXTENDED_ATTR))
+#define flag_long_extended(_flags)   (!(_flags)->extra && (_flags)->subtype == FLAG_LONG_EXTENDED_ATTR)
+#define flag_tunnel_password(_flags) (!(_flags)->extra && (((_flags)->subtype == FLAG_ENCRYPT_TUNNEL_PASSWORD) || ((_flags)->subtype == FLAG_TAGGED_TUNNEL_PASSWORD)))
+
+typedef struct {
+	fr_pair_t	*parent;
+	fr_dcursor_t	cursor;
+} fr_radius_tag_ctx_t;
+
+typedef struct {
+	char const		*secret;
+	size_t			secret_length;
+
+	bool			secure_transport;	//!< for TLS
+
+	uint32_t		proxy_state;		//!< if so, this is its value
+} fr_radius_ctx_t;
+
+typedef struct {
+	fr_radius_ctx_t	const	*common;
+
+	uint8_t const		*request_authenticator;
+
+	fr_fast_rand_t		rand_ctx;		//!< for tunnel passwords
+	int			salt_offset;		//!< for tunnel passwords
+
+
+	uint8_t			tag;			//!< current tag for encoding
+
+	uint8_t			request_code;
+
+	uint8_t			code;
+	uint8_t			id;
+
+	bool			add_proxy_state;       	//!< do we add a Proxy-State?
+	bool			disallow_tunnel_passwords; //!< not all packets can have tunnel passwords
+	bool			seen_message_authenticator;
+} fr_radius_encode_ctx_t;
+
+typedef struct {
+	fr_radius_ctx_t const  	*common;
+
+	uint8_t const		*request_authenticator;
+
+	TALLOC_CTX		*tmp_ctx;		//!< for temporary things cleaned up during decoding
+	uint8_t const  		*end;			//!< end of the packet
+
+	uint8_t			request_code;		//!< original code for the request.
+
+	bool 			tunnel_password_zeros;  //!< check for trailing zeros on decode
+	bool			verify;			//!< can skip verify for dynamic clients
+	bool			require_message_authenticator;
+	bool			limit_proxy_state;	//!< Don't allow Proxy-State in requests
+
+	fr_radius_tag_ctx_t    	**tags;			//!< for decoding tagged attributes
+	fr_pair_list_t		*tag_root;		//!< Where to insert tag attributes.
+	TALLOC_CTX		*tag_root_ctx;		//!< Where to allocate new tag attributes.
+} fr_radius_decode_ctx_t;
+
+extern fr_table_num_sorted_t const fr_radius_require_ma_table[];
+extern size_t fr_radius_require_ma_table_len;
+
+extern fr_table_num_sorted_t const fr_radius_limit_proxy_state_table[];
+extern size_t fr_radius_limit_proxy_state_table_len;
+
+extern fr_table_num_sorted_t const fr_radius_request_name_table[];
+extern size_t fr_radius_request_name_table_len;
+
+extern char const *fr_radius_packet_name[FR_RADIUS_CODE_MAX];
 
 /*
  *	protocols/radius/base.c
  */
-size_t		fr_radius_attr_len(VALUE_PAIR const *vp);
+int		fr_radius_allow_reply(int code, bool allowed[static FR_RADIUS_CODE_MAX]);
 
-int		fr_radius_sign(uint8_t *packet, uint8_t const *original,
+int		fr_radius_sign(uint8_t *packet, uint8_t const *vector,
 			       uint8_t const *secret, size_t secret_len) CC_HINT(nonnull (1,3));
-int		fr_radius_verify(uint8_t *packet, uint8_t const *original,
-				 uint8_t const *secret, size_t secret_len) CC_HINT(nonnull (1,3));
-bool		fr_radius_ok(uint8_t const *packet, size_t *packet_len_p,
-			     uint32_t max_attributes, bool require_ma, decode_fail_t *reason) CC_HINT(nonnull (1,2));
 
-void		fr_radius_ascend_secret(uint8_t *digest, uint8_t const *vector,
-					char const *secret, uint8_t const *value) CC_HINT(nonnull);
+int		fr_radius_verify(uint8_t *packet, uint8_t const *vector,
+				 uint8_t const *secret, size_t secret_len,
+				 bool require_message_authenticator, bool limit_proxy_state) CC_HINT(nonnull (1,3));
+
+bool		fr_radius_ok(uint8_t const *packet, size_t *packet_len_p,
+			     uint32_t max_attributes, bool require_message_authenticator, decode_fail_t *reason) CC_HINT(nonnull (1,2));
+
+ssize_t		fr_radius_ascend_secret(fr_dbuff_t *dbuff, uint8_t const *in, size_t inlen,
+					char const *secret, uint8_t const *vector);
 
 ssize_t		fr_radius_recv_header(int sockfd, fr_ipaddr_t *src_ipaddr, uint16_t *src_port, unsigned int *code);
 
-ssize_t		fr_radius_encode(uint8_t *packet, size_t packet_len, uint8_t const *original,
-				 char const *secret, UNUSED size_t secret_len, int code, int id, VALUE_PAIR *vps);
+ssize_t		fr_radius_encode(fr_dbuff_t *dbuff, fr_pair_list_t *vps, fr_radius_encode_ctx_t *packet_ctx) CC_HINT(nonnull);
 
-ssize_t		fr_radius_decode(TALLOC_CTX *ctx, uint8_t *packet, size_t packet_len, uint8_t const *original,
-				 char const *secret, UNUSED size_t secret_len, VALUE_PAIR **vps) CC_HINT(nonnull);
+ssize_t		fr_radius_decode(TALLOC_CTX *ctx, fr_pair_list_t *out,
+				 uint8_t *packet, size_t packet_len,
+				 fr_radius_decode_ctx_t *decode_ctx) CC_HINT(nonnull);
 
+ssize_t		fr_radius_decode_simple(TALLOC_CTX *ctx, fr_pair_list_t *out,
+					uint8_t *packet, size_t packet_len,
+					uint8_t const *vector, char const *secret) CC_HINT(nonnull(1,2,3,6));
 
-void		fr_radius_print_hex(FILE *fp, uint8_t const *packet, size_t packet_len);
+int		fr_radius_global_init(void);
+
+void		fr_radius_global_free(void);
 
 /*
  *	protocols/radius/packet.c
  */
-RADIUS_PACKET	*fr_radius_alloc(TALLOC_CTX *ctx, bool new_vector);
-RADIUS_PACKET	*fr_radius_alloc_reply(TALLOC_CTX *ctx, RADIUS_PACKET *);
-RADIUS_PACKET	*fr_radius_copy(TALLOC_CTX *ctx, RADIUS_PACKET const *in);
-void		fr_radius_free(RADIUS_PACKET **);
+ssize_t		fr_packet_encode(fr_packet_t *packet, fr_pair_list_t *list,
+					fr_packet_t const *original,
+					char const *secret) CC_HINT(nonnull (1,2,4));
 
-int		fr_radius_packet_encode(RADIUS_PACKET *packet, RADIUS_PACKET const *original,
-					char const *secret) CC_HINT(nonnull (1,3));
-int		fr_radius_packet_decode(RADIUS_PACKET *packet, RADIUS_PACKET *original,
-					uint32_t max_attributes, bool tunnel_password_zeros,
-					char const *secret) CC_HINT(nonnull (1,5));
-
-bool		fr_radius_packet_ok(RADIUS_PACKET *packet, uint32_t max_attributes, bool require_ma,
+bool		fr_packet_ok(fr_packet_t *packet, uint32_t max_attributes, bool require_message_authenticator,
 				    decode_fail_t *reason) CC_HINT(nonnull (1));
 
-int		fr_radius_packet_verify(RADIUS_PACKET *packet, RADIUS_PACKET *original,
+int		fr_packet_verify(fr_packet_t *packet, fr_packet_t *original,
 					char const *secret) CC_HINT(nonnull (1,3));
-int		fr_radius_packet_sign(RADIUS_PACKET *packet, RADIUS_PACKET const *original,
+int		fr_packet_sign(fr_packet_t *packet, fr_packet_t const *original,
 				      char const *secret) CC_HINT(nonnull (1,3));
 
-RADIUS_PACKET	*fr_radius_packet_recv(TALLOC_CTX *ctx, int fd, int flags, uint32_t max_attributes, bool require_ma);
-int		fr_radius_packet_send(RADIUS_PACKET *packet, RADIUS_PACKET const *original,
-				      char const *secret) CC_HINT(nonnull (1,3));
+fr_packet_t	*fr_packet_recv(TALLOC_CTX *ctx, int fd, int flags, uint32_t max_attributes, bool require_message_authenticator);
+int		fr_packet_send(fr_packet_t *packet, fr_pair_list_t *list,
+				      fr_packet_t const *original, char const *secret) CC_HINT(nonnull (1,2,4));
 
-void		fr_radius_packet_print_hex(RADIUS_PACKET const *packet) CC_HINT(nonnull);
+#define fr_packet_log_hex(_log, _packet) _fr_packet_log_hex(_log, _packet, __FILE__, __LINE__)
+void		_fr_packet_log_hex(fr_log_t const *log, fr_packet_t const *packet, char const *file, int line) CC_HINT(nonnull);
 
+/*
+ *	protocols/radius/abinary.c
+ */
+ssize_t		fr_radius_encode_abinary(fr_pair_t const *vp, fr_dbuff_t *dbuff);
 
-typedef struct fr_radius_ctx {
-	uint8_t const		*vector;		//!< vector for encryption / decryption of data
-	char const		*secret;		//!< shared secret.  MUST be talloc'd
-	bool 			tunnel_password_zeros;
-	fr_dict_attr_t const	*root;
-} fr_radius_ctx_t;
+ssize_t		fr_radius_decode_abinary(fr_pair_t *vp, uint8_t const *data, size_t data_len);
 
 /*
  *	protocols/radius/encode.c
  */
-int		fr_radius_encode_password(char *encpw, size_t *len, char const *secret, uint8_t const *vector);
+ssize_t		fr_radius_encode_pair(fr_dbuff_t *dbuff, fr_dcursor_t *cursor, void *encode_ctx);
 
-int		fr_radius_encode_tunnel_password(char *encpw, size_t *len, char const *secret, uint8_t const *vector);
-
-int		fr_radius_encode_chap_password(uint8_t *output, RADIUS_PACKET *packet, int id, VALUE_PAIR *password);
-
-ssize_t		fr_radius_encode_pair(uint8_t *out, size_t outlen, vp_cursor_t *cursor, void *encoder_ctx);
+ssize_t		fr_radius_encode_foreign(fr_dbuff_t *dbuff, fr_pair_list_t const *list) CC_HINT(nonnull);
 
 /*
  *	protocols/radius/decode.c
  */
 int		fr_radius_decode_tlv_ok(uint8_t const *data, size_t length, size_t dv_type, size_t dv_length);
 
-ssize_t		fr_radius_decode_password(char *encpw, size_t len, char const *secret, uint8_t const *vector);
+ssize_t		fr_radius_decode_pair_value(TALLOC_CTX *ctx, fr_pair_list_t *list,
+					    fr_dict_attr_t const *parent,
+					    uint8_t const *data, size_t const attr_len,
+					    void *packet_ctx) CC_HINT(nonnull);
 
-
-ssize_t		fr_radius_decode_tunnel_password(uint8_t *encpw, size_t *len, char const *secret,
-						 uint8_t const *vector, bool tunnel_password_zeros);
-
-ssize_t		fr_radius_decode_pair_value(TALLOC_CTX *ctx, vp_cursor_t *cursor, fr_dict_attr_t const *parent,
-					    uint8_t const *data, size_t const attr_len, size_t const packet_len,
-					    void *decoder_ctx);
-
-ssize_t		fr_radius_decode_tlv(TALLOC_CTX *ctx, vp_cursor_t *cursor, fr_dict_attr_t const *parent,
+ssize_t		fr_radius_decode_tlv(TALLOC_CTX *ctx, fr_pair_list_t *list,
+				     fr_dict_attr_t const *parent,
 				     uint8_t const *data, size_t data_len,
-				     void *decoder_ctx);
+				     fr_radius_decode_ctx_t *packet_ctx) CC_HINT(nonnull);
 
-ssize_t		fr_radius_decode_pair(TALLOC_CTX *ctx, vp_cursor_t *cursor, uint8_t const *data, size_t data_len,
-				      void *decoder_ctx);
+ssize_t		fr_radius_decode_pair(TALLOC_CTX *ctx, fr_pair_list_t *list,
+				      uint8_t const *data, size_t data_len, fr_radius_decode_ctx_t *packet_ctx) CC_HINT(nonnull);
 
-#endif	/* _FR_RADIUS_RADIUS_H */
+ssize_t		fr_radius_decode_foreign(TALLOC_CTX *ctx, fr_pair_list_t *out,
+					 uint8_t const *data, size_t data_len) CC_HINT(nonnull);
+
+void		fr_radius_packet_header_log(fr_log_t const *log, fr_packet_t *packet, bool received);
+
+void		fr_radius_packet_log(fr_log_t const *log, fr_packet_t *packet, fr_pair_list_t *list, bool received);

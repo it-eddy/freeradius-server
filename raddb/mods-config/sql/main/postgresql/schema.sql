@@ -1,19 +1,13 @@
-/*
- * $Id$
- *
- * Postgresql schema for FreeRADIUS
- *
- * All field lengths need checking as some are still suboptimal. -pnixon 2003-07-13
- *
- */
+--
+-- $Id$
+--
+-- Postgresql schema for FreeRADIUS
+--
 
-/*
- * Table structure for table 'radacct'
- *
- * Note: Column type bigserial does not exist prior to Postgres 7.2
- *       If you run an older version you need to change this to serial
- */
-CREATE TABLE radacct (
+--
+-- Table structure for table 'radacct'
+--
+CREATE TABLE IF NOT EXISTS radacct (
 	RadAcctId		bigserial PRIMARY KEY,
 	AcctSessionId		text NOT NULL,
 	AcctUniqueId		text NOT NULL UNIQUE,
@@ -38,7 +32,12 @@ CREATE TABLE radacct (
 	AcctTerminateCause	text,
 	ServiceType		text,
 	FramedProtocol		text,
-	FramedIPAddress		inet
+	FramedIPAddress		inet,
+	FramedIPv6Address	inet,
+	FramedIPv6Prefix	inet,
+	FramedInterfaceId	text,
+	DelegatedIPv6Prefix	inet,
+	Class 			text
 );
 -- This index may be useful..
 -- CREATE UNIQUE INDEX radacct_whoson on radacct (AcctStartTime, nasipaddress);
@@ -66,9 +65,9 @@ CREATE INDEX radacct_start_user_idx ON radacct (AcctStartTime, UserName);
 -- and, optionally
 -- CREATE INDEX radacct_stop_user_idx ON radacct (acctStopTime, UserName);
 
-/*
- * Table structure for table 'radcheck'
- */
+--
+-- Table structure for table 'radcheck'
+--
 CREATE TABLE radcheck (
 	id			serial PRIMARY KEY,
 	UserName		text NOT NULL DEFAULT '',
@@ -77,14 +76,14 @@ CREATE TABLE radcheck (
 	Value			text NOT NULL DEFAULT ''
 );
 create index radcheck_UserName on radcheck (UserName,Attribute);
-/*
- * Use this index if you use case insensitive queries
- */
+--
+-- Use this index if you use case insensitive queries
+--
 -- create index radcheck_UserName_lower on radcheck (lower(UserName),Attribute);
 
-/*
- * Table structure for table 'radgroupcheck'
- */
+--
+-- Table structure for table 'radgroupcheck'
+--
 CREATE TABLE radgroupcheck (
 	id			serial PRIMARY KEY,
 	GroupName		text NOT NULL DEFAULT '',
@@ -94,9 +93,9 @@ CREATE TABLE radgroupcheck (
 );
 create index radgroupcheck_GroupName on radgroupcheck (GroupName,Attribute);
 
-/*
- * Table structure for table 'radgroupreply'
- */
+--
+-- Table structure for table 'radgroupreply'
+--
 CREATE TABLE radgroupreply (
 	id			serial PRIMARY KEY,
 	GroupName		text NOT NULL DEFAULT '',
@@ -106,9 +105,9 @@ CREATE TABLE radgroupreply (
 );
 create index radgroupreply_GroupName on radgroupreply (GroupName,Attribute);
 
-/*
- * Table structure for table 'radreply'
- */
+--
+-- Table structure for table 'radreply'
+--
 CREATE TABLE radreply (
 	id			serial PRIMARY KEY,
 	UserName		text NOT NULL DEFAULT '',
@@ -117,14 +116,14 @@ CREATE TABLE radreply (
 	Value			text NOT NULL DEFAULT ''
 );
 create index radreply_UserName on radreply (UserName,Attribute);
-/*
- * Use this index if you use case insensitive queries
- */
+--
+-- Use this index if you use case insensitive queries
+--
 -- create index radreply_UserName_lower on radreply (lower(UserName),Attribute);
 
-/*
- * Table structure for table 'radusergroup'
- */
+--
+-- Table structure for table 'radusergroup'
+--
 CREATE TABLE radusergroup (
 	id			serial PRIMARY KEY,
 	UserName		text NOT NULL DEFAULT '',
@@ -132,15 +131,14 @@ CREATE TABLE radusergroup (
 	priority		integer NOT NULL DEFAULT 0
 );
 create index radusergroup_UserName on radusergroup (UserName);
-/*
- * Use this index if you use case insensitive queries
- */
+--
+-- Use this index if you use case insensitive queries
+--
 -- create index radusergroup_UserName_lower on radusergroup (lower(UserName));
 
 --
 -- Table structure for table 'radpostauth'
 --
-
 CREATE TABLE radpostauth (
 	id			bigserial PRIMARY KEY,
 	username		text NOT NULL,
@@ -148,12 +146,13 @@ CREATE TABLE radpostauth (
 	reply			text,
 	CalledStationId		text,
 	CallingStationId	text,
-	authdate		timestamp with time zone NOT NULL default now()
+	authdate		timestamp with time zone NOT NULL default now(),
+	Class			text
 );
 
-/*
- * Table structure for table 'nas'
- */
+--
+-- Table structure for table 'nas'
+--
 CREATE TABLE nas (
 	id			serial PRIMARY KEY,
 	nasname			text NOT NULL,
@@ -166,3 +165,11 @@ CREATE TABLE nas (
 	description		text
 );
 create index nas_nasname on nas (nasname);
+
+/*
+ * Table structure for table 'nasreload'
+ */
+CREATE TABLE IF NOT EXISTS nasreload (
+	NASIPAddress		inet PRIMARY KEY,
+	ReloadTime		timestamp with time zone NOT NULL
+);

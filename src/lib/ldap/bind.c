@@ -23,28 +23,17 @@
  */
 RCSID("$Id$")
 
-#include "libfreeradius-ldap.h"
-#include <freeradius-devel/rad_assert.h>
+USES_APPLE_DEPRECATED_API
 
-/** Holds arguments for the bind operation
- *
- */
-typedef struct {
-	fr_ldap_connection_t	*c;			//!< to bind.
-	char const		*bind_dn;		//!< of the user, may be NULL to bind anonymously.
-	char const		*password;		//!< of the user, may be NULL if no password is specified.
-	LDAPControl		**serverctrls;		//!< Controls to pass to the server.
-	LDAPControl		**clientctrls;		//!< Controls to pass to the client (library).
-
-	int			msgid;
-} fr_ldap_bind_ctx_t;
+#include <freeradius-devel/ldap/base.h>
+#include <freeradius-devel/util/debug.h>
 
 /** Error reading from or writing to the file descriptor
  *
  * @param[in] el	the event occurred in.
  * @param[in] fd	the event occurred on.
  * @param[in] flags	from kevent.
- * @param[in] fd_errno	The error that ocurred.
+ * @param[in] fd_errno	The error that occurred.
  * @param[in] uctx	Connection config and handle.
  */
 static void _ldap_bind_io_error(UNUSED fr_event_list_t *el, UNUSED int fd,
@@ -70,14 +59,15 @@ static void _ldap_bind_io_read(UNUSED fr_event_list_t *el, UNUSED int fd, UNUSED
 	fr_ldap_connection_t	*c = bind_ctx->c;
 
 	fr_ldap_rcode_t		status;
-	struct timeval		tv = { 0, 0 };	/* We're I/O driven, if there's no data someone lied to us */
 
-	status = fr_ldap_result(NULL, NULL, c, bind_ctx->msgid, LDAP_MSG_ALL, bind_ctx->bind_dn, &tv);
-	talloc_free(bind_ctx);			/* Also removes fd events */
-
+	/*
+	 *	We're I/O driven, if there's no data someone lied to us
+	 */
+	status = fr_ldap_result(NULL, NULL, c, bind_ctx->msgid, LDAP_MSG_ALL, bind_ctx->bind_dn, fr_time_delta_wrap(0));
 	switch (status) {
 	case LDAP_PROC_SUCCESS:
-		DEBUG("Bind successful");
+		DEBUG2("Bind as \"%s\" to \"%s\" successful",
+		       *bind_ctx->bind_dn ? bind_ctx->bind_dn : "(anonymous)", c->config->server);
 		fr_ldap_state_next(c);		/* onto the next operation */
 		break;
 
@@ -85,17 +75,18 @@ static void _ldap_bind_io_read(UNUSED fr_event_list_t *el, UNUSED int fd, UNUSED
 		PERROR("Bind as \"%s\" to \"%s\" not permitted",
 		       *bind_ctx->bind_dn ? bind_ctx->bind_dn : "(anonymous)", c->config->server);
 		fr_ldap_state_error(c);		/* Restart the connection state machine */
-		break;
+		return;
 
 	default:
 		PERROR("Bind as \"%s\" to \"%s\" failed",
 		       *bind_ctx->bind_dn ? bind_ctx->bind_dn : "(anonymous)", c->config->server);
 		fr_ldap_state_error(c);		/* Restart the connection state machine */
-		break;
+		return;
 	}
+	talloc_free(bind_ctx);			/* Also removes fd events */
 }
 
-/** Send a bind request to a aserver
+/** Send a bind request to a server
  *
  * @param[in] el	the event occurred in.
  * @param[in] fd	the event occurred on.
@@ -110,21 +101,13 @@ static void _ldap_bind_io_write(fr_event_list_t *el, int fd, UNUSED int flags, v
 	LDAPControl		*our_serverctrls[LDAP_MAX_CONTROLS];
 	LDAPControl		*our_clientctrls[LDAP_MAX_CONTROLS];
 
-	struct timeval		tv = { 0, 0 };
-
 	int			ret;
 	struct berval		cred;
 
 	fr_ldap_control_merge(our_serverctrls, our_clientctrls,
-			      sizeof(our_serverctrls) / sizeof(*our_serverctrls),
-			      sizeof(our_clientctrls) / sizeof(*our_clientctrls),
+			      NUM_ELEMENTS(our_serverctrls),
+			      NUM_ELEMENTS(our_clientctrls),
 			      c, bind_ctx->serverctrls, bind_ctx->clientctrls);
-
-	/*
-	 *	Set timeout to be 0.0, which is the magic
-	 *	non-blocking value.
-	 */
-	(void) ldap_set_option(c->handle, LDAP_OPT_NETWORK_TIMEOUT, &tv);
 
 	if (bind_ctx->password) {
 		memcpy(&cred.bv_val, &bind_ctx->password, sizeof(cred.bv_val));
@@ -150,7 +133,7 @@ static void _ldap_bind_io_write(fr_event_list_t *el, int fd, UNUSED int flags, v
 	 */
 	case LDAP_X_CONNECTING:					/* Connection in progress - retry later */
 		ret = ldap_get_option(c->handle, LDAP_OPT_DESC, &fd);
-		if (!rad_cond_assert(ret == LDAP_OPT_SUCCESS)) {
+		if (!fr_cond_assert(ret == LDAP_OPT_SUCCESS)) {
 		error:
 			talloc_free(bind_ctx);
 			fr_ldap_connection_timeout_reset(c);
@@ -158,21 +141,26 @@ static void _ldap_bind_io_write(fr_event_list_t *el, int fd, UNUSED int flags, v
 			return;
 		}
 
-		ret = fr_event_fd_insert(bind_ctx, el, fd,
+		ret = fr_event_fd_insert(bind_ctx, NULL, el, fd,
 					 NULL,
 					 _ldap_bind_io_write,	/* We'll be called again when the conn is open */
 					 _ldap_bind_io_error,
 					 bind_ctx);
-		if (!rad_cond_assert(ret == 0)) goto error;
+		if (!fr_cond_assert(ret == 0)) goto error;
 		break;
 
 	case LDAP_SUCCESS:
-		ret = fr_event_fd_insert(bind_ctx, el, fd,
+		if (fd < 0 ) {
+			ret = ldap_get_option(c->handle, LDAP_OPT_DESC, &fd);
+			if ((ret != LDAP_OPT_SUCCESS) || (fd < 0)) goto error;
+		}
+		c->fd = fd;
+		ret = fr_event_fd_insert(bind_ctx, NULL, el, fd,
 					 _ldap_bind_io_read,
 					 NULL,
 					 _ldap_bind_io_error,
 					 bind_ctx);
-		if (!rad_cond_assert(ret == 0)) goto error;
+		if (!fr_cond_assert(ret == 0)) goto error;
 		break;
 
 	default:
@@ -215,23 +203,168 @@ int fr_ldap_bind_async(fr_ldap_connection_t *c,
 	bind_ctx->serverctrls = serverctrls;
 	bind_ctx->clientctrls = clientctrls;
 
-	el = fr_connection_get_el(c->conn);
+	el = c->conn->el;
 
-	if (ldap_get_option(c->handle, LDAP_OPT_DESC, &fd) == LDAP_SUCCESS) {
+	/*
+	 *	ldap_get_option can return a LDAP_SUCCESS even if the fd is not yet available
+	 *	- hence the test for fd >= 0
+	 */
+	if ((ldap_get_option(c->handle, LDAP_OPT_DESC, &fd) == LDAP_SUCCESS) && (fd >= 0)) {
 		int ret;
 
-		ret = fr_event_fd_insert(bind_ctx, el, fd,
+		ret = fr_event_fd_insert(bind_ctx, NULL, el, fd,
 					 NULL,
 					 _ldap_bind_io_write,
 					 _ldap_bind_io_error,
 					 bind_ctx);
-		if (!rad_cond_assert(ret == 0)) {
+		if (!fr_cond_assert(ret == 0)) {
 			talloc_free(bind_ctx);
 			return -1;
 		}
 	} else {
+	/*
+	 *	Connections initialised with ldap_init() do not have a fd until
+	 *	the first request (usually bind) occurs - so this code path
+	 *	starts the bind process to open the connection.
+	 */
 		_ldap_bind_io_write(el, -1, 0, bind_ctx);
 	}
 
 	return 0;
+}
+
+/** Yield interpreter after queueing LDAP bind
+ *
+ */
+static unlang_action_t ldap_async_auth_bind_start(UNUSED rlm_rcode_t *p_result, UNUSED int *priority,
+						  UNUSED request_t *request, UNUSED void *uctx)
+{
+	return UNLANG_ACTION_YIELD;
+}
+
+/** Handle the return code from parsed LDAP results to set the module rcode
+ *
+ */
+static unlang_action_t ldap_async_auth_bind_results(rlm_rcode_t *p_result, UNUSED int *priority, request_t *request, void *uctx)
+{
+	fr_ldap_bind_auth_ctx_t	*bind_auth_ctx = talloc_get_type_abort(uctx, fr_ldap_bind_auth_ctx_t);
+	fr_ldap_bind_ctx_t	*bind_ctx = bind_auth_ctx->bind_ctx;
+	rlm_rcode_t		rcode = RLM_MODULE_OK;
+
+	switch (bind_auth_ctx->ret) {
+	case LDAP_PROC_SUCCESS:
+		RDEBUG2("Bind as user \"%s\" was successful", bind_ctx->bind_dn);
+		break;
+
+	case LDAP_PROC_NOT_PERMITTED:
+		RDEBUG2("Bind as user \"%s\" not permitted", bind_ctx->bind_dn);
+		rcode = RLM_MODULE_DISALLOW;
+		break;
+
+	case LDAP_PROC_REJECT:
+		RDEBUG2("Bind as user \"%s\" rejected", bind_ctx->bind_dn);
+		rcode = RLM_MODULE_REJECT;
+		break;
+
+	case LDAP_PROC_BAD_DN:
+		rcode = RLM_MODULE_INVALID;
+		break;
+
+	case LDAP_PROC_NO_RESULT:
+		rcode = RLM_MODULE_NOTFOUND;
+		break;
+
+	default:
+		rcode = RLM_MODULE_FAIL;
+		break;
+	}
+
+	if (bind_auth_ctx->treq) {
+		/*
+		 *	Bind auth ctx is freed by trunk request free.
+		 */
+		trunk_request_signal_complete(bind_auth_ctx->treq);
+	} else {
+		/*
+		 *	If there is no trunk request, the request failed, and we need to free the ctx
+		 */
+		talloc_free(bind_auth_ctx);
+	}
+
+	RETURN_MODULE_RCODE(rcode);
+}
+
+/** Signal an outstanding LDAP bind request to cancel
+ *
+ */
+static void ldap_async_auth_bind_cancel(request_t *request, UNUSED fr_signal_t action, void *uctx)
+{
+	fr_ldap_bind_auth_ctx_t	*bind_auth_ctx = talloc_get_type_abort(uctx, fr_ldap_bind_auth_ctx_t);
+
+	RWARN("Cancelling bind auth");
+	if (bind_auth_ctx->msgid > 0) fr_rb_remove(bind_auth_ctx->thread->binds, bind_auth_ctx);
+	trunk_request_signal_cancel(bind_auth_ctx->treq);
+}
+
+/** Initiate an async LDAP bind for authentication
+ *
+ * @param[in] request		this bind relates to.
+ * @param[in] thread		whose connection the bind should be performed on.
+ * @param[in] bind_dn		Identity to bind with.
+ * @param[in] password		Password to bind with.
+ * @return
+ *	- 0 on success.
+ *	- -1 on failure.
+ */
+unlang_action_t fr_ldap_bind_auth_async(request_t *request, fr_ldap_thread_t *thread, char const *bind_dn, char const *password)
+{
+	fr_ldap_bind_auth_ctx_t	*bind_auth_ctx;
+	trunk_request_t	*treq;
+	fr_ldap_thread_trunk_t	*ttrunk = fr_thread_ldap_bind_trunk_get(thread);
+	trunk_enqueue_t	ret;
+
+	if (!ttrunk) {
+		ERROR("Failed to get trunk connection for LDAP bind");
+		return UNLANG_ACTION_FAIL;
+	}
+
+	treq = trunk_request_alloc(ttrunk->trunk, request);
+	if (!treq) {
+		ERROR ("Failed to allocate trunk request for LDAP bind");
+		return UNLANG_ACTION_FAIL;
+	}
+
+	MEM(bind_auth_ctx = talloc(treq, fr_ldap_bind_auth_ctx_t));
+	*bind_auth_ctx = (fr_ldap_bind_auth_ctx_t) {
+		.treq = treq,
+		.request = request,
+		.thread = thread,
+		.ret = LDAP_PROC_NO_RESULT
+	};
+
+	MEM(bind_auth_ctx->bind_ctx = talloc(bind_auth_ctx, fr_ldap_bind_ctx_t));
+	*bind_auth_ctx->bind_ctx = (fr_ldap_bind_ctx_t) {
+		.bind_dn = bind_dn,
+		.password = password
+	};
+
+	ret = trunk_request_enqueue(&bind_auth_ctx->treq, ttrunk->trunk, request, bind_auth_ctx, NULL);
+
+	switch (ret) {
+	case TRUNK_ENQUEUE_OK:
+	case TRUNK_ENQUEUE_IN_BACKLOG:
+		break;
+
+	default:
+		ERROR("Failed to enqueue bind request");
+		trunk_request_free(&treq);
+		return UNLANG_ACTION_FAIL;
+	}
+
+	return unlang_function_push(request,
+				    ldap_async_auth_bind_start,
+				    ldap_async_auth_bind_results,
+				    ldap_async_auth_bind_cancel,
+				    ~FR_SIGNAL_CANCEL, UNLANG_SUB_FRAME,
+				    bind_auth_ctx);
 }

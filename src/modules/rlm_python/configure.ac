@@ -1,147 +1,143 @@
-AC_PREREQ([2.53])
-AC_INIT(rlm_python.c)
+AC_PREREQ([2.71])
+AC_INIT
+AC_CONFIG_SRCDIR([rlm_python.c])
 AC_REVISION($Revision$)
-AC_DEFUN(modname,[rlm_python])
+FR_INIT_MODULE([rlm_python], [support for embedded Python functions])
 
-if test x$with_[]modname != xno; then
+FR_MODULE_START_TESTS
 
-	AC_PROG_CC
-	AC_PROG_CPP
+AC_PROG_CC
+AC_PROG_CPP
 
-	dnl extra argument: --with-rlm-python-bin
-	PYHTON_BIN=
-	AC_ARG_WITH(rlm-python-bin,
-	[  --with-rlm-python-bin=PATH   Path to python binary []],
-	[ case "$withval" in
-	    no)
-		AC_MSG_ERROR(Need rlm-python-bin)
+dnl extra argument: --with-rlm-python-config-bin
+PYHTON_BIN=
+AC_ARG_WITH(rlm-python-config-bin,
+	[AS_HELP_STRING([--with-rlm-python-config-bin=PATH],
+		[path to python-config binary])],
+	[case "$withval" in
+	no)
+		AC_MSG_ERROR(Need rlm-python-config-bin)
 		;;
-	    yes)
+	yes)
 		;;
-	    *)
-		PYTHON_BIN="$withval"
+	*)
+		PYTHON_CONFIG_BIN="$withval"
 		;;
-	  esac ]
-	)
+	esac])
 
-	if test "x$PYTHON_BIN" = x; then
-		AC_CHECK_PROGS(PYTHON_BIN, [ python2.7 python2.6 python ], not-found, [${PATH}:/usr/bin:/usr/local/bin])
-	fi
+if test "x$PYTHON_CONFIG_BIN" = x; then
+	AC_CHECK_PROGS(PYTHON_CONFIG_BIN, [ python3-config ], not-found, [${PATH}:/usr/bin:/usr/local/bin])
+fi
 
-	if test "x$PYTHON_BIN" = "xnot-found"; then
-		fail="python-binary"
-	fi
-
-	dnl extra argument: --with-rlm-python-lib-dir
-	PY_LIB_DIR=
-	AC_ARG_WITH(rlm-python-lib-dir,
-	[  --with-rlm-python-lib-dir=DIR       Directory for Python library files []],
-	[ case "$withval" in
-	    no)
-		AC_MSG_ERROR(Need rlm-python-lib-dir)
-		;;
-	    yes)
-		;;
-	    *)
-		PY_LIB_DIR="$withval"
-		;;
-	  esac ]
-	)
-
-	dnl extra argument: --with-rlm-python-include-dir
-	PY_INC_DIR=
-	AC_ARG_WITH(rlm-python-include-dir,
-	[  --with-rlm-python-include-dir=DIR   Directory for Python include files []],
-	[ case "$withval" in
-	    no)
-		AC_MSG_ERROR(Need rlm-python-include-dir)
-		;;
-	    yes)
-		;;
-	    *)
-		PY_INC_DIR="$withval"
-		;;
-	  esac ]
-	)
-
-	if test x$fail = x; then
-		PY_PREFIX=`${PYTHON_BIN} -c 'import sys ; print(sys.prefix)'`
-		AC_MSG_NOTICE([Python sys.prefix \"${PY_PREFIX}\"])
-
-		PY_EXEC_PREFIX=`${PYTHON_BIN} -c 'import sys ; print(sys.exec_prefix)'`
-		AC_MSG_NOTICE([Python sys.exec_prefix \"${PY_EXEC_PREFIX}\"])
-
-		PY_SYS_VERSION=`${PYTHON_BIN} -c 'import sys ; print(sys.version[[0:3]])'`
-		AC_MSG_NOTICE([Python sys.version \"${PY_SYS_VERSION}\"])
-
-		PY_LIB_DIR="$PY_EXEC_PREFIX/lib/python${PY_SYS_VERSION}/config"
-		PY_LIB_LOC="-L$PY_EXEC_PREFIX/lib/python${PY_SYS_VERSION}/config"
-
-		PY_MAKEFILE="$PY_EXEC_PREFIX/lib/python${PY_SYS_VERSION}/config/Makefile"
-		if test -f ${PY_MAKEFILE}; then
-			PY_LOCAL_MOD_LIBS=`sed -n -e 's/^LOCALMODLIBS=\(.*\)/\1/p' $PY_MAKEFILE | sed -e 's/[[[:blank:]]]/ /g;s/^ *//;s/ *$//'`
-			AC_MSG_NOTICE([Python local_mod_libs \"${PY_LOCAL_MOD_LIBS}\"])
-
-			PY_BASE_MOD_LIBS=`sed -n -e 's/^BASEMODLIBS=\(.*\)/\1/p' $PY_MAKEFILE | sed -e 's/[[[:blank:]]]/ /g;s/^ *//;s/ *$//'`
-			AC_MSG_NOTICE([Python base_mod_libs \"${PY_BASE_MOD_LIBS}\"])
-
-			PY_OTHER_LIBS=`sed -n -e 's/^LIBS=\(.*\)/\1/p' $PY_MAKEFILE | sed -e 's/[[[:blank:]]]/ /g;s/  / /g;s/^ *//;s/ *$//'`
-			PY_OTHER_LDFLAGS=`sed -n -e 's/^LINKFORSHARED=\(.*\)/\1/p' $PY_MAKEFILE | sed -e 's/[[[:blank:]]]/ /g;s/  / /g;s/^ *//;s/ *$//'`
-			AC_MSG_NOTICE([Python other_libs \"${PY_OTHER_LDFLAGS} ${PY_OTHER_LIBS}\"])
-		fi
-		PY_EXTRA_LIBS="$PY_LOCALMODLIBS $PY_BASE_MOD_LIBS $PY_OTHER_LIBS"
-
-		old_CFLAGS=$CFLAGS
-		CFLAGS="$CFLAGS $PY_CFLAGS"
-		smart_try_dir="$PY_PREFIX/include/python$PY_SYS_VERSION"
-		FR_SMART_CHECK_INCLUDE(Python.h)
-		CFLAGS=$old_CFLAGS
-
-		if test "x$ac_cv_header_Python_h" = "xyes"; then
-			mod_cflags="$SMART_CPPFLAGS"
-		else
-			fail="$fail Python.h"
-			targetname=
-		fi
-
-		old_LIBS=$LIBS
-		LIBS="$LIBS $PY_LIB_LOC $PY_EXTRA_LIBS -lm"
-		smart_try_dir=$PY_LIB_DIR
-		FR_SMART_CHECK_LIB(python${PY_SYS_VERSION}, Py_Initialize)
-		LIBS=$old_LIBS
-
-		eval t=\${ac_cv_lib_${sm_lib_safe}_${sm_func_safe}}
-		if test "x$t" = "xyes"; then
-			mod_ldflags="$PY_LIB_LOC $PY_EXTRA_LIBS $SMART_LIBS -lm"
-			targetname=modname
-		else
-			FR_SMART_CHECK_LIB(python${PY_SYS_VERSION}m, Py_Initialize)
-			eval t=\${ac_cv_lib_${sm_lib_safe}_${sm_func_safe}}
-			if test "x$t" = "xyes"; then
-				mod_ldflags="$PY_LIB_LOC $PY_EXTRA_LIBS $SMART_LIBS -lm"
-				targetname=modname
-			else
-				targetname=
-				fail="$fail libpython$PY_SYS_VERSION"
-			fi
-		fi
-	fi
+if test "x$PYTHON_CONFIG_BIN" = "xnot-found"; then
+	FR_MODULE_FAIL([python-config])
 else
-	targetname=
-	echo \*\*\* module modname is disabled.
+	dnl #
+	dnl # It is necessary due to a weird behavior with 'python-config'
+	dnl #
+	old_CFLAGS="$CFLAGS"
+	old_LDFLAGS="$LDFLAGS"
+	old_LIBS="$LIBS"
+
+	unset CFLAGS
+	unset LDFLAGS
+	unset LIBS
+
+	dnl #
+	dnl # Not all python3-config versions have --embed.  If doesn't
+	dnl # the utility throws an error, and if it does, it omits the
+	dnl # linker argument to link to Python.
+	dnl #
+	if ${PYTHON_CONFIG_BIN} --help 2>&1 | grep '\-\-embed'; then
+		PYTHON_CONFIG_EMBED="--embed"
+	else
+		PYTHON_CONFIG_EMBED=""
+	fi
+
+	python_cflags=`${PYTHON_CONFIG_BIN} --cflags ${PYTHON_CONFIG_EMBED}`
+	AC_MSG_NOTICE([${PYTHON_CONFIG_BIN}'s cflags were "${python_cflags}"])
+
+	dnl # Convert -I to -isystem to get rid of warnings about issues in Python headers
+	dnl # Strip -systemroot
+	dnl # Strip optimisation flags (-O[0-9|fast]?). We decide our optimisation level, not python.
+	dnl # -D_FORTIFY_SOURCE needs -O.
+	dnl # Strip debug symbol flags (-g[0-9]?). We decide on debugging symbols, not python
+	dnl # Strip -W*, we decide what warnings are important
+	dnl # Strip -DNDEBUG
+	dnl # Strip -frecord-gcc-switches, We decide if we need that. not python.
+	dnl # Strip -stack-clash-protection.  We don't need it for our module and it's not
+	dnl # supported by clang < 11.
+	dnl # Strip -frecord-gcc-switches. We decide if this needs recording, not python.
+	dnl # Strip specs as they're only supported by GCC and cause warnings under clang
+	dnl # Strip -ffat-lto-objects, We decide if we need that, not python.
+	mod_cflags=`echo " $python_cflags" | sed -e '\
+		s/ -I/ -isystem/g;\
+		s/ -isysroot[[ =]]\{0,1\}[[^-]]*/ /g;\
+		s/ -O[[^[[:blank:]]*]]*/ /g;\
+		s/ -Wp,-D_FORTIFY_SOURCE=[[[:digit:]]]/ /g;\
+		s/ -g[[^ ]]*/ /g;\
+		s/ -W[[^ ]]*/ /g;\
+		s/ -DNDEBUG[[[:blank:]]]*/ /g;\
+		s/ -frecord-gcc-switches/ /g;\
+		s/ -fstack-clash-protection[[[:blank:]]]*/ /g;\
+		s/ -specs=[[^ ]]*/ /g;\
+		s/ -ffat-lto-objects/ /g;
+		'`
+	AC_MSG_NOTICE([Sanitized cflags were "${mod_cflags}"])
+
+	python_ldflags=`${PYTHON_CONFIG_BIN} --ldflags ${PYTHON_CONFIG_EMBED}`
+	AC_MSG_NOTICE([${PYTHON_CONFIG_BIN}'s ldflags were "${python_ldflags}"])
+
+	dnl # Strip -Wl,-O1... Is -O even a valid linker flag??
+	dnl # Strip -Wl,-Bsymbolic-functions as thats not always supported or required
+	dnl # Strip -Xlinker -export-dynamic as it causes weird linking issues on Linux
+	dnl #   See: https://bugs.python.org/issue36508
+	mod_ldflags=`echo $python_ldflags | sed -e '\
+		s/-Wl,-O[[[:digit:]]][[[:blank:]]]*//g;\
+		s/-Wl,-Bsymbolic-functions[[[:blank:]]]*//g;\
+		s/-Xlinker -export-dynamic//g;\
+		s/-Wl,-stack_size,[[[:digit:]]]*[[[:blank:]]]//g;
+		'`
+	AC_MSG_NOTICE([Sanitized ldflags were "${mod_ldflags}"])
+
+	dnl # Extract -l options - they should be in LIBS not LDFLAGS for gcc
+	mod_lib=`echo "${mod_ldflags}" | grep -o -E ' \-l\S+' | tr '\n' ' '`
+	AC_MSG_NOTICE([Sanitized libs were "${mod_lib}"])
+
+	python_lib=`echo "${mod_ldflags}" | grep -o -E '\-lpython[[0-9.]]+' | sed -e 's/-l//'`
+
+	AC_MSG_NOTICE([Python library is "${python_lib}"])
+
+	AC_MSG_CHECKING([we can link to python libraries])
+
+	CFLAGS=${mod_cflags}
+	LDFLAGS=${mod_ldflags}
+	LIBS=${mod_lib}
+	AC_LINK_IFELSE(
+		[AC_LANG_PROGRAM([[
+			#include <Python.h>
+		]],
+		[[
+			Py_SetProgramName("test")
+		]])],
+		[LINKS="yes"],
+		[LINKS="no"]
+	)
+
+	AC_MSG_RESULT($LINKS)
+	if test "x$LINKS" = "xno"; then
+		FR_MODULE_FAIL([working python libraries])
+	fi
+
+	CFLAGS=$old_CFLAGS
+	LDFLAGS=$old_LDFLAGS
+	LIBS=$old_LIBS
 fi
 
-if test x"$fail" != x""; then
-	if test x"${enable_strict_dependencies}" = x"yes"; then
-		AC_MSG_ERROR([set --without-]modname[ to disable it explicitly.])
-	else
-		AC_MSG_WARN([silently not building ]modname[.])
-		AC_MSG_WARN([FAILURE: ]modname[ requires: $fail.]);
-		targetname=""
-	fi
-fi
+FR_MODULE_END_TESTS
 
 AC_SUBST(mod_ldflags)
 AC_SUBST(mod_cflags)
-AC_SUBST(targetname)
-AC_OUTPUT(all.mk)
+
+AC_CONFIG_FILES([all.mk])
+AC_OUTPUT

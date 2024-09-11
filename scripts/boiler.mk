@@ -21,11 +21,11 @@
 #          bugs, add features, etc).
 
 # Note: Parameterized "functions" in this makefile that are marked with
-#       "USE WITH EVAL" are only useful in conjuction with eval. This is
+#       "USE WITH EVAL" are only useful in conjunction with eval. This is
 #       because those functions result in a block of Makefile syntax that must
 #       be evaluated after expansion. Since they must be used with eval, most
 #       instances of "$" within them need to be escaped with a second "$" to
-#       accomodate the double expansion that occurs when eval is invoked.
+#       accommodate the double expansion that occurs when eval is invoked.
 
 #
 #  You can watch what it's doing by:
@@ -36,6 +36,13 @@ ifeq "${VERBOSE}" ""
     Q=@
 else
     Q=
+endif
+
+ifeq "${BUILD_CC}" ""
+   BUILD_CC := $(shell which cc)
+   ifeq "${BUILD_CC}" ""
+     BUILD_CC := ${CC}
+   endif
 endif
 
 #
@@ -49,6 +56,34 @@ else
     ANALYZE_C_DUMP=true
 endif
 
+# FIND_DIRS - find all subdirectories in a given directory
+#
+#  Note that it excludes normal files
+#
+define FIND_DIRS
+$(patsubst %/,%,$(sort $(dir $(wildcard ${1}/*/ ${1}/*/*/ ${1}/*/*/*/ ${1}/*/*/*/*/ ${1}/*/*/*/*/*/))))
+endef
+
+# FIND_FILES - find all files in a given directory
+#
+#  Note that it excludes directories
+#
+define FIND_FILES
+$(filter-out %~ $(call FIND_DIRS,${1}),$(wildcard ${1}/* ${1}/*/* ${1}/*/*/* ${1}/*/*/*/* ${1}/*/*/*/*/* ${1}/*/*/*/*/*/* ))
+endef
+
+# FIND_FILES_SUFFIX - find all the files with a given suffix
+define FIND_FILES_SUFFIX
+$(foreach d,$(wildcard $(1:=/*)),$(call FIND_FILES_SUFFIX,$d,$2) $(filter $(subst *,%,$2),$d))
+endef
+
+# remove duplicates without sorting.
+define uniq
+  $(eval seen :=)
+  $(foreach _,$1,$(if $(filter $_,${seen}),,$(eval seen += $_)))
+  ${seen}
+endef
+
 # ADD_CLEAN_RULE - Parameterized "function" that adds a new rule and phony
 #   target for cleaning the specified target (removing its build-generated
 #   files).
@@ -56,11 +91,11 @@ endif
 #   USE WITH EVAL
 #
 define ADD_CLEAN_RULE
-    clean: clean_$(notdir ${1})
-    .PHONY: clean_$(notdir ${1})
-    clean_$(notdir ${1}):
+    clean: clean.$(notdir ${1})
+    .PHONY: clean.$(notdir ${1})
+    clean.$(notdir ${1}):
 	$(Q)$(strip rm -f ${${1}_BUILD}/${1} $${${1}_OBJS} $${${1}_DEPS} $${${1}_OBJS:%.${OBJ_EXT}=%.[do]}) $(if ${TARGET_DIR},$${TARGET_DIR}/$(notdir ${1}))
-	$${${1}_POSTCLEAN}
+	${Q}$${${1}_POSTCLEAN}
 
 endef
 
@@ -124,7 +159,6 @@ define FILTER_DEPENDS
 	  -e 's/$$$$/ :/' \
 	  < $${BUILD_DIR}/objs/$$*.d | sed -e '$$$$!N; /^\(.*\)\n\1$$$$/!P; D' \
 	 >> $${BUILD_DIR}/make/src/$$*.mk
-	 @rm -f $${BUILD_DIR}/objs/$$*.d
 endef
 
 # ADD_OBJECT_RULE - Parameterized "function" that adds a pattern rule, using
@@ -184,6 +218,15 @@ define ADD_TARGET_TO_ALL
 
 endef
 
+# ADD_TARGET_TO_ALL - Parameterized "function" that adds the target,
+#   and makes "all" depend on it.
+#
+#   USE WITH EVAL
+#
+define ADD_DEPENDS_MK
+    ALL_DEPENDS_MK += ${1}
+endef
+
 # ADD_TARGET_RULE.* - Parameterized "functions" that adds a new target to the
 #   Makefile.  There should be one ADD_TARGET_RULE definition for each
 #   type of target that is used in the build.
@@ -213,6 +256,9 @@ define ADD_TARGET_RULE.exe
     ifneq "${ANALYZE.c}" ""
         scan.${1}: $${${1}_PLISTS}
     endif
+
+    .PHONY: $(DIR)
+    $(DIR)/: ${1}
 endef
 
 # ADD_TARGET_RULE.a - Build a static library target.
@@ -234,6 +280,9 @@ define ADD_TARGET_RULE.a
     ifneq "${ANALYZE.c}" ""
         scan.${1}: $${${1}_PLISTS}
     endif
+
+    .PHONY: $(DIR)
+    $(DIR)/: ${1}
 endef
 
 # ADD_TARGET_RULE.so - Build a ".so" target.
@@ -267,7 +316,7 @@ endef
 #   top-level directory, the canonical form is the absolute path (i.e. from
 #   the root of the filesystem) also without "./" or "../" sequences.
 define CANONICAL_PATH
-$(patsubst ${CURDIR}/%,%,$(abspath ${1}))
+$(patsubst ${top_srcdir}/%,%,$(patsubst ${CURDIR}/%,%,$(abspath ${1})))
 endef
 
 # COMPILE_C_CMDS - Commands for compiling C source code.
@@ -275,7 +324,8 @@ ifeq "$(CPPCHECK)" ""
 define COMPILE_C_CMDS
 	$(Q)mkdir -p $(dir $@)
 	$(Q)$(ECHO) CC $<
-	$(Q)$(strip ${COMPILE.c} -o $@ -c -MD ${CPPFLAGS} ${CFLAGS} ${SRC_CFLAGS} ${INCDIRS} \
+	$(Q)$(strip ${SRC_CC} -o $@ -c -MD ${CPPFLAGS} ${CFLAGS} ${SRC_CFLAGS} ${INCDIRS} \
+	    $(if $(findstring clang,${SRC_CC}),-MJ $(basename $@).cc.json) \
 	    $(addprefix -I, ${SRC_INCDIRS}) ${SRC_DEFS} ${DEFS} $<)
 endef
 else
@@ -301,7 +351,12 @@ define ANALYZE_C_CMDS
 	$(Q)$(ECHO) SCAN $<
 	$(Q)$(strip ${ANALYZE.c} --analyze -Xanalyzer -analyzer-output=html -c $< -o $@ ${CPPFLAGS} \
 	    ${CFLAGS} ${SRC_CFLAGS} ${INCDIRS} $(addprefix -I,${SRC_INCDIRS}) ${SRC_DEFS} ${DEFS}) || (rm -f $@ && false)
-	$(Q)if $(ANALYZE_C_DUMP) && which lynx > /dev/null && test -d "$@"; then lynx -width=200 -dump $@/*.html; fi
+	$(Q)if $(ANALYZE_C_DUMP) && test -d "$@"; then \
+	    echo "Decode with:"; \
+	    echo -n "echo \""; \
+	    gzip -9 -c $@/*.html | base64; \
+	    echo "\" | base64 -D | zcat > scan.html"; \
+	fi
 	$(Q)touch $@
 endef
 
@@ -332,13 +387,19 @@ define INCLUDE_SUBMAKEFILE
     TGT_INSTALLDIR := ..
     TGT_CHECK_HEADERS :=
     TGT_CHECK_LIBS :=
+    TEST :=
 
     SOURCES :=
+    HEADERS :=
+    SRC_CC := $(COMPILE.c)
     SRC_CFLAGS :=
     SRC_CXXFLAGS :=
     SRC_DEFS :=
     SRC_INCDIRS :=
     MAN :=
+    FILES :=
+    OUTPUT :=
+    DEPENDS_MK :=
 
     SUBMAKEFILES :=
 
@@ -349,6 +410,7 @@ define INCLUDE_SUBMAKEFILE
     DIR_STACK := $$(call PUSH,$${DIR_STACK},$${DIR})
 
     include ${1}
+    ALL_MAKEFILES += ${1}
 
     # Initialize internal local variables.
     OBJS :=
@@ -375,21 +437,36 @@ define INCLUDE_SUBMAKEFILE
         $${TGT}_POSTMAKE := $${TGT_POSTMAKE}
         $${TGT}_POSTCLEAN := $${TGT_POSTCLEAN}
         $${TGT}_POSTINSTALL := $${TGT_POSTINSTALL}
-        $${TGT}_PREREQS := $${TGT_PREREQS}
-        $${TGT}_PRBIN := $$(addprefix $${BUILD_DIR}/bin/,$$(filter-out %.a %.so %.la,$${TGT_PREREQS}))
-        $${TGT}_PRLIBS := $$(addprefix $${BUILD_DIR}/lib/,$$(filter %.a %.so %.la,$${TGT_PREREQS}))
+        $${TGT}_PRBIN := $$(addprefix $${BUILD_DIR}/bin/,$$(filter-out %.a %.la %.${TARGET_LIB_EXT},$${TGT_PREREQS}))
         $${TGT}_DEPS :=
         $${TGT}_OBJS :=
         $${TGT}_SOURCES :=
         $${TGT}_MAN := $${MAN}
         $${TGT}_SUFFIX := $$(if $$(suffix $${TGT}),$$(suffix $${TGT}),.exe)
 
+        #  If we link to FOO, and FOO itself links to things, then we also link to the things
+        #  which FOO needs.  That way we don't have to manually specify the recursive library
+        #  references.
+        $${TGT}_PREREQS := $$(strip $$(call uniq,$$(foreach x,$${TGT_PREREQS},$$(or $${$${x}_PREREQS},) $${x})))
+        $${TGT}_PRLIBS := $$(addprefix $${BUILD_DIR}/lib/,$$(filter %.a %.la %.${TARGET_LIB_EXT},$${$${TGT}_PREREQS}))
+
         # If it's an EXE, ensure that transitive library linking works.
         # i.e. we build libfoo.a which in turn requires -lbar.  So, the executable
         # has to be linked to both libfoo.a and -lbar.
-	ifeq "$${$${TGT}_SUFFIX}" ".exe"
-		$${TGT}_LDLIBS += $$(filter-out %.a %.so %.la,$${$${TGT_PREREQS}_LDLIBS})
-	endif
+        ifeq "$${$${TGT}_SUFFIX}" ".${TARGET_EXE_EXT}"
+            # This breaks compilation by listing the same libraries multiple times, jlibtool either
+            # needs to be made smarter to filter out the duplicates, or we need to find a way of
+            # doing it here.
+#           $${TGT}_LDLIBS += $$(filter-out %.a %.la %.${TARGET_LIB_EXT},$${$${TGT_PREREQS}_LDLIBS})
+
+            #
+            #  OSX does lazy linking by default.  We want to over-ride that for binaries.
+            #  That way we catch errors at compile time, and not at run time.
+            #
+            ifneq "$(findstring apple-darwin,$(TARGET_SYSTEM))" ""
+                $${TGT}_LDFLAGS += -Wl,-undefined -Wl,error
+            endif
+        endif
 
         $${TGT}_BUILD := $$(if $$(suffix $${TGT}),$${BUILD_DIR}/lib,$${BUILD_DIR}/bin)
         $${TGT}_MAKEFILES += ${1}
@@ -429,6 +506,7 @@ define INCLUDE_SUBMAKEFILE
 
         # Save the list of source files for this target.
         $${TGT}_SOURCES += $${SOURCES}
+        $${TGT}_HEADERS += $${HEADERS}
 
         # Convert the source file names to their corresponding object file
         # names.
@@ -450,6 +528,7 @@ define INCLUDE_SUBMAKEFILE
         # A "hook" to define variables needed by the "legacy" makefiles.
         $$(eval $$(call ADD_LEGACY_VARIABLES,$$(dir ${1}),$${TGT}))
 
+        $${OBJS}: SRC_CC := $${SRC_CC}
         $${OBJS}: SRC_CFLAGS := $${SRC_CFLAGS}
         $${OBJS}: SRC_CXXFLAGS := $${SRC_CXXFLAGS}
         $${OBJS}: SRC_DEFS := $$(addprefix -D,$${SRC_DEFS})
@@ -472,6 +551,10 @@ define INCLUDE_SUBMAKEFILE
                          $$(call QUALIFY_PATH,$${DIR},$${MK})))))
     endif
 
+    ifneq "$${DEPENDS_MK}" ""
+        $$(eval $$(call ADD_DEPENDS_MK,$${DEPENDS_MK}))
+    endif
+
     # Reset the "current" target to it's previous value.
     TGT_STACK := $$(call POP,$${TGT_STACK})
     # If we're about to change targets, create the rules for the target
@@ -489,16 +572,22 @@ define INCLUDE_SUBMAKEFILE
         # Choose the correct linker.
         ifeq "$$(strip $$(filter $${CXX_SRC_EXTS},$${$${TGT}_SOURCES}))" ""
             ifeq "$${$${TGT}_LINKER}" ""
-                $${TGT}_LINKER := ${LL}$${LINK.c}
+                $${TGT}_LINKER := $${LINK.c}
             endif
         else
             ifeq "$${$${TGT}_LINKER}" ""
-                $${TGT}_LINKER := ${LL}$${LINK.cxx}
+                $${TGT}_LINKER := $${LINK.cxx}
             endif
         endif
 
         # add rules to build the target
         $$(eval $$(call ADD_TARGET_RULE$${$${TGT}_SUFFIX},$${TGT}))
+
+        # add rules to install the header files
+	ifneq "${HEADERS}" ""
+	  $(foreach h, ${HEADERS},\
+	    $(eval $(call ADD_INSTALL_RULE.h,${h},src/include/${h})))
+        endif
 
         # generate the clean rule for this target.
         $$(eval $$(call ADD_CLEAN_RULE,$${TGT}))
@@ -585,6 +674,7 @@ DEFS :=
 DIR_STACK :=
 INCDIRS :=
 TGT_STACK :=
+ALL_MAKEFILES :=
 
 ifeq "${top_builddir}" ""
     top_builddir := .
@@ -607,7 +697,7 @@ $(BUILD_DIR):
 
 # Define compilers and linkers
 #
-BOOTSTRAP_BUILD = 
+BOOTSTRAP_BUILD =
 COMPILE.c = ${CC}
 COMPILE.cxx = ${CXX}
 CPP = cc -E
@@ -664,12 +754,44 @@ ifneq "$(MAKECMDGOALS)" "clean"
       $(eval -include ${${TGT}_DEPS}))
 endif
 
+#
+#  Install binaries
+#
+$(foreach B,$(INSTALL_BIN),\
+  $(eval $(call ADD_INSTALL_RULE.bin,${B})))
+
 # Build rules for installation subdirectories
-$(foreach D,$(patsubst %/,%,$(sort $(dir ${ALL_INSTALL}))),\
+$(foreach D,$(patsubst %/,%,$(sort $(subst //,/,$(dir ${ALL_INSTALL})))),\
   $(eval $(call ADD_INSTALL_RULE.dir,${D})))
 
+#
+#  Now that all of the targets have been defined, include auto-build
+#  dependency files.
+#
+ifneq "$(ALL_DEPENDS_MK)" ""
+-include $(ALL_DEPENDS_MK)
+endif
 
 scan: ${ALL_PLISTS}
+
+scan.protocols: $(filter build/plist/src/protocols/%,$(ALL_PLISTS))
+
+scan.modules: $(filter build/plist/src/modules/%,$(ALL_PLISTS))
+
+scan.unlang: $(filter build/plist/src/lib/unlang/%,$(ALL_PLISTS))
+
+scan.server: $(filter build/plist/src/lib/server/%,$(ALL_PLISTS))
+
+.PHONY: scan.help
+scan.help:
+	@echo ""
+	@echo "Make targets:"
+	@echo "    scan                - scan all source"
+	@echo "    scan.protocols      - scan src/protocols"
+	@echo "    scan.modules        - scan src/modules"
+	@echo "    scan.server         - scan src/lib/server"
+	@echo "    scan.unlang         - scan src/lib/unlang"
+
 
 .PHONY: clean.scan
 clean.scan:

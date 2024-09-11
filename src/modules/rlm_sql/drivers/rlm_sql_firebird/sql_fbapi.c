@@ -15,8 +15,8 @@
  *   along with this program; if not, write to the Free Software
  *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  *
- * Copyright 2006  The FreeRADIUS server project
- * Copyright 2006  Vitaly Bodzhgua <vitaly@eastera.net>
+ * @copyright 2006 The FreeRADIUS server project
+ * @copyright 2006 Vitaly Bodzhgua (vitaly@eastera.net)
  */
 
 RCSID("$Id$")
@@ -31,11 +31,9 @@ static void fb_set_tpb(rlm_sql_firebird_conn_t *conn, int count, ...)
 	va_list arg;
 
 	va_start(arg, count);
-	conn->tpb = malloc(count);
+	MEM(conn->tpb = malloc(count));
 
-	for (i = 0; i < count; i++) {
-		conn->tpb[i] = (char) va_arg(arg, int);
-	}
+	for (i = 0; i < count; i++) conn->tpb[i] = (char) va_arg(arg, int);
 
 	conn->tpb_len = count;
 
@@ -66,13 +64,13 @@ static void fb_set_sqlda(XSQLDA *sqlda) {
 
 	for (i = 0; i < sqlda->sqld; i++) {
 		if ((sqlda->sqlvar[i].sqltype & ~1) == SQL_VARYING) {
-			sqlda->sqlvar[i].sqldata = (char*)malloc(sqlda->sqlvar[i].sqllen + sizeof(short));
+			MEM(sqlda->sqlvar[i].sqldata = (char*)malloc(sqlda->sqlvar[i].sqllen + sizeof(short)));
 		} else {
-			sqlda->sqlvar[i].sqldata = (char*)malloc(sqlda->sqlvar[i].sqllen);
+			MEM(sqlda->sqlvar[i].sqldata = (char*)malloc(sqlda->sqlvar[i].sqllen));
 		}
 
 		if (sqlda->sqlvar[i].sqltype & 1) {
-			sqlda->sqlvar[i].sqlind = (short*)calloc(sizeof(short), 1);
+			MEM(sqlda->sqlvar[i].sqlind = (short*)calloc(1, sizeof(short)));
 		} else {
 			sqlda->sqlvar[i].sqlind = 0;
 		}
@@ -142,7 +140,7 @@ void fb_free_sqlda(XSQLDA *sqlda)
 #define IS_NULL(x) (x->sqltype & 1) && (*x->sqlind < 0)
 
 //Structure to manage a SQL_VARYING Firebird's data types
-typedef struct vary_fb {
+typedef struct {
 	 short vary_length;
 	 char vary_string[1];
 } VARY;
@@ -211,7 +209,7 @@ void fb_store_row(rlm_sql_firebird_conn_t *conn)
 
 		case SQL_FLOAT:
 			snprintf(conn->row[i], conn->row_sizes[i], "%15g",
-				 *(float ISC_FAR *) (var->sqldata));
+				 *(double ISC_FAR *) (var->sqldata));
 			break;
 
 		case SQL_SHORT:
@@ -221,8 +219,6 @@ void fb_store_row(rlm_sql_firebird_conn_t *conn)
 			ISC_INT64 value = 0;
 			short field_width = 0;
 			short dscale = 0;
-			char *p;
-			p = conn->row[i];
 
 			switch (dtype) {
 			case SQL_SHORT:
@@ -252,26 +248,26 @@ void fb_store_row(rlm_sql_firebird_conn_t *conn)
 				}
 
 				if (value >= 0) {
-					sprintf(p, "%*lld.%0*lld",
-						field_width - 1 + dscale,
-						(ISC_INT64) value / tens,
-						-dscale,
-						(ISC_INT64) value % tens);
+					snprintf(conn->row[i], conn->row_sizes[i], "%*lld.%0*lld",
+						 field_width - 1 + dscale,
+						 (ISC_INT64) value / tens,
+						 -dscale,
+						 (ISC_INT64) value % tens);
 				} else if ((value / tens) != 0) {
-					sprintf (p, "%*lld.%0*lld",
-						field_width - 1 + dscale,
-						(ISC_INT64) (value / tens),
-						-dscale,
-						(ISC_INT64) -(value % tens));
+					snprintf(conn->row[i], conn->row_sizes[i], "%*lld.%0*lld",
+						 field_width - 1 + dscale,
+						 (ISC_INT64) (value / tens),
+						 -dscale,
+						 (ISC_INT64) -(value % tens));
 				} else {
-					sprintf(p, "%*s.%0*lld", field_width - 1 + dscale,
-						"-0", -dscale, (ISC_INT64) - (value % tens));
+					snprintf(conn->row[i], conn->row_sizes[i], "%*s.%0*lld", field_width - 1 + dscale,
+						 "-0", -dscale, (ISC_INT64) - (value % tens));
 				}
 			} else if (dscale) {
-				sprintf(p, "%*lld%0*d", field_width,
+				snprintf(conn->row[i], conn->row_sizes[i], "%*lld%0*d", field_width,
 					(ISC_INT64) value, dscale, 0);
 			} else {
-				sprintf(p, "%*lld", field_width,
+				snprintf(conn->row[i], conn->row_sizes[i], "%*lld", field_width,
 					(ISC_INT64) value);
 			}
 		}
@@ -326,7 +322,7 @@ void fb_store_row(rlm_sql_firebird_conn_t *conn)
 int fb_init_socket(rlm_sql_firebird_conn_t *conn)
 {
 	memset(conn, 0, sizeof(*conn));
-	conn->sqlda_out = (XSQLDA ISC_FAR *) calloc(XSQLDA_LENGTH (5), 1);
+	MEM(conn->sqlda_out = (XSQLDA ISC_FAR *) calloc(1, XSQLDA_LENGTH(5)));
 	conn->sqlda_out->sqln = 5;
 	conn->sqlda_out->version =  SQLDA_VERSION1;
 	conn->sql_dialect = 3;
@@ -346,7 +342,7 @@ int fb_init_socket(rlm_sql_firebird_conn_t *conn)
 	return 0;
 }
 
-int fb_connect(rlm_sql_firebird_conn_t *conn, rlm_sql_config_t *config)
+int fb_connect(rlm_sql_firebird_conn_t *conn, rlm_sql_config_t const *config)
 {
 	char *p;
 	char *database;
@@ -360,7 +356,7 @@ int fb_connect(rlm_sql_firebird_conn_t *conn, rlm_sql_config_t *config)
 		conn->dpb_len += strlen(config->sql_password) + 2;
 	}
 
-	conn->dpb = (char *) malloc(conn->dpb_len);
+	MEM(conn->dpb = (char *) malloc(conn->dpb_len));
 	p = conn->dpb;
 
 	*conn->dpb++= isc_dpb_version1;
@@ -387,7 +383,7 @@ int fb_connect(rlm_sql_firebird_conn_t *conn, rlm_sql_config_t *config)
 		 */
 		int ls = strlen(config->sql_server);
 		int ld = strlen(config->sql_db);
-		database = (char *) calloc(ls + ld + 2, 1);
+		MEM(database = (char *) calloc(1, ls + ld + 2));
 		strcpy(database, config->sql_server);
 		database[ls] = ':';
 		memmove(database + ls + 1, config->sql_db, ld);
@@ -518,14 +514,16 @@ int fb_affected_rows(rlm_sql_firebird_conn_t *conn) {
 	p = info_buffer + 3;
 	while (*p != isc_info_end) {
 		p++;
-		short len = (short)isc_vax_integer(p, 2);
-		p += 2;
+		{
+			short len = (short)isc_vax_integer(p, 2);
+			p += 2;
 
-		affected_rows = isc_vax_integer(p, len);
-		if (affected_rows > 0) {
-			break;
+			affected_rows = isc_vax_integer(p, len);
+			if (affected_rows > 0) {
+				break;
+			}
+			p += len;
 		}
-		p += len;
 	}
 	return affected_rows;
 }

@@ -23,73 +23,115 @@
  */
 RCSID("$Id$")
 
-#define LOG_PREFIX "rlm_eap_gtc - "
+#include <freeradius-devel/eap/base.h>
+#include <freeradius-devel/util/debug.h>
+#include <freeradius-devel/server/virtual_servers.h>
+#include <freeradius-devel/server/pair.h>
+#include <freeradius-devel/unlang/call.h>
+#include <freeradius-devel/unlang/interpret.h>
 
-#include <stdio.h>
-#include <stdlib.h>
-
-#include <freeradius-devel/unlang.h>
-#include "eap.h"
-
-#include <freeradius-devel/rad_assert.h>
+static int auth_type_parse(TALLOC_CTX *ctx, void *out, UNUSED void *parent,
+			   CONF_ITEM *ci, UNUSED conf_parser_t const *rule);
 
 /*
  *	EAP-GTC is just ASCII data carried inside of the EAP session.
  *	The length of the data is indicated by the encapsulating EAP
  *	protocol.
  */
-typedef struct rlm_eap_gtc_t {
-	char const	*challenge;
-	char const	*auth_type_name;
-	uint32_t	auth_type;
+typedef struct {
+	char const		*challenge;
+	fr_dict_enum_value_t const	*auth_type;
 } rlm_eap_gtc_t;
 
-static CONF_PARSER submodule_config[] = {
-	{ FR_CONF_OFFSET("challenge", FR_TYPE_STRING, rlm_eap_gtc_t, challenge), .dflt = "Password: " },
-	{ FR_CONF_OFFSET("auth_type", FR_TYPE_STRING, rlm_eap_gtc_t, auth_type_name), .dflt = "pap" },
+static conf_parser_t submodule_config[] = {
+	{ FR_CONF_OFFSET("challenge", rlm_eap_gtc_t, challenge), .dflt = "Password: " },
+	{ FR_CONF_OFFSET_TYPE_FLAGS("auth_type", FR_TYPE_VOID, 0, rlm_eap_gtc_t, auth_type), .func = auth_type_parse,  .dflt = "pap" },
 	CONF_PARSER_TERMINATOR
 };
 
-static rlm_rcode_t CC_HINT(nonnull) mod_process(void *instance, eap_session_t *eap_session);
+static fr_dict_t const *dict_freeradius;
+static fr_dict_t const *dict_radius;
+
+extern fr_dict_autoload_t rlm_eap_gtc_dict[];
+fr_dict_autoload_t rlm_eap_gtc_dict[] = {
+	{ .out = &dict_freeradius, .proto = "freeradius" },
+	{ .out = &dict_radius, .proto = "radius" },
+	{ NULL }
+};
+
+static fr_dict_attr_t const *attr_auth_type;
+static fr_dict_attr_t const *attr_user_password;
+
+extern fr_dict_attr_autoload_t rlm_eap_gtc_dict_attr[];
+fr_dict_attr_autoload_t rlm_eap_gtc_dict_attr[] = {
+	{ .out = &attr_auth_type, .name = "Auth-Type", .type = FR_TYPE_UINT32, .dict = &dict_freeradius },
+	{ .out = &attr_user_password, .name = "User-Password", .type = FR_TYPE_STRING, .dict = &dict_radius },
+	{ NULL }
+};
+
+static unlang_action_t mod_session_init(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request);
+
+/** Translate a string auth_type into an enumeration value
+ *
+ * @param[in] ctx	to allocate data.
+ * @param[out] out	Where to write the auth_type we created or resolved.
+ * @param[in] parent	Base structure address.
+ * @param[in] ci	#CONF_PAIR specifying the name of the auth_type.
+ * @param[in] rule	unused.
+ * @return
+ *	- 0 on success.
+ *	- -1 on failure.
+ */
+static int auth_type_parse(UNUSED TALLOC_CTX *ctx, void *out, UNUSED void *parent,
+			   CONF_ITEM *ci, UNUSED conf_parser_t const *rule)
+{
+	char const	*auth_type = cf_pair_value(cf_item_to_pair(ci));
+
+	if (fr_dict_enum_add_name_next(fr_dict_attr_unconst(attr_auth_type), auth_type) < 0) {
+		cf_log_err(ci, "Failed adding %s alias", attr_auth_type->name);
+		return -1;
+	}
+	*((fr_dict_enum_value_t **)out) = fr_dict_enum_by_name(attr_auth_type, auth_type, -1);
+
+	return 0;
+}
 
 /*
  *	Keep processing the Auth-Type until it doesn't return YIELD.
  */
-static rlm_rcode_t mod_process_auth_type(UNUSED void *instance, eap_session_t *eap_session)
+static unlang_action_t gtc_resume(rlm_rcode_t *p_result, module_ctx_t const *mctx,  request_t *request)
 {
 	rlm_rcode_t	rcode;
+
+	eap_session_t	*eap_session = mctx->rctx;
 	eap_round_t	*eap_round = eap_session->this_round;
-	REQUEST		*request = eap_session->request;
 
-	rcode = unlang_interpret_continue(request);
-
-	if (request->master_state == REQUEST_STOP_PROCESSING) return RLM_MODULE_REJECT;
-
-	if (rcode == RLM_MODULE_YIELD) return rcode;
+	rcode = unlang_interpret_stack_result(request);
 
 	if (rcode != RLM_MODULE_OK) {
 		eap_round->request->code = FR_EAP_CODE_FAILURE;
-		return rcode;
+		RETURN_MODULE_RCODE(rcode);
 	}
 
 	eap_round->request->code = FR_EAP_CODE_SUCCESS;
-	return RLM_MODULE_OK;
+	RETURN_MODULE_OK;
 }
 
 /*
  *	Authenticate a previously sent challenge.
  */
-static rlm_rcode_t mod_process(void *instance, eap_session_t *eap_session)
+static unlang_action_t mod_process(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request)
 {
-	int		rcode;
-	VALUE_PAIR	*vp;
-	eap_round_t	*eap_round = eap_session->this_round;
-	rlm_eap_gtc_t	*inst = talloc_get_type_abort(instance, rlm_eap_gtc_t);
-	REQUEST		*request = eap_session->request;
-	CONF_SECTION	*unlang;
+	rlm_eap_gtc_t const	*inst = talloc_get_type_abort(mctx->mi->data, rlm_eap_gtc_t);
+
+	eap_session_t		*eap_session = eap_session_get(request->parent);
+	eap_round_t		*eap_round = eap_session->this_round;
+
+	fr_pair_t		*vp;
+	CONF_SECTION		*unlang;
 
 	/*
-	 *	Get the Cleartext-Password for this user.
+	 *	Get the Password.Cleartext for this user.
 	 */
 
 	/*
@@ -97,9 +139,9 @@ static rlm_rcode_t mod_process(void *instance, eap_session_t *eap_session)
 	 *	of data.
 	 */
 	if (eap_round->response->length <= 4) {
-		ERROR("Corrupted data");
+		REDEBUG("Corrupted data");
 		eap_round->request->code = FR_EAP_CODE_FAILURE;
-		return RLM_MODULE_INVALID;
+		RETURN_MODULE_INVALID;
 	}
 
 	/*
@@ -107,62 +149,45 @@ static rlm_rcode_t mod_process(void *instance, eap_session_t *eap_session)
 	 *	we don't like that.
 	 */
 	if (eap_round->response->type.length > 128) {
-		ERROR("Response is too large to understand");
+		REDEBUG("Response is too large to understand");
 		eap_round->request->code = FR_EAP_CODE_FAILURE;
-		return RLM_MODULE_INVALID;
+		RETURN_MODULE_INVALID;
 	}
 
 	/*
 	 *	If there was a User-Password in the request,
 	 *	why the heck are they using EAP-GTC?
 	 */
-	fr_pair_delete_by_num(&request->packet->vps, 0, FR_USER_PASSWORD, TAG_ANY);
-
-	MEM(vp = pair_make_request("User-Password", NULL, T_OP_EQ));
-	fr_pair_value_bstrncpy(vp, eap_round->response->type.data, eap_round->response->type.length);
+	MEM(pair_update_request(&vp, attr_user_password) >= 0);
+	fr_pair_value_bstrndup(vp, (char const *)eap_round->response->type.data, eap_round->response->type.length, true);
 	vp->vp_tainted = true;
 
-	/*
-	 *	Add the password to the request, and allow
-	 *	another module to do the work of authenticating it.
-	 */
-	request->password = vp;
-
-	unlang = cf_section_find(request->server_cs, "authenticate", inst->auth_type_name);
+	unlang = cf_section_find(unlang_call_current(request), "authenticate", inst->auth_type->name);
+	if (!unlang) unlang = cf_section_find(unlang_call_current(request->parent), "authenticate", inst->auth_type->name);
 	if (!unlang) {
-		/*
-		 *	Call the authenticate section of the *current* virtual server.
-		 */
-		rcode = process_authenticate(inst->auth_type, request);
-		if (rcode != RLM_MODULE_OK) {
-			eap_round->request->code = FR_EAP_CODE_FAILURE;
-			return rcode;
-		}
-
-		eap_round->request->code = FR_EAP_CODE_SUCCESS;
-		return RLM_MODULE_OK;
+		RDEBUG2("authenticate %s { ... } sub-section not found.",
+			inst->auth_type->name);
+		eap_round->request->code = FR_EAP_CODE_FAILURE;
+		RETURN_MODULE_FAIL;
 	}
 
-	unlang_push_section(request, unlang, RLM_MODULE_FAIL);
-
-	eap_session->process = mod_process_auth_type;
-
-	return eap_session->process(inst, eap_session);
+	return unlang_module_yield_to_section(p_result, request, unlang, RLM_MODULE_FAIL, gtc_resume, NULL, 0, eap_session);
 }
 
 
 /*
  *	Initiate the EAP-GTC session by sending a challenge to the peer.
  */
-static rlm_rcode_t mod_session_init(void *instance, eap_session_t *eap_session)
+static unlang_action_t mod_session_init(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request)
 {
+	eap_session_t	*eap_session = eap_session_get(request->parent);
 	char		challenge_str[1024];
 	int		length;
 	eap_round_t	*eap_round = eap_session->this_round;
-	rlm_eap_gtc_t	*inst = (rlm_eap_gtc_t *) instance;
+	rlm_eap_gtc_t	*inst = talloc_get_type_abort(mctx->mi->data, rlm_eap_gtc_t);
 
-	if (xlat_eval(challenge_str, sizeof(challenge_str), eap_session->request, inst->challenge, NULL, NULL) < 0) {
-		return RLM_MODULE_FAIL;
+	if (xlat_eval(challenge_str, sizeof(challenge_str), request, inst->challenge, NULL, NULL) < 0) {
+		RETURN_MODULE_FAIL;
 	}
 
 	length = strlen(challenge_str);
@@ -173,7 +198,7 @@ static rlm_rcode_t mod_session_init(void *instance, eap_session_t *eap_session)
 	eap_round->request->code = FR_EAP_CODE_REQUEST;
 
 	eap_round->request->type.data = talloc_array(eap_round->request, uint8_t, length);
-	if (!eap_round->request->type.data) return RLM_MODULE_FAIL;
+	if (!eap_round->request->type.data) RETURN_MODULE_FAIL;
 
 	memcpy(eap_round->request->type.data, challenge_str, length);
 	eap_round->request->type.length = length;
@@ -187,31 +212,7 @@ static rlm_rcode_t mod_session_init(void *instance, eap_session_t *eap_session)
 	 */
 	eap_session->process = mod_process;
 
-	return RLM_MODULE_OK;
-}
-
-/*
- *	Attach the module.
- */
-static int mod_instantiate(void *instance, CONF_SECTION *cs)
-{
-	rlm_eap_gtc_t	*inst = talloc_get_type_abort(instance, rlm_eap_gtc_t);
-	fr_dict_enum_t	*dval;
-
-	if (!inst->auth_type_name) {
-		ERROR("You must specify 'auth_type'");
-		return -1;
-	}
-
-	dval = fr_dict_enum_by_alias(NULL, fr_dict_attr_by_num(NULL, 0, FR_AUTH_TYPE), inst->auth_type_name);
-	if (!dval) {
-		cf_log_err_by_name(cs, "auth_type", "Unknown Auth-Type %s", inst->auth_type_name);
-		return -1;
-	}
-	inst->auth_type = dval->value->vb_uint32;
-	inst->auth_type_name = dval->alias;	/* Corrects case mismatches */
-
-	return 0;
+	RETURN_MODULE_HANDLED;
 }
 
 /*
@@ -220,14 +221,13 @@ static int mod_instantiate(void *instance, CONF_SECTION *cs)
  */
 extern rlm_eap_submodule_t rlm_eap_gtc;
 rlm_eap_submodule_t rlm_eap_gtc = {
-	.name		= "eap_gtc",
-	.magic		= RLM_MODULE_INIT,
-
-	.provides	= { FR_EAP_GTC },
-	.inst_size	= sizeof(rlm_eap_gtc_t),
-	.config		= submodule_config,
-
-	.instantiate	= mod_instantiate,	/* Create new submodule instance */
+	.common = {
+		.magic		= MODULE_MAGIC_INIT,
+		.name		= "eap_gtc",
+		.inst_size	= sizeof(rlm_eap_gtc_t),
+		.config		= submodule_config,
+	},
+	.provides	= { FR_EAP_METHOD_GTC },
 	.session_init	= mod_session_init,	/* Initialise a new EAP session */
-	.process	= mod_process		/* Process next round of EAP method */
+	.clone_parent_lists = true		/* HACK */
 };

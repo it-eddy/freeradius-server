@@ -3,72 +3,100 @@
 #
 
 #
-#  The files are put here in order.  Later tests need
-#  functionality from earlier tests.
+#  Test name
 #
-FILES  := \
-	radius_rfc.txt \
-	radius_errors.txt \
-	radius_extended.txt \
-	radius_lucent.txt \
-	radius_wimax.txt \
-	radius_tunnel.txt \
-	radius_vendor.txt \
-	radius_tlv.txt \
-	eap_aka_encode.txt \
-	eap_aka_decode.txt \
-	eap_aka_error.txt \
-	eap_sim_encode.txt \
-	eap_sim_decode.txt \
-	eap_sim_error.txt \
-	dhcp.txt \
-	dict.txt \
-	regex.txt \
-	escape.txt \
-	condition.txt \
-	xlat.txt \
-	ethernet.txt
+TEST := test.unit
 
 #
-#  Create the output directory
+#  Get all .txt files
 #
-.PHONY: $(BUILD_DIR)/tests/unit
-$(BUILD_DIR)/tests/unit:
-	${Q}mkdir -p $@
-
-.PHONY: $(BUILD_DIR)/share
-$(BUILD_DIR)/share:
-	${Q}mkdir -p $@
+FILES  := $(filter-out $(DIR)/files/%,$(call FIND_FILES_SUFFIX,$(DIR),*.txt))
 
 #
-#  We need $INCLUDE in the output file, so we pass 2 parameters to 'echo'
-#  No idea how portable that is...
+#  If we don't have OpenSSL, filter out tests which need TLS.
 #
-$(BUILD_DIR)/share/dictionary: $(top_srcdir)/share/dictionary $(top_srcdir)/share/dictionary.dhcp $(top_srcdir)/src/tests/unit/dictionary.unit | $(BUILD_DIR)/share
-	${Q}rm -f $@
-	${Q}for x in $^; do \
-		echo '$$INCLUDE ' "$$x" >> $@; \
-	done
+ifeq "$(AC_HAVE_OPENSSL_SSL_H)" ""
+FILES := $(filter-out $(shell grep -l 'need-feature tls' $(FILES)),$(FILES))
+endif
 
 #
-#  Files in the output dir depend on the unit tests
+#  Remove our directory prefix, which is needed by the bootstrap function.
 #
-$(BUILD_DIR)/tests/unit/%: $(DIR)/% $(BUILD_DIR)/bin/unit_test_attribute $(TESTBINDIR)/unit_test_attribute $(BUILD_DIR)/share/dictionary | $(BUILD_DIR)/tests/unit
-	${Q}echo UNIT-TEST $(notdir $@)
-	${Q}if ! $(TESTBIN)/unit_test_attribute -D $(BUILD_DIR)/share $<; then \
-		echo "$(TESTBIN)/unit_test_attribute -D $(BUILD_DIR)/share $<"; \
+FILES := $(subst $(DIR)/,,$(FILES))
+
+# dict.txt - removed because the unit tests don't allow for protocol namespaces
+
+# command.txt - removed because commands like ":sql" are not parsed properly any more
+
+#
+#  Bootstrap the test framework.
+#
+$(eval $(call TEST_BOOTSTRAP))
+
+#
+#  We use GMT for the tests, so that local time zones don't affect
+#  the test outputs.
+#
+$(FILES.$(TEST)): export TZ = GMT
+
+#
+#  Ensure that the protocol tests are run if any of the protocol dictionaries change
+#
+PROTOCOLS := $(subst $(DIR)/protocols/,,$(wildcard $(DIR)/protocols/*))
+define UNIT_TEST_PROTOCOLS
+$(addprefix $(OUTPUT)/,$(filter protocols/${1}/%.txt,$(FILES))): $(wildcard $(top_srcdir)/share/dictionary/${1}/dictionary*) $(BUILD_DIR)/lib/local/libfreeradius-${1}.la $(BUILD_DIR)/lib/libfreeradius-${1}.la
+
+ifeq "${1}" "eap"
+$(addprefix $(OUTPUT)/,$(filter protocols/${1}/%.txt,$(FILES))): $(wildcard $(top_srcdir)/share/dictionary/${1}/dictionary*) $(BUILD_DIR)/lib/local/libfreeradius-${1}.la $(BUILD_DIR)/lib/libfreeradius-eap-aka-sim.la
+endif
+
+test.unit.${1}: $(addprefix $(OUTPUT)/,$(filter protocols/${1}/%.txt,$(FILES))) $(BUILD_DIR)/lib/libfreeradius-${1}.la $(BUILD_DIR)/lib/local/libfreeradius-${1}.la
+
+.PHONY: clean.test.unit.${1}
+clean.test.unit.${1}:
+	@rm -f $(addprefix $(OUTPUT)/,$(filter protocols/${1}/%.txt,$(FILES)))
+
+test.unit.help: TEST_UNIT_HELP += test.unit.${1}
+endef
+$(foreach x,$(PROTOCOLS),$(eval $(call UNIT_TEST_PROTOCOLS,$x)))
+
+test.unit.xlat: $(addprefix $(OUTPUT)/,$(filter xlat/%.txt,$(FILES))) $(BUILD_DIR)/lib/libfreeradius-unlang.la
+
+test.unit.help: TEST_UNIT_HELP += test.unit.xlat
+
+
+#  This is useful, too
+test.unit.condition: $(addprefix $(OUTPUT)/,$(filter condition/%.txt,$(FILES))) $(BUILD_DIR)/lib/libfreeradius-server.la
+
+#
+#  Add special command-line flag for purify tests.
+#
+$(BUILD_DIR)/tests/unit/xlat/purify.txt $(filter $(BUILD_DIR)/tests/unit/xlat/cond_%,$(FILES.$(TEST))): PURIFY=-p
+
+#
+#  For automatically fixing the tests when only the output has changed
+#
+#  The unit_test_attribute program will copy the inputs to the outputs, and rewrite the "expected" output
+#  with the "actual" output.  But only for the "match" command.  Everything is including comments and blank
+#  lines is copied verbatim.
+#
+
+#REWRITE_FLAGS = -w $(BUILD_DIR)/tmp
+
+#
+#  And the actual script to run each test.
+#
+$(OUTPUT)/%: $(DIR)/% $(TEST_BIN_DIR)/unit_test_attribute $(top_srcdir)/src/tests/unit/dictionary
+	$(eval DIR:=${top_srcdir}/src/tests/unit)
+	@echo "UNIT-TEST $(lastword $(subst /, ,$(dir $@))) $(basename $(notdir $@))"
+	${Q}if ! $(TEST_BIN)/unit_test_attribute $(PURIFY) $(REWRITE_FLAGS) -F ./src/tests/fuzzer-corpus -D ./share/dictionary -d $(DIR) -r "$@" $<; then \
+		echo "TZ=GMT $(TEST_BIN)/unit_test_attribute $(PURIFY) -F ./src/tests/fuzzer-corpus -D ./share/dictionary -d $(DIR) -r \"$@\" $<"; \
+		rm -f $(BUILD_DIR)/tests/test.unit; \
 		exit 1; \
 	fi
-	${Q}touch $@
 
-#
-#  Get all of the unit test output files
-#
-TESTS.UNIT_FILES := $(addprefix $(BUILD_DIR)/tests/unit/,$(FILES))
+$(TEST):
+	@touch $(BUILD_DIR)/tests/$@
 
-$(TESTS.UNIT_FILES): $(TESTS.DICT_FILES)
-
-#
-#  Depend on the output files, and create the directory first.
-#
-tests.unit: $(TESTS.UNIT_FILES)
+$(TEST).help:
+	@echo make $(TEST_UNIT_HELP)

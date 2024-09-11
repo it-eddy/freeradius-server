@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, Network RADIUS SARL <license@networkradius.com>
+ * @copyright (c) 2016, Network RADIUS SAS (license@networkradius.com)
  *  All rights reserved.
  *
  *  Redistribution and use in source and binary forms, with or without
@@ -9,7 +9,7 @@
  *    * Redistributions in binary form must reproduce the above copyright
  *      notice, this list of conditions and the following disclaimer in the
  *      documentation and/or other materials provided with the distribution.
- *    * Neither the name of Network RADIUS SARL nor the
+ *    * Neither the name of Network RADIUS SAS nor the
  *      names of its contributors may be used to endorse or promote products
  *      derived from this software without specific prior written permission.
  *
@@ -30,23 +30,24 @@
  * @file rlm_sigtran/rlm_sigtran.c
  * @brief Implement a SCTP/M3UA/SCCP/TCAP/MAP stack
  *
- * @copyright 2016 Network RADIUS SARL <license@networkradius.com>
+ * @copyright 2016 Network RADIUS SAS (license@networkradius.com)
  */
 RCSID("$Id$")
 
-#define LOG_PREFIX "rlm_sigtran (%s) - "
-#define LOG_PREFIX_ARGS inst->name
+#define LOG_PREFIX_ARGS mctx->mi->name
 
 #include <osmocom/core/linuxlist.h>
 
 #include "libosmo-m3ua/include/bsc_data.h"
 #include "libosmo-m3ua/include/sctp_m3ua.h"
 
-#include <freeradius-devel/radiusd.h>
-#include <freeradius-devel/modules.h>
-#include <freeradius-devel/rad_assert.h>
+#include <freeradius-devel/server/base.h>
+#include <freeradius-devel/server/module_rlm.h>
+#include <freeradius-devel/util/debug.h>
 
 #include "sigtran.h"
+#include "attrs.h"
+
 #include <assert.h>
 #include <limits.h>
 
@@ -62,142 +63,151 @@ static uint32_t	sigtran_instances = 0;
 
 unsigned int __hack_opc, __hack_dpc;
 
-fr_thread_local_setup(int *, req_pipe);
-
-static const FR_NAME_NUMBER m3ua_traffic_mode_table[] = {
-	{ "override",  1 },
-	{ "loadshare", 2 },
-	{ "broadcast", 3 },
-	{  NULL, 0 }
+static fr_table_num_sorted_t const m3ua_traffic_mode_table[] = {
+	{ L("broadcast"), 3 },
+	{ L("loadshare"), 2 },
+	{ L("override"),  1 }
 };
+static size_t m3ua_traffic_mode_table_len = NUM_ELEMENTS(m3ua_traffic_mode_table);
 
-static const CONF_PARSER sctp_config[] = {
-	{ FR_CONF_OFFSET("server", FR_TYPE_COMBO_IP_ADDR, rlm_sigtran_t, conn_conf.sctp_dst_ipaddr) },
-	{ FR_CONF_OFFSET("port", FR_TYPE_UINT16, rlm_sigtran_t, conn_conf.sctp_dst_port), .dflt = "2905" },
+static const conf_parser_t sctp_config[] = {
+	{ FR_CONF_OFFSET_TYPE_FLAGS("server", FR_TYPE_COMBO_IP_ADDR, 0, rlm_sigtran_t, conn_conf.sctp_dst_ipaddr) },
+	{ FR_CONF_OFFSET("port", rlm_sigtran_t, conn_conf.sctp_dst_port), .dflt = "2905" },
 
-	{ FR_CONF_OFFSET("src_ipaddr", FR_TYPE_COMBO_IP_ADDR, rlm_sigtran_t, conn_conf.sctp_src_ipaddr ) },
-	{ FR_CONF_OFFSET("src_port", FR_TYPE_UINT16, rlm_sigtran_t, conn_conf.sctp_src_port), .dflt = "0" },
+	{ FR_CONF_OFFSET_TYPE_FLAGS("src_ipaddr", FR_TYPE_COMBO_IP_ADDR, 0, rlm_sigtran_t, conn_conf.sctp_src_ipaddr ) },
+	{ FR_CONF_OFFSET("src_port", rlm_sigtran_t, conn_conf.sctp_src_port), .dflt = "0" },
 
-	{ FR_CONF_OFFSET("timeout", FR_TYPE_UINT32, rlm_sigtran_t, conn_conf.sctp_timeout), .dflt = "5" },
+	{ FR_CONF_OFFSET("timeout", rlm_sigtran_t, conn_conf.sctp_timeout), .dflt = "5" },
 
 	CONF_PARSER_TERMINATOR
 };
 
-static const CONF_PARSER m3ua_route[] = {
-	{ FR_CONF_IS_SET_OFFSET("dpc", FR_TYPE_UINT32, sigtran_m3ua_route_t, dpc) },
-	{ FR_CONF_OFFSET("opc", FR_TYPE_UINT32 | FR_TYPE_MULTI, sigtran_m3ua_route_t, opc) },
-	{ FR_CONF_OFFSET("si", FR_TYPE_UINT32 | FR_TYPE_MULTI, sigtran_m3ua_route_t, si) },
+static const conf_parser_t m3ua_route[] = {
+	{ FR_CONF_OFFSET_IS_SET("dpc", FR_TYPE_UINT32, 0, sigtran_m3ua_route_t, dpc) },
+	{ FR_CONF_OFFSET_FLAGS("opc" , CONF_FLAG_MULTI, sigtran_m3ua_route_t, opc) },
+	{ FR_CONF_OFFSET_FLAGS("si" , CONF_FLAG_MULTI, sigtran_m3ua_route_t, si) },
 
 	CONF_PARSER_TERMINATOR
 };
 
-static const CONF_PARSER m3ua_config[] = {
-	{ FR_CONF_OFFSET("link_index", FR_TYPE_UINT16, rlm_sigtran_t, conn_conf.m3ua_link_index) },
-	{ FR_CONF_OFFSET("routing_ctx", FR_TYPE_UINT16, rlm_sigtran_t, conn_conf.m3ua_routing_context) },
-	{ FR_CONF_OFFSET("traffic_mode", FR_TYPE_STRING, rlm_sigtran_t, conn_conf.m3ua_traffic_mode_str), .dflt = "loadshare" },
-	{ FR_CONF_OFFSET("ack_timeout", FR_TYPE_UINT32, rlm_sigtran_t, conn_conf.m3ua_ack_timeout), .dflt = "2" },
-	{ FR_CONF_OFFSET("beat_interval", FR_TYPE_UINT32, rlm_sigtran_t, conn_conf.m3ua_beat_interval), .dflt = "0" },
+static const conf_parser_t m3ua_config[] = {
+	{ FR_CONF_OFFSET("link_index", rlm_sigtran_t, conn_conf.m3ua_link_index) },
+	{ FR_CONF_OFFSET("routing_ctx", rlm_sigtran_t, conn_conf.m3ua_routing_context) },
+	{ FR_CONF_OFFSET("traffic_mode", rlm_sigtran_t, conn_conf.m3ua_traffic_mode_str), .dflt = "loadshare" },
+	{ FR_CONF_OFFSET("ack_timeout", rlm_sigtran_t, conn_conf.m3ua_ack_timeout), .dflt = "2" },
+	{ FR_CONF_OFFSET("beat_interval", rlm_sigtran_t, conn_conf.m3ua_beat_interval), .dflt = "0" },
 
-	{ FR_CONF_IS_SET_OFFSET("route", FR_TYPE_SUBSECTION, rlm_sigtran_t, conn_conf.m3ua_routes), .subcs = (void const *) m3ua_route },
-
-	CONF_PARSER_TERMINATOR
-};
-
-static const CONF_PARSER mtp3_config[] = {
-	{ FR_CONF_OFFSET("dpc", FR_TYPE_UINT32 | FR_TYPE_REQUIRED, rlm_sigtran_t, conn_conf.mtp3_dpc) },
-	{ FR_CONF_OFFSET("opc", FR_TYPE_UINT32 | FR_TYPE_REQUIRED, rlm_sigtran_t, conn_conf.mtp3_opc) },
+	{ FR_CONF_OFFSET_IS_SET("route", 0, CONF_FLAG_SUBSECTION, rlm_sigtran_t, conn_conf.m3ua_routes), .subcs = (void const *) m3ua_route },
 
 	CONF_PARSER_TERMINATOR
 };
 
-static const CONF_PARSER sccp_global_title[] = {
-	{ FR_CONF_OFFSET("address", FR_TYPE_STRING, sigtran_sccp_global_title_t, address) },
-	{ FR_CONF_IS_SET_OFFSET("tt", FR_TYPE_UINT8, sigtran_sccp_global_title_t, tt) },
-	{ FR_CONF_IS_SET_OFFSET("nai", FR_TYPE_UINT8, sigtran_sccp_global_title_t, nai) },
-	{ FR_CONF_IS_SET_OFFSET("np", FR_TYPE_UINT8, sigtran_sccp_global_title_t, np) },
-	{ FR_CONF_IS_SET_OFFSET("es", FR_TYPE_UINT8, sigtran_sccp_global_title_t, es) },
+static const conf_parser_t mtp3_config[] = {
+	{ FR_CONF_OFFSET_FLAGS("dpc", CONF_FLAG_REQUIRED, rlm_sigtran_t, conn_conf.mtp3_dpc) },
+	{ FR_CONF_OFFSET_FLAGS("opc", CONF_FLAG_REQUIRED, rlm_sigtran_t, conn_conf.mtp3_opc) },
 
 	CONF_PARSER_TERMINATOR
 };
 
-static const CONF_PARSER sccp_address[] = {
-	{ FR_CONF_IS_SET_OFFSET("pc", FR_TYPE_UINT32, sigtran_sccp_address_t, pc) },
-	{ FR_CONF_IS_SET_OFFSET("ssn", FR_TYPE_UINT8, sigtran_sccp_address_t, ssn) },
-	{ FR_CONF_IS_SET_OFFSET("gt", FR_TYPE_SUBSECTION, sigtran_sccp_address_t, gt), .subcs = (void const *) sccp_global_title },
+static const conf_parser_t sccp_global_title[] = {
+	{ FR_CONF_OFFSET("address", sigtran_sccp_global_title_t, address) },
+	{ FR_CONF_OFFSET_IS_SET("tt", FR_TYPE_UINT8, 0, sigtran_sccp_global_title_t, tt) },
+	{ FR_CONF_OFFSET_IS_SET("nai", FR_TYPE_UINT8, 0, sigtran_sccp_global_title_t, nai) },
+	{ FR_CONF_OFFSET_IS_SET("np", FR_TYPE_UINT8, 0, sigtran_sccp_global_title_t, np) },
+	{ FR_CONF_OFFSET_IS_SET("es", FR_TYPE_UINT8, 0, sigtran_sccp_global_title_t, es) },
 
 	CONF_PARSER_TERMINATOR
 };
 
-static const CONF_PARSER sccp_config[] = {
-	{ FR_CONF_OFFSET("ai8", FR_TYPE_BOOL, rlm_sigtran_t, conn_conf.sccp_ai8) },
-	{ FR_CONF_OFFSET("route_on_ssn", FR_TYPE_BOOL, rlm_sigtran_t, conn_conf.sccp_route_on_ssn) },
-
-	{ FR_CONF_OFFSET("called", FR_TYPE_SUBSECTION, rlm_sigtran_t, conn_conf.sccp_called), .subcs = (void const *) sccp_address },
-	{ FR_CONF_OFFSET("calling", FR_TYPE_SUBSECTION, rlm_sigtran_t, conn_conf.sccp_calling), .subcs = (void const *) sccp_address },
+static const conf_parser_t sccp_address[] = {
+	{ FR_CONF_OFFSET_IS_SET("pc", FR_TYPE_UINT32, 0, sigtran_sccp_address_t, pc) },
+	{ FR_CONF_OFFSET_IS_SET("ssn", FR_TYPE_UINT8, 0, sigtran_sccp_address_t, ssn) },
+	{ FR_CONF_OFFSET_IS_SET("gt", 0, CONF_FLAG_SUBSECTION, sigtran_sccp_address_t, gt), .subcs = (void const *) sccp_global_title },
 
 	CONF_PARSER_TERMINATOR
 };
 
-static const CONF_PARSER map_config[] = {
-	{ FR_CONF_OFFSET("version", FR_TYPE_TMPL, rlm_sigtran_t, conn_conf.map_version), .dflt = "2", .quote = T_BARE_WORD},
+static const conf_parser_t sccp_config[] = {
+	{ FR_CONF_OFFSET("ai8", rlm_sigtran_t, conn_conf.sccp_ai8) },
+	{ FR_CONF_OFFSET("route_on_ssn", rlm_sigtran_t, conn_conf.sccp_route_on_ssn) },
+
+	{ FR_CONF_OFFSET_SUBSECTION("called", 0, rlm_sigtran_t, conn_conf.sccp_called, sccp_address) },
+	{ FR_CONF_OFFSET_SUBSECTION("calling", 0, rlm_sigtran_t, conn_conf.sccp_calling, sccp_address) },
 
 	CONF_PARSER_TERMINATOR
 };
 
-static const CONF_PARSER module_config[] = {
-	{ FR_CONF_POINTER("sctp", FR_TYPE_SUBSECTION, NULL), .subcs = (void const *) sctp_config },
-	{ FR_CONF_POINTER("m3ua", FR_TYPE_SUBSECTION, NULL), .subcs = (void const *) m3ua_config },
-	{ FR_CONF_POINTER("mtp3", FR_TYPE_SUBSECTION, NULL), .subcs = (void const *) mtp3_config },
-	{ FR_CONF_POINTER("sccp", FR_TYPE_SUBSECTION, NULL), .subcs = (void const *) sccp_config },
-	{ FR_CONF_POINTER("map", FR_TYPE_SUBSECTION, NULL), .subcs = (void const *) map_config },
-
-	{ FR_CONF_OFFSET("imsi", FR_TYPE_TMPL | FR_TYPE_REQUIRED, rlm_sigtran_t, imsi) },
+static const conf_parser_t map_config[] = {
+	{ FR_CONF_OFFSET("version", rlm_sigtran_t, conn_conf.map_version), .dflt = "2", .quote = T_BARE_WORD},
 
 	CONF_PARSER_TERMINATOR
 };
 
-/** Signal the multiplexer that this thread is exiting
- *
+static const conf_parser_t module_config[] = {
+	{ FR_CONF_POINTER("sctp", 0, CONF_FLAG_SUBSECTION, NULL), .subcs = (void const *) sctp_config },
+	{ FR_CONF_POINTER("m3ua", 0, CONF_FLAG_SUBSECTION, NULL), .subcs = (void const *) m3ua_config },
+	{ FR_CONF_POINTER("mtp3", 0, CONF_FLAG_SUBSECTION, NULL), .subcs = (void const *) mtp3_config },
+	{ FR_CONF_POINTER("sccp", 0, CONF_FLAG_SUBSECTION, NULL), .subcs = (void const *) sccp_config },
+	{ FR_CONF_POINTER("map", 0, CONF_FLAG_SUBSECTION, NULL), .subcs = (void const *) map_config },
+
+	{ FR_CONF_OFFSET_FLAGS("imsi", CONF_FLAG_REQUIRED, rlm_sigtran_t, imsi) },
+
+	CONF_PARSER_TERMINATOR
+};
+
+fr_dict_t const *dict_eap_aka_sim;
+
+/*
+ *	UMTS vector
  */
-static void _req_pipe_unregister(void *fd_ptr)
+fr_dict_attr_t const *attr_eap_aka_sim_autn;
+fr_dict_attr_t const *attr_eap_aka_sim_ck;
+fr_dict_attr_t const *attr_eap_aka_sim_ik;
+fr_dict_attr_t const *attr_eap_aka_sim_xres;
+
+/*
+ *	GSM vector
+ */
+fr_dict_attr_t const *attr_eap_aka_sim_kc;
+fr_dict_attr_t const *attr_eap_aka_sim_sres;
+
+/*
+ *	Shared
+ */
+fr_dict_attr_t const *attr_eap_aka_sim_rand;
+
+extern fr_dict_autoload_t rlm_sigtran_dict[];
+fr_dict_autoload_t rlm_sigtran_dict[] = {
+	{ .out = &dict_eap_aka_sim, .base_dir = "eap/aka-sim", .proto = "eap-aka-sim" },
+	{ NULL }
+};
+
+fr_dict_attr_t const *attr_auth_type;
+
+extern fr_dict_attr_autoload_t rlm_sigtran_dict_attr[];
+fr_dict_attr_autoload_t rlm_sigtran_dict_attr[] = {
+	{ .out = &attr_eap_aka_sim_autn, .name = "AUTN", .type = FR_TYPE_OCTETS, .dict = &dict_eap_aka_sim },
+	{ .out = &attr_eap_aka_sim_ck, .name = "CK", .type = FR_TYPE_OCTETS, .dict = &dict_eap_aka_sim },
+	{ .out = &attr_eap_aka_sim_ik, .name = "IK", .type = FR_TYPE_OCTETS, .dict = &dict_eap_aka_sim },
+	{ .out = &attr_eap_aka_sim_kc, .name = "KC", .type = FR_TYPE_OCTETS, .dict = &dict_eap_aka_sim },
+	{ .out = &attr_eap_aka_sim_rand, .name = "RAND", .type = FR_TYPE_OCTETS, .dict = &dict_eap_aka_sim },
+	{ .out = &attr_eap_aka_sim_sres, .name = "SRES", .type = FR_TYPE_OCTETS, .dict = &dict_eap_aka_sim },
+	{ .out = &attr_eap_aka_sim_xres, .name = "XRES", .type = FR_TYPE_OCTETS, .dict = &dict_eap_aka_sim },
+
+	{ NULL }
+};
+
+static unlang_action_t CC_HINT(nonnull) mod_authorize(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request)
 {
-	int fd = *talloc_get_type_abort(fd_ptr, int);
+	rlm_sigtran_t const		*inst = talloc_get_type_abort_const(mctx->mi->data, rlm_sigtran_t);
+	rlm_sigtran_thread_t const	*t = talloc_get_type_abort_const(mctx->thread, rlm_sigtran_thread_t);
 
-	sigtran_client_thread_unregister(fd);	/* Also closes our side */
+	return sigtran_client_map_send_auth_info(p_result, inst, request, inst->conn, t->fd);
 }
-
-static rlm_rcode_t CC_HINT(nonnull) mod_authorize(void *instance, UNUSED void *thread, REQUEST *request)
-{
-	rlm_sigtran_t const	*inst = instance;
-	int			*fd_ptr, fd;
-
-	/*
-	 *	Retrieve the thread specific pipe we use
-	 *	to communicate with the multiplexer.
-	 */
-	fd_ptr = req_pipe;
-	if (!fd_ptr) {
-		fd_ptr = talloc(NULL, int);
-		fd = sigtran_client_thread_register();
-		if (fd < 0) {
-			RERROR("Failed registering thread with multiplexer");
-			talloc_free(fd_ptr);
-			return RLM_MODULE_FAIL;
-		}
-		*fd_ptr = fd;
-		fr_thread_local_set_destructor(req_pipe, _req_pipe_unregister, fd_ptr);
-	} else {
-		fd = *fd_ptr;
-	}
-
-	return sigtran_client_map_send_auth_info(inst, request, inst->conn, fd);
-}
-
 
 /** Convert our sccp address config structure into sockaddr_sccp
  *
  * @param ctx to allocated address in.
- * @param inst of rlm_sigtran.
  * @param out Where to write the parsed data.
  * @param conf to parse.
  * @param cs specifying sccp address.
@@ -205,7 +215,7 @@ static rlm_rcode_t CC_HINT(nonnull) mod_authorize(void *instance, UNUSED void *t
  *	- 0 on success.
  *	- -1 on failure.
  */
-static int sigtran_sccp_sockaddr_from_conf(TALLOC_CTX *ctx, rlm_sigtran_t *inst,
+static int sigtran_sccp_sockaddr_from_conf(TALLOC_CTX *ctx,
 					   struct sockaddr_sccp *out,
 					   sigtran_sccp_address_t *conf, CONF_SECTION *cs)
 {
@@ -288,33 +298,50 @@ static int sigtran_sccp_sockaddr_from_conf(TALLOC_CTX *ctx, rlm_sigtran_t *inst,
 		/*
 		 *	Print out the constructed global title blob.
 		 */
-		if (DEBUG_ENABLED4) {
-			char *hex;
-
-			hex = fr_abin2hex(ctx, out->gti_data, out->gti_len);
-			DEBUG4("gt_ind: 0x%x", out->gti_ind);
-			DEBUG4("digits: 0x%s (%i)", hex, out->gti_len);
-			talloc_free(hex);
-		}
+		DEBUG4("gt_ind: 0x%x", out->gti_ind);
+		DEBUG4("digits: 0x%pH (%i)", fr_box_octets(out->gti_data, out->gti_len), out->gti_len);
 	}
 	return 0;
 }
 
-static int mod_instantiate(void *instance, CONF_SECTION *conf)
+static int mod_thread_instantiate(module_thread_inst_ctx_t const *mctx)
 {
-	rlm_sigtran_t *inst = instance;
+	rlm_sigtran_thread_t	*t = talloc_get_type_abort(mctx->thread, rlm_sigtran_thread_t);
+	int			fd;
 
-	inst->name = cf_section_name2(conf);
-	if (!inst->name) inst->name = cf_section_name1(conf);
+	fd = sigtran_client_thread_register(mctx->el);
+	if (fd < 0) {
+		ERROR("Failed registering thread with multiplexer");
+		return -1;
+	}
+
+	t->fd = fd;
+
+	return 0;
+}
+
+static int mod_thread_detach(module_thread_inst_ctx_t const *mctx)
+{
+	rlm_sigtran_thread_t	*t = talloc_get_type_abort(mctx->thread, rlm_sigtran_thread_t);
+
+	sigtran_client_thread_unregister(mctx->el, t->fd);	/* Also closes our side */
+
+	return 0;
+}
+
+static int mod_instantiate(module_inst_ctx_t const *mctx)
+{
+	rlm_sigtran_t *inst = talloc_get_type_abort(mctx->mi->data, rlm_sigtran_t);
+	CONF_SECTION const *conf = mctx->mi->conf;
 
 	/*
 	 *	Translate traffic mode string to integer
 	 */
-	inst->conn_conf.m3ua_traffic_mode = fr_str2int(m3ua_traffic_mode_table,
+	inst->conn_conf.m3ua_traffic_mode = fr_table_value_by_str(m3ua_traffic_mode_table,
 						       inst->conn_conf.m3ua_traffic_mode_str, -1);
 	if (inst->conn_conf.m3ua_traffic_mode < 0) {
 		cf_log_err(conf, "Invalid 'm3ua_traffic_mode' value \"%s\", expected 'override', "
-			      "'loadshare' or 'broadcast'", inst->conn_conf.m3ua_traffic_mode_str);
+			   "'loadshare' or 'broadcast'", inst->conn_conf.m3ua_traffic_mode_str);
 		return -1;
 	}
 
@@ -331,10 +358,16 @@ static int mod_instantiate(void *instance, CONF_SECTION *conf)
 	MTP3_PC_CHECK(dpc);
 	MTP3_PC_CHECK(opc);
 
-	if (sigtran_sccp_sockaddr_from_conf(inst, inst, &inst->conn_conf.sccp_called_sockaddr,
+	if (sigtran_sccp_sockaddr_from_conf(inst, &inst->conn_conf.sccp_called_sockaddr,
 					    &inst->conn_conf.sccp_called, conf) < 0) return -1;
-	if (sigtran_sccp_sockaddr_from_conf(inst, inst, &inst->conn_conf.sccp_calling_sockaddr,
+	if (sigtran_sccp_sockaddr_from_conf(inst, &inst->conn_conf.sccp_calling_sockaddr,
 					    &inst->conn_conf.sccp_calling, conf) < 0) return -1;
+
+	/*
+	 *	Don't bother starting the sigtran thread if we're
+	 *	just checking the config.
+	 */
+	if (check_config) return 0;
 
 	/*
 	 *	If this is the first instance of rlm_sigtran
@@ -362,9 +395,15 @@ static int mod_instantiate(void *instance, CONF_SECTION *conf)
 /**
  * Cleanup internal state.
  */
-static int mod_detach(UNUSED void *instance)
+static int mod_detach(module_detach_ctx_t const *mctx)
 {
-	rlm_sigtran_t *inst = instance;
+	rlm_sigtran_t *inst = talloc_get_type_abort(mctx->mi->data, rlm_sigtran_t);
+
+	/*
+	 *	If we're just checking the config we didn't start the
+	 *	thread.
+	 */
+	if (check_config) return 0;
 
 	sigtran_client_link_down(&inst->conn);
 
@@ -378,20 +417,27 @@ static int mod_detach(UNUSED void *instance)
  *	That is, everything else should be 'static'.
  *
  *	If the module needs to temporarily modify it's instantiation
- *	data, the type should be changed to RLM_TYPE_THREAD_UNSAFE.
+ *	data, the type should be changed to MODULE_TYPE_THREAD_UNSAFE.
  *	The server will then take care of ensuring that the module
  *	is single-threaded.
  */
-extern rad_module_t rlm_sigtran;
-rad_module_t rlm_sigtran = {
-	.magic		= RLM_MODULE_INIT,
-	.name		= "sigtran",
-	.type		= RLM_TYPE_THREAD_SAFE,
-	.inst_size	= sizeof(rlm_sigtran_t),
-	.config		= module_config,
-	.instantiate	= mod_instantiate,
-	.detach		= mod_detach,
-	.methods = {
-		[MOD_AUTHORIZE]		= mod_authorize,
+extern module_rlm_t rlm_sigtran;
+module_rlm_t rlm_sigtran = {
+	.common = {
+		.magic			= MODULE_MAGIC_INIT,
+		.name			= "sigtran",
+		.inst_size		= sizeof(rlm_sigtran_t),
+		.thread_inst_size	= sizeof(rlm_sigtran_thread_t),
+		.config			= module_config,
+		.instantiate		= mod_instantiate,
+		.detach			= mod_detach,
+		.thread_instantiate	= mod_thread_instantiate,
+		.thread_detach		= mod_thread_detach
+	},
+	.method_group = {
+		.bindings = (module_method_binding_t[]){
+			{ .section = SECTION_NAME(CF_IDENT_ANY, CF_IDENT_ANY), .method = mod_authorize },
+			MODULE_BINDING_TERMINATOR
+		}
 	}
 };

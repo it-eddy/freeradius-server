@@ -1,9 +1,9 @@
-TARGET		:= trie
+TARGET		:= trie$(E)
 
-SRC_CFLAGS	:= -DTESTING
+SRC_CFLAGS	:= -DTESTING -DWITH_PATH_COMPRESSION
 SOURCES		:= trie.c
 TGT_LDLIBS	:= $(LIBS)
-TGT_PREREQS	:= libfreeradius-util.a
+TGT_PREREQS	:= libfreeradius-util$(L)
 
 #
 #  The build system maps one source file to one object file.  So in
@@ -14,4 +14,7 @@ TGT_PREREQS	:= libfreeradius-util.a
 #  definitions in the trie library.
 #
 src/tests/trie/trie.c: ${top_srcdir}/src/lib/util/trie.c
-	@[-e $@ ] || ln -s $^ $(dir $@)
+	@[ -e $@ ] || ln -s $^ $(dir $@)
+
+${top_srcdir}/src/tests/trie/trie.c: ${top_srcdir}/src/lib/util/trie.c
+	@[ -e $@ ] || ln -s $^ $(dir $@)

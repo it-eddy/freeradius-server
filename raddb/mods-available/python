@@ -1,56 +1,67 @@
+#  -*- text -*-
 #
-#  Uncomment any func_* which are included in your module. If
-#  rlm_python is called for a section which does not have
-#  a function defined, it will return NOOP.
 #
-#  threading.local() may be used store thread specific data such
-#  as connection handles.
+#  $Id$
+
+#######################################################################
+#
+#  = Python Module
+#
+#  The `python` module processes attributes through a Python interpreter.
+#
+#  * Please see the `src/modules/rlm_python/example.py` sample.
+#  * Please see https://www.python.org/doc/ for more information about the
+#  Python language.
+#
+#  NOTE: Uncomment any `func_*` configuration items below which are
+#  included in your module. If the module is called for a section which
+#  does not have a function defined, it will return `noop`.
+#
+#  Please see the file global.d/python for server-global configuration
+#  items which control the Python path.
+#
+
+#
+#  [NOTE]
+#  ====
+#  See `raddb/global.d/python` for configuration items that affect the
+#  python interpreter globally, such as the Python path.
+#  ====
+#
+
+#
+#  ## Configuration Settings
+#
+#  The Python API `threading.local()` may be used store thread
+#  specific data such as connection handles.
 #
 python {
-    #
-    #  Module to load functions from.
-    #
+	#
+	#  module::
+	#
+	#  Module to load functions from.
+	#
 	module = example
 
 	#
-	#  Uncomment the following line (and set to true) if you need
-	#  to call Python C extensions that acquire the GIL.
+	#  [NOTE]
+	#  ====
+	#  * You may set `mod_<section>` for any of the section to module
+	#  mappings below, if you want to reference a function in a  different
+	#  module.
 	#
-	#  This will use the first Python interpreter (not a subinterpreter)
-	#  to provide the execution environment for this module instance.
+	#  * Uncomment `func_<section>` lines your module provides methods for.
+	#  ====
 	#
-	#  The tradeoff is, that any module instance with cext_compat = true,
-	#  will share the same environment, and will use the same user
-	#  configurable configuration items, and python_path, as the first
-	#  instance of rlm_python to be loaded with cext_compat enabled.
+
 	#
-	#  Not all Python functions use the GIL as it prevents parallel
-	#  execution.  A good indication of whether cext_compat is needed
-	#  is whether your script locks up or crashes when calling a
-	#  python C extension.
+	#  func_instantiate:: Called on module instantiation.
 	#
-#	cext_compat = false
-
-    #
-    #  Search path for Python modules, must include the path to your
-    #  python module.
-    #
-#	python_path = ${modconfdir}/${.:name}
-
-    #
-    #  You may set mod_<section> for any of the section to module
-    #  mappings below, if you want to reference a function in a
-    #  different module.
-    #
-
-    #
-    #  Uncomment func_<section> lines your module provides methods for.
-    #
-
-    # Called on module instantiation.
 #	func_instantiate = instantiate
 
-    # Called on module unload
+	#
+	#  func_detach:: Called on module unload.
+	#
 #	func_detach = detach
 
 #	func_authorize = authorize
@@ -60,19 +71,26 @@ python {
 #	func_pre_proxy = pre_proxy
 #	func_post_proxy = post_proxy
 #	func_post_auth = post_auth
-#	func_recv_coa = recv_coa
-#	func_send_coa = send_coa
 
-    #
-	#  You can define configuration items (and nested sub-sections) in
-	#  python "config" section. These items will be accessible in the python
-	#  script through radiusd.config dict For instance: radiusd.config['name'],
-	#  radiusd.config['sub-config']['name']
 	#
-#   config {
-#	    name = "value"
-#	    sub-config {
-#		    name = "value of name from config.sub-config"
-#	    }
-#   }
+	#  config { ... }::
+	#
+	#  You can define configuration items (and nested sub-sections) in python `config { ... }`
+	#  section. These items will be accessible in the Python script through `radiusd.config`
+	#  dict for instance:
+	#
+	#  e.g:
+	#
+	#  [source,python]
+	#  ----
+	#  radiusd.config['name']
+	#  radiusd.config['sub-config']['name']
+	#  ----
+	#
+#	config {
+#		name = "value"
+#		sub-config {
+#			name = "value of name from config.sub-config"
+#		}
+#	}
 }

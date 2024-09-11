@@ -1,9 +1,4 @@
 /*
- * missing.c	Replacements for functions that are or can be
- *		missing on some platforms.
- *
- * Version:	$Id$
- *
  *   This library is free software; you can redistribute it and/or
  *   modify it under the terms of the GNU Lesser General Public
  *   License as published by the Free Software Foundation; either
@@ -17,26 +12,24 @@
  *   You should have received a copy of the GNU Lesser General Public
  *   License along with this library; if not, write to the Free Software
  *   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
- *
- * Copyright 2000,2006  The FreeRADIUS server project
  */
 
+/** Replacements for functions that are or can be missing on some platforms
+ *
+ * @file src/lib/util/missing.c
+ *
+ * @copyright 2000,2006 The FreeRADIUS server project
+ */
 RCSID("$Id$")
 
-#include <freeradius-devel/libradius.h>
-#include <pthread.h>
+#include <freeradius-devel/missing.h>
+
 #include <ctype.h>
+#include <pthread.h>
+#include <stdbool.h>
 
 #if !defined(HAVE_CLOCK_GETTIME) && defined(__MACH__)
 #  include <mach/mach_time.h>
-#endif
-
-#ifndef HAVE_CRYPT
-char *crypt(UNUSED char *key, char *salt)
-{
-	/*log(L_ERR, "crypt() called but not implemented");*/
-	return salt;
-}
 #endif
 
 #ifndef HAVE_STRNCASECMP
@@ -79,6 +72,24 @@ int strcasecmp(char *s1, char *s2)
 	if (l2 > l1) l1 = l2;
 
 	return strncasecmp(s1, s2, l1);
+}
+#endif
+
+
+#ifndef HAVE_MEMRCHR
+/** GNU libc extension on some platforms
+ *
+ */
+void *memrchr(void const *s, int c, size_t n)
+{
+	uint8_t *p;
+
+	if (n == 0) return NULL;
+
+	memcpy(&p, &s, sizeof(p));	/* defeat const */
+	for (p += (n - 1); p >= (uint8_t const *)s; p--) if (*p == (uint8_t)c) return (void *)p;
+
+	return NULL;
 }
 #endif
 
@@ -218,47 +229,6 @@ int vdprintf (int fd, char const *format, va_list args)
 }
 #endif
 
-#ifndef HAVE_GETTIMEOFDAY
-#ifdef WIN32
-/*
- * Number of micro-seconds between the beginning of the Windows epoch
- * (Jan. 1, 1601) and the Unix epoch (Jan. 1, 1970).
- *
- * This assumes all Win32 compilers have 64-bit support.
- */
-#if defined(_MSC_VER) || defined(_MSC_EXTENSIONS) || defined(__WATCOMC__)
-#define DELTA_EPOCH_IN_USEC  11644473600000000Ui64
-#else
-#define DELTA_EPOCH_IN_USEC  11644473600000000ULL
-#endif
-
-static uint64_t filetime_to_unix_epoch (FILETIME const *ft)
-{
-	uint64_t res = (uint64_t) ft->dwHighDateTime << 32;
-
-	res |= ft->dwLowDateTime;
-	res /= 10;		   /* from 100 nano-sec periods to usec */
-	res -= DELTA_EPOCH_IN_USEC;  /* from Win epoch to Unix epoch */
-	return (res);
-}
-
-int gettimeofday (struct timeval *tv, UNUSED void *tz)
-{
-	FILETIME  ft;
-	uint64_t tim;
-
-	if (!tv) {
-		errno = EINVAL;
-		return (-1);
-	}
-	GetSystemTimeAsFileTime (&ft);
-	tim = filetime_to_unix_epoch (&ft);
-	tv->tv_sec  = (long) (tim / 1000000L);
-	tv->tv_usec = (long) (tim % 1000000L);
-	return (0);
-}
-#endif
-#endif
 
 #if !defined(HAVE_CLOCK_GETTIME) && defined(__MACH__)
 int clock_gettime(int clk_id, struct timespec *t)
@@ -285,10 +255,10 @@ int clock_gettime(int clk_id, struct timespec *t)
 	{
 		uint64_t time;
 		time = mach_absolute_time();
-		double nseconds = ((double)time * (double)timebase.numer)/((double)timebase.denom);
+		double nanoseconds = ((double)time * (double)timebase.numer)/((double)timebase.denom);
 		double seconds = ((double)time * (double)timebase.numer)/((double)timebase.denom * 1e9);
 		t->tv_sec = seconds;
-		t->tv_nsec = nseconds;
+		t->tv_nsec = nanoseconds;
 	}
 		return 0;
 
@@ -296,65 +266,6 @@ int clock_gettime(int clk_id, struct timespec *t)
 		errno = EINVAL;
 		return -1;
 	}
-}
-#endif
-
-#define NTP_EPOCH_OFFSET	2208988800ULL
-
-/*
- *	Convert 'struct timeval' into NTP format (32-bit integer
- *	of seconds, 32-bit integer of fractional seconds)
- */
-void
-timeval2ntp(struct timeval const *tv, uint8_t *ntp)
-{
-	uint32_t sec, usec;
-
-	sec = tv->tv_sec + NTP_EPOCH_OFFSET;
-	usec = tv->tv_usec * 4295; /* close enough to 2^32 / USEC */
-	usec -= ((tv->tv_usec * 2143) >> 16); /*  */
-
-	sec = htonl(sec);
-	usec = htonl(usec);
-
-	memcpy(ntp, &sec, sizeof(sec));
-	memcpy(ntp + sizeof(sec), &usec, sizeof(usec));
-}
-
-/*
- *	Inverse of timeval2ntp
- */
-void
-ntp2timeval(struct timeval *tv, char const *ntp)
-{
-	uint32_t sec, usec;
-
-	memcpy(&sec, ntp, sizeof(sec));
-	memcpy(&usec, ntp + sizeof(sec), sizeof(usec));
-
-	sec = ntohl(sec);
-	usec = ntohl(usec);
-
-	tv->tv_sec = sec - NTP_EPOCH_OFFSET;
-	tv->tv_usec = usec / 4295; /* close enough */
-}
-
-#if !defined(HAVE_128BIT_INTEGERS) && !defined(WORDS_BIGENDIAN)
-/** Swap byte order of 128 bit integer
- *
- * @param num 128bit integer to swap.
- * @return 128bit integer reversed.
- */
-uint128_t ntohlll(uint128_t const num)
-{
-	uint64_t const *p = (uint64_t const *) &num;
-	uint64_t ret[2];
-
-	/* swapsies */
-	ret[1] = ntohll(p[0]);
-	ret[0] = ntohll(p[1]);
-
-	return *(uint128_t *)ret;
 }
 #endif
 
@@ -552,14 +463,14 @@ char const *inet_ntop(int af, void const *src, char *dst, size_t cnt)
 		if (cnt <= INET6_ADDRSTRLEN) return NULL;
 
 		snprintf(dst, cnt, "%x:%x:%x:%x:%x:%x:%x:%x",
-			 (ipaddr->s6_addr[0] << 8) | ipaddr->s6_addr[1],
-			 (ipaddr->s6_addr[2] << 8) | ipaddr->s6_addr[3],
-			 (ipaddr->s6_addr[4] << 8) | ipaddr->s6_addr[5],
-			 (ipaddr->s6_addr[6] << 8) | ipaddr->s6_addr[7],
-			 (ipaddr->s6_addr[8] << 8) | ipaddr->s6_addr[9],
-			 (ipaddr->s6_addr[10] << 8) | ipaddr->s6_addr[11],
-			 (ipaddr->s6_addr[12] << 8) | ipaddr->s6_addr[13],
-			 (ipaddr->s6_addr[14] << 8) | ipaddr->s6_addr[15]);
+			 fr_nbo_to_uint16(ipaddr->a6_addr),
+			 fr_nbo_to_uint16(ipaddr->a6_addr + 2),
+			 fr_nbo_to_uint16(ipaddr->a6_addr + 4),
+			 fr_nbo_to_uint16(ipaddr->a6_addr + 6),
+			 fr_nbo_to_uint16(ipaddr->a6_addr + 8),
+			 fr_nbo_to_uint16(ipaddr->a6_addr + 10),
+			 fr_nbo_to_uint16(ipaddr->a6_addr + 12),
+			 fr_nbo_to_uint16(ipaddr->a6_addr + 14));
 		return dst;
 	}
 
@@ -567,3 +478,167 @@ char const *inet_ntop(int af, void const *src, char *dst, size_t cnt)
 }
 #endif
 
+#ifndef HAVE_SENDMMSG
+/** Emulates the real sendmmsg in userland
+ *
+ * The idea behind the proper sendmmsg in FreeBSD and Linux is that multiple
+ * datagram messages can be sent using a single system call.
+ *
+ * This function doesn't achieve that, but it does reduce ifdefs elsewhere
+ * and means we can batch encoding/sending operations.
+ *
+ * @param[in] sockfd	to write packets to.
+ * @param[in] msgvec	a pointer to an array of mmsghdr structures.
+ *			The size of this array is specified in vlen.
+ * @param[in] vlen	Length of msgvec.
+ * @param[in] flags	same as for sendmsg(2).
+ * @return
+ *	- >= 0 The number of messages sent.  Check against vlen to determine
+ *	  if overall operation was successful.
+ *	- < 0 on error.  Only returned if first operation errors.
+ */
+int sendmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags)
+{
+	unsigned int i;
+
+	for (i = 0; i < vlen; i++) {
+     		ssize_t slen;
+
+		slen = sendmsg(sockfd, &msgvec[i].msg_hdr, flags);
+		if (slen < 0) {
+			msgvec[i].msg_len = 0;
+
+			/*
+			 * man sendmmsg - Errors are as for sendmsg(2).
+			 * An error is returned only if no datagrams could
+			 * be sent.  See also BUGS.
+			 */
+			if (i == 0) return -1;
+			return i;
+		}
+		msgvec[i].msg_len = (unsigned int)slen;	/* Number of bytes sent */
+	}
+
+	return i;
+}
+#endif
+
+/*
+ *	So we don't have ifdef's in the rest of the code
+ */
+#ifndef HAVE_CLOSEFROM
+ #include <stdlib.h>
+#ifdef HAVE_DIRENT_H
+#  include <dirent.h>
+/*
+ *	Some versions of Linux don't have closefrom(), but they will
+ *	have /proc.
+ *
+ *	BSD systems will generally have closefrom(), but not proc.
+ *
+ *	OSX doesn't have closefrom() or /proc/self/fd, but it does
+ *	have /dev/fd
+ */
+#  ifdef __linux__
+#    define CLOSEFROM_DIR "/proc/self/fd"
+#  elif defined(__APPLE__)
+#    define CLOSEFROM_DIR "/dev/fd"
+#  else
+#    undef HAVE_DIRENT_H
+#  endif
+#endif
+
+void closefrom(int fd)
+{
+	int i;
+	int maxfd = 256;
+#  ifdef HAVE_DIRENT_H
+	DIR *dir;
+#  endif
+
+#ifdef F_CLOSEM
+	if (fcntl(fd, F_CLOSEM) == 0) return;
+#  endif
+
+#  ifdef F_MAXFD
+	maxfd = fcntl(fd, F_F_MAXFD);
+	if (maxfd >= 0) goto do_close;
+#  endif
+
+#  ifdef _SC_OPEN_MAX
+	maxfd = sysconf(_SC_OPEN_MAX);
+	if (maxfd < 0) {
+		maxfd = 256;
+	}
+#  endif
+
+#  ifdef HAVE_DIRENT_H
+	/*
+	 *	Use /proc/self/fd directory if it exists.
+	 */
+	dir = opendir(CLOSEFROM_DIR);
+	if (dir != NULL) {
+		long my_fd;
+		char *endp;
+		struct dirent *dp;
+
+		while ((dp = readdir(dir)) != NULL) {
+			my_fd = strtol(dp->d_name, &endp, 10);
+			if (my_fd <= 0) continue;
+
+			if (*endp) continue;
+
+			if (my_fd == dirfd(dir)) continue;
+
+			if ((my_fd >= fd) && (my_fd <= maxfd)) {
+				(void) close((int) my_fd);
+			}
+		}
+		(void) closedir(dir);
+		return;
+	}
+#  endif
+
+#  ifdef F_MAXFD
+do_close:
+#  endif
+
+	if (fd > maxfd) return;
+
+	/*
+	 *	FIXME: return EINTR?
+	 */
+	for (i = fd; i < maxfd; i++) {
+		close(i);
+	}
+
+	return;
+}
+#endif
+
+#ifndef HAVE_MEMSET_EXPLICIT
+void *memset_explicit(void *ptr,
+#ifdef HAVE_EXPLICIT_BZERO
+		      UNUSED
+#endif
+		      int ch,
+		      size_t len)
+{
+	if (!len) return ptr;
+
+#ifdef HAVE_EXPLICIT_BZERO
+	explicit_bzero(ptr, len);
+#else
+	{
+		volatile unsigned char *volatile p =  (volatile unsigned char *volatile) ptr;
+		size_t i = len;
+
+		while (i--) {
+			*(p++) = ch;
+		}
+	}
+#endif
+
+	return ptr;
+}
+#endif

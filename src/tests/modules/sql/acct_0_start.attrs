@@ -1,6 +1,7 @@
 #
 #  Input packet
 #
+Packet-Type = Access-Request
 User-Name = 'user0@example.org'
 NAS-Port = 17826193
 NAS-IP-Address = 192.0.2.10
@@ -21,12 +22,12 @@ Acct-Output-Gigawords = 0
 Event-Timestamp = 'Feb  1 2015 08:28:58 WIB'
 NAS-Port-Type = Ethernet
 NAS-Port-Id = 'port 001'
-Service-Type = Framed-User
+Service-Type = ::Framed-User
 Framed-Protocol = PPP
 Acct-Link-Count = 0
 Idle-Timeout = 0
 Session-Timeout = 604800
-Access-Loop-Encapsulation = 0x000000
+Vendor-Specific.ADSL-Forum.Access-Loop-Encapsulation = 0x000000
 Proxy-State = 0x323531
 
 #
@@ -34,4 +35,5 @@ Proxy-State = 0x323531
 #
 #  There's not an Accounting-Failed packet type in RADIUS...
 #
-Response-Packet-Type == Access-Accept
+Packet-Type == Access-Accept
+Proxy-State == 0x323531

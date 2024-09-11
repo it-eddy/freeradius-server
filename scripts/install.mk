@@ -53,6 +53,23 @@ define ADD_INSTALL_RULE.exe
 
 endef
 
+# ADD_INSTALL_RULE.bin - Parameterized "function" that adds a new rule
+#   and phony target for installing an executable into the "bin" directory
+#
+#   USE WITH EVAL
+#
+define ADD_INSTALL_RULE.bin
+    ALL_INSTALL += ${R}${bindir}/$(notdir ${1})
+
+    # Global install depends on ${1}
+    install: ${R}${bindir}/$(notdir ${1})
+
+    # Install executable ${1}
+    ${R}${bindir}/$(notdir ${1}): ${1} | ${R}${bindir}/
+	@$(ECHO) INSTALL $(notdir ${1})
+	$(Q)$${PROGRAM_INSTALL} -c -m 755 ${1} ${R}${bindir}/
+endef
+
 # ADD_INSTALL_RULE.a - Parameterized "function" that adds a new rule
 #   and phony target for installing a static library
 #
@@ -113,9 +130,75 @@ define ADD_INSTALL_RULE.man
 
 endef
 
+# ADD_INSTALL_RULE.file - Parameterized "function" that adds a new rule
+#   and phony target for installing a file.
+#
+#   ${1} = file to install
+#   ${2} = destination where it is installed
+#
+#   USE WITH EVAL
+#
+define ADD_INSTALL_RULE.file
+    ALL_INSTALL += ${2}
+
+    # Global install depends on the installed file
+    install: ${2}
+
+    # Install the file
+    ${2}: ${1} | $(patsubst %/,%,$(dir ${2}))
+	@$(ECHO) INSTALL ${1}
+	$(Q)$${PROGRAM_INSTALL} -c -m 644 ${1} ${2}
+
+endef
+
+
+# ADD_INSTALL_RULE.h - Parameterized "function" that adds a new rule
+#   and phony target for installing a header file.
+#
+#  Note that we re-write the header files to get rid of
+#  "freeradius-devel" and replace it with "freeradius"
+#
+#  install-sh function for creating directories gets confused
+#  if there's a trailing slash, tries to create a directory
+#  it already created, and fails...
+#
+# ${1} = filename where it will be installed
+# ${2} = filename in the source
+#
+#  Because things in .../src/lib/io/foo.h go into .../io/foo.h
+#
+#  For 'sed', the expression must deal with indentation after the hash
+#  and copy it to the substitution string.  The hash is not anchored
+#  in order to allow substitution in function documentation.
+#
+#   USE WITH EVAL
+#
+define ADD_INSTALL_RULE.h
+    ALL_INSTALL += $(DESTDIR)/${includedir}/${PROJECT_NAME}/${1}
+
+    install: $(DESTDIR)/${includedir}/${PROJECT_NAME}/${1}
+
+    $(DESTDIR)/${includedir}/${PROJECT_NAME}/${1}: ${2}
+	${Q}echo INSTALL ${1}
+	${Q}$(INSTALL) -d -m 755 `echo $$(dir $$@) | sed 's/\/$$$$//'`
+	${Q}sed -e 's/#\([\\t ]*\)include <${PROJECT_NAME}-devel\/\([^>]*\)>/#\1include <${PROJECT_NAME}\/\2>/g' < $$< > $$@
+	${Q}chmod 644 $$@
+endef
 
 # ADD_INSTALL_RULE.dir - Parameterized "function" that adds a new rule
 #   and phony target for installing a directory
+#
+#   We would like to have this directory have an order dependency on it's parent:
+#
+#	| $(dir $(patsubst %/,%,$(dir ${1})))
+#
+#  but ONLY to the root of the directory we're installing.  There's no simple way
+#  to get at that information right now, so we'll ignore it.  Until that's fixed,
+#  doing "make -j 14 install.doc" will get a series of complaints about
+#
+#	"mkdir: foo: File exists"
+#
+#  but ONLY once for each directory.
 #
 #   USE WITH EVAL
 #
@@ -147,7 +230,7 @@ define ADD_INSTALL_TARGET
 
     # add rules to install the target
     ifneq "$${TGT_INSTALLDIR}" ""
-        ${1}_INSTALLDIR := ${LL}$${DESTDIR}$${TGT_INSTALLDIR}
+        ${1}_INSTALLDIR := $${DESTDIR}$${TGT_INSTALLDIR}
 
         $$(eval $$(call ADD_INSTALL_RULE$${${1}_SUFFIX},${1}))
     endif
@@ -205,15 +288,13 @@ ifeq "${mandir}" ""
     mandir = ${datadir}/man
 endif
 ifeq "${docdir}" ""
-    ifneq "${PROJECT_NAME}" ""
-        docdir = ${datadir}/doc/${PROJECT_NAME}
-    endif
+    docdir = ${datadir}/doc/${PROJECT_NAME}
 endif
 ifeq "${logdir}" ""
     logdir = ${localstatedir}/log/
 endif
 ifeq "${includedir}" ""
-    includedir = ${prefix}/include
+    includedir = ${prefix}/include/${PROJECT_NAME}
 endif
 
 

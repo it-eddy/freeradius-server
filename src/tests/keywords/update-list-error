@@ -5,15 +5,13 @@
 #
 update {
 	request := reply
-	config += request
+	control += request
 	reply !* ANY
 }
 
 update {
-       reply += `/path/to/foo bar baz`
-}
-
-
-update {
 	request := nope		# ERROR
 }
+
+request += { User-Password = 'hello' }
+success

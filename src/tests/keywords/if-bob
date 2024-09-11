@@ -6,8 +6,6 @@ if (User-Name == "bob") {
 	success
 }
 
-if (User-Name != "bob") {
-	update reply {
-		Filter-Id := "not bob"
-	}
+if (!(User-Name == "bob")) {
+	test_fail
 }

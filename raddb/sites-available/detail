@@ -1,4 +1,4 @@
-# -*- text -*-
+#  -*- text -*-
 ######################################################################
 #
 #	This virtual server gives an example of reading the detail
@@ -7,37 +7,43 @@
 #	$Id$
 #
 ######################################################################
-virtual_server detail {
+server detail {
 	#
 	#  In v4, all "server" sections MUST start with a "namespace"
 	#  parameter.  This tells the server which protocol is being used.
 	#
-	#  All of the subsequent "listen" sections in this server will
-	#  only accept packets for that protocol.
+	#  RADIUS, or DHCPv4, or any other protocol supported by the server.
 	#
-	namespace = detail
+	namespace = radius
 
-	listen {
+	#
+	#  This virtual server will read detail files from the
+	#  following directory.
+	#
+	directory = ${radacctdir}/detail
+
+	#
+	#  The "listen" section MUST have a second name here, which
+	#  says "load the detail file processor, and not the typical
+	#  RADIUS UDP / TCP socket IO.
+	#
+	listen detail {
 		#
-		#  The packet types are NOT in the detail file,
-		#  so they need to be listed here.
+		#  Overrides the default transport prefix set by
+		#  namespace and loads the detail reader code.
 		#
-		#  Supported types are:
+		proto = detail
+
 		#
-		#  Accounting-Request
-		#  CoA-Request
-		#  Disconnect-Request
+		#  Types of packets we are reading.
 		#
 		type = Accounting-Request
 
 		#
-		#  What transports are being used to read detail
-		#  files.  For now, only "file" is supported.
+		#  There is no need to specify a transport.
+		#  The default is `file`, which is the only
+		#  one supported.
 		#
-		#  Future releases will allow reading "detail"
-		#  style information from sockets or streams.
-		#
-		transport = file
 
 		#
 		#  Unlike v3, there is no "load_factor" configuration.
@@ -47,7 +53,17 @@ virtual_server detail {
 		#  soon as it gets a response to that entry, the
 		#  listener reads a second entry.
 		#
-		#  
+		#  Packets from the detail listener are low priority,
+		#  so they are processed only when there is nothing
+		#  else to do.  i.e. if the server receives many
+		#  Access-Request or Accounting-Request packets from
+		#  the network, they will be processed *before* any
+		#  packets from the detail file.
+		#
+		#  This behavior ensures that the detail file is read
+		#  as fast as possible.  At the same time, it ensures
+		#  that the detail file does not affect higher
+		#  priority packets from the network.
 		#
 
 		#
@@ -83,19 +99,46 @@ virtual_server detail {
 #		priority = 1
 
 		#
-		#  Read from a "file".
+		#  Check for the existence of detail files.
+		#
+		#  You MUST also configure a "work" subsection below.
 		#
 		file {
 			#
 			#  The wildcard to use for finding detail files
 			#
-			filename = "${confdir}/detail-*"
+			filename = "${...directory}/detail-*"
 
 			#
-			#  The name of the current working file.
-			#  If ommitted, it is the directory from
-			#  the 'filename' above, with "/detail.work"
-			#  appended to it.
+			#  If there are no detail files in the directory,
+			#  the listener will periodically wake up to check
+			#  for new entries.
+			#
+			#  If this is set to `0`. then the server will
+			#  rely on file system notifications to
+			#  discover when a detail file has been added.
+			#  Setting it to `0` only works on Linux.  On
+			#  other operating systems, it MUST be set to
+			#  a non-zero value.
+			#
+			#  Allowed values: 0 to 3600
+			poll_interval = 5
+		}
+
+		#
+		#  Configuration related to processing the
+		#  "detail.work" file.
+		#
+		#  This MUST also be specified, along with the "file"
+		#  subsection above.
+		#
+		work {
+			#
+			#  The name of the current working file.  If
+			#  omitted, it is the directory from the
+			#  `file` subsection, `filename` argument
+			#  given above, with "/detail.work" appended
+			#  to it.
 			#
 			#  As of v4, you can have multiple detail file
 			#  readers in the same directory.  The only
@@ -104,25 +147,17 @@ virtual_server detail {
 			#  The best way to enforce that is to give the
 			#  the files different prefixes.
 			#
-			filename.work = "${confdir}/detail.work"
+			filename = "${...directory}/detail.work"
 
 			#
 			#  Track progress through the detail file.  When the detail
-			#  file is large, and the server is re-started, it will
+			#  file is large, and the server is restarted, it will
 			#  read from the START of the file.
 			#
-			#  Setting "track = yes" means it will skip packets which
-			#  have already been processed.  The default is "no".
+			#  Setting `track = yes` means it will skip packets which
+			#  have already been processed.  The default is `no`.
 			#
 			track = yes
-
-			#
-			#  If there are no detail files in the directory,
-			#  the listener will periodically wake up to check
-			#  for new entries.
-			#
-			#  Allowed values: 1 to 3600
-			poll_interval = 5
 
 			#
 			#  The maximum size (in bytes) of one entry in
@@ -130,17 +165,17 @@ virtual_server detail {
 			#  low, then the "too large" entries in the
 			#  detail file will be ignored.
 			#
-			#  Due to limitations in the detail file
-			#  reader, if multiple entries fit into this
-			#  size, then all of those entries will be
-			#  read and processed, before further reading
-			#  is done from the file.
-			#
 			max_entry_size = 65536
 
 			#
-			#  Whether or not the module retransmits
-			#  packets which have failed.
+			#  Whether or not the detail.work file reader
+			#  retransmits packets which have failed.
+			#
+			#  If this configuration item is set to `no`, then
+			#  the reader will ignore any failures, and will
+			#  go to the next entry as soon as the current
+			#  entry is finished, even if it failed to process
+			#  that entry.
 			#
 			#  default = yes
 			#
@@ -151,11 +186,12 @@ virtual_server detail {
 			#
 			limit {
 				#
-				#  Number of simultaneous packets it will
-				#  read from the file.
+				#  Number of simultaneous packets it
+				#  will read from the file and feed
+				#  into the server core.
 				#
 				#  Useful values: 1..256
-				maximum_outstanding = 1
+				max_outstanding = 1
 
 				#
 				#  Initial retransmit time: 1..60
@@ -163,14 +199,14 @@ virtual_server detail {
 				#  If there is no response within this time,
 				#  the module will retransmit the packet.
 				#
-				initial_retransmission_time = 1
+				initial_rtx_time = 1
 
 				#
 				#  Maximum Retransmit Time: 5..30
 				#
 				#  The maximum time between retransmissions.
 				#
-				maximum_retransmission_time = 30
+				max_rtx_time = 30
 
 				#
 				#  The following are maximums that *all* apply.
@@ -186,26 +222,39 @@ virtual_server detail {
 				#
 				#  A special value of "0" means "retransmit forever".
 				#
-				maximum_retransmission_count = 6
+				max_rtx_count = 6
 
 				#
 				#  Maximum Retransmit Duration: 0..600
 				#
 				#  The total length of time the module will try to
-				#  retransit the packet
+				#  retransmit the packet
 				#
 				#  A special value of "0" means "retransmit forever".
 				#
-				maximum_retransmission_duration = 40
+				max_rtx_duration = 40
 			}
 		}
 	}
 
 #
-#  All packets read by the detail listener are processed through the
-#  'recv' section.  Note that there is no second name to the section.
+#  The detail file reader runs the normal RADIUS / DHCP / etc. processing sections.
 #
-recv {
+recv Accounting-Request {
+	#
+	#  If there's an Acct-Delay-Time, increase its value based on the
+	#  difference between when the packet was written, and the current time.
+	#
+	#  Note that we do NOT rely on any Event-Timestamp in the original packet,
+	#  it could be wrong.
+	#
+	if (&Acct-Delay-Time) {
+		&Acct-Delay-Time += %l - &Packet-Original-Timestamp
+	}
+
+	if (!&Event-Timestamp) {
+		&Event-Timestamp := &Packet-Original-Timestamp
+	}
 
 	#
 	#  We handled the packet successfully.  Run the "send ok" section.
@@ -222,34 +271,25 @@ recv {
 }
 
 #
-#  All successful packets sent by the detail listener are processed through the
-#  'send ok' section.  Note that the name is the same for all packet types.
-#
 #  If the listener is configured with 'track = yes', then the entry in
 #  the detail file is marked up as being "done".  Subsequent re-reads
-#  of the same detail file (e.g. on server re-start) will skip the
+#  of the same detail file (e.g. on server restart) will skip the
 #  "done" entries.
 #
-send ok {
+send Accounting-Response {
 	ok
 }
 
 #
-#  All failed packets sent by the detail listener are processed through the
-#  'send fail' section.  Note that the name is the same for all packet types.
+#  All failed packets sent by the detail listener should be processed
+#  through the 'send Do-Not-Respond' section.
 #
 #  If the listener is configured with 'track = yes', then the packet
 #  will be retransmitted by the detail file reader, until the packet
 #  returns "success".  See the "limit" subsection above for retransmission
 #  configuration.
 #
-send fail {
+send Do-Not-Respond {
 	ok
 }
-
-#
-#  Note that unlike other listeners, there is no "send Do-Not-Respond"
-#  section.  You should just return "fail" instead.
-#
-
 } # virtual server "detail"

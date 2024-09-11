@@ -1,14 +1,14 @@
 # Code of Conduct
 ## 1. Overview
 
-The goal of the FreeRADIUS project is to produce reliable, feature full software which benefits the
+The goal of the FreeRADIUS project is to produce reliable, feature-full software which benefits the
 open source community.
 
 The GitHub issue tracker and mailing lists have a strict code of conduct.
 
 > Only technical discussion related to FreeRADIUS, the protocols it implements, and its dependencies
 > are permitted in GitHub communications and on the mailing list.
-> 
+>
 > Please note that any off-topic discussion will result in a warning. Continued off topic discussion
 > will result in the individual being unsubscribed from the mailing lists and/or permanent
 > banishment from the GitHub repositories.
@@ -18,13 +18,17 @@ it does not require participants to be explicitly "inclusive" or "accepting" of 
 requires participants to be *blind* to non-technical subjects, as those subjects are explicitly off
 topic. The FreeRADIUS community is inclusive by virtue of not being exclusionary.
 
+If you believe that the implicit biases of community members may affect how your contributions are
+evaluated, you are invited to anonymise your contributions.  You will not be penalised for use of
+pseudonyms or anonymised identities when creating/signing patches, or posting on the mailing list(s).
+
 ## 2. Expected Behaviour
 
 The following behaviours are expected and requested of all community members:
 
 - Ensure that the rules of the community resource you're using have been reviewed in full, [mailing
   list guidelines](https://freeradius.org/support/) for the mailing lists, [the guidelines for
-  contributing](https://github.com/FreeRADIUS/freeradius-server/blob/v4.0.x/.github/contributing.md)
+  contributing](https://github.com/FreeRADIUS/freeradius-server/blob/master/.github/contributing.md)
   for GitHub.
 - Use a neutral tone with a focus on technical arguments and technical discussion.
 - Evaluate contributions, ideas and feedback on technical merit only.  The personal attributes of

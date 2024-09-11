@@ -1,3 +1,4 @@
+#pragma once
 /*
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -13,26 +14,25 @@
  *  along with this program; if not, write to the Free Software
  *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
-#ifndef _FR_MESSAGE_H
-#define _FR_MESSAGE_H
+
 /**
  * $Id$
  *
  * @file io/message.h
  * @brief Inter-thread messaging
  *
- * @copyright 2016 Alan DeKok <aland@freeradius.org>
+ * @copyright 2016 Alan DeKok (aland@freeradius.org)
  */
 RCSIDH(message_h, "$Id$")
 
-#include <freeradius-devel/io/time.h>
+#include <freeradius-devel/util/time.h>
 #include <freeradius-devel/io/ring_buffer.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-typedef struct fr_message_set_t fr_message_set_t;
+typedef struct fr_message_set_s fr_message_set_t;
 
 typedef enum fr_message_status_t {
 	FR_MESSAGE_FREE = 0,
@@ -41,7 +41,7 @@ typedef enum fr_message_status_t {
 	FR_MESSAGE_DONE
 } fr_message_status_t;
 
-typedef struct fr_message_t {
+typedef struct {
 	fr_message_status_t	status;		//!< free, used, done, etc.
 
 	fr_time_t		when;		//!< when this message was sent
@@ -56,8 +56,7 @@ fr_message_set_t *fr_message_set_create(TALLOC_CTX *ctx, int num_messages, size_
 fr_message_t *fr_message_reserve(fr_message_set_t *ms, size_t reserve_size) CC_HINT(nonnull);
 fr_message_t *fr_message_alloc(fr_message_set_t *ms, fr_message_t *m, size_t actual_packet_size) CC_HINT(nonnull(1));
 fr_message_t *fr_message_alloc_reserve(fr_message_set_t *ms, fr_message_t *m, size_t actual_packet_size,
-				       size_t reserve_size) CC_HINT(nonnull);
-fr_message_t *fr_message_alloc_aligned(fr_message_set_t *ms, fr_message_t *m, size_t actual_packet_size) CC_HINT(nonnull(1));
+				       size_t leftover, size_t reserve_size) CC_HINT(nonnull);
 int fr_message_done(fr_message_t *m) CC_HINT(nonnull);
 
 fr_message_t *fr_message_localize(TALLOC_CTX *ctx, fr_message_t *m, size_t message_size) CC_HINT(nonnull);
@@ -70,5 +69,3 @@ void fr_message_set_debug(fr_message_set_t *ms, FILE *fp) CC_HINT(nonnull);
 #ifdef __cplusplus
 }
 #endif
-
-#endif /* _FR_MESSAGE_H */

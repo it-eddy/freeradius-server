@@ -23,8 +23,10 @@
  */
 RCSID("$Id$")
 
-#include "libfreeradius-ldap.h"
-#include <freeradius-devel/rad_assert.h>
+USES_APPLE_DEPRECATED_API
+
+#include <freeradius-devel/ldap/base.h>
+#include <freeradius-devel/util/debug.h>
 
 /** Holds arguments for the start_tls operation
  *
@@ -42,7 +44,7 @@ typedef struct {
  * @param[in] el	the event occurred in.
  * @param[in] fd	the event occurred on.
  * @param[in] flags	from kevent.
- * @param[in] fd_errno	The error that ocurred.
+ * @param[in] fd_errno	The error that occurred.
  * @param[in] uctx	Connection config and handle.
  */
 static void _ldap_start_tls_io_error(UNUSED fr_event_list_t *el, UNUSED int fd, UNUSED int flags,
@@ -63,7 +65,7 @@ static void _ldap_start_tls_io_error(UNUSED fr_event_list_t *el, UNUSED int fd, 
  *   - calls ldap_pvt_tls_inplace to check is the Sockbuf for defconn has TLS installed
  *     - If it does (it shouldn't), returns LDAP_LOCAL_ERROR (and we fail).
  *   - calls ldap_int_tls_start.
- *     - calls_tls_init (to initialise ssl library - only done once per implementation).
+ *     - calls tls_init (to initialise ssl library - only done once per implementation).
  *     - if net timeout is >= 0, then set the FD to nonblocking mode.
  *     - calls ldap_int_tls_connect
  *       - either gets existing session or
@@ -97,9 +99,11 @@ static void _ldap_start_tls_io_read(UNUSED fr_event_list_t *el, UNUSED int fd, U
 	fr_ldap_connection_t	*c = tls_ctx->c;
 	int			ret;
 	fr_ldap_rcode_t		status;
-	struct timeval		tv = { 0, 0 };		/* We're I/O driven, if there's no data someone lied to us */
 
-	status = fr_ldap_result(NULL, NULL, c, tls_ctx->msgid, LDAP_MSG_ALL, NULL, &tv);
+	/*
+	 *	We're I/O driven, if there's no data someone lied to us
+	 */
+	status = fr_ldap_result(NULL, NULL, c, tls_ctx->msgid, LDAP_MSG_ALL, NULL, fr_time_delta_wrap(0));
 	talloc_free(tls_ctx);				/* Free explicitly so we don't accumulate contexts */
 
 	switch (status) {
@@ -108,7 +112,8 @@ static void _ldap_start_tls_io_read(UNUSED fr_event_list_t *el, UNUSED int fd, U
 		 *	If tls_handshake_timeout is NULL ldap_install_tls
 		 *	will block forever.
 		 */
-		fr_ldap_connection_timeout_set(c, &c->config->tls_handshake_timeout);
+		fr_ldap_connection_timeout_set(c, c->config->tls_handshake_timeout);
+
 		/*
 		 *	This call will block for a maximum of tls_handshake_timeout.
 		 *	Patches to libldap are required to fix this.
@@ -146,22 +151,16 @@ static void _ldap_start_tls_io_write(fr_event_list_t *el, int fd, UNUSED int fla
 	fr_ldap_start_tls_ctx_t	*tls_ctx = talloc_get_type_abort(uctx, fr_ldap_start_tls_ctx_t);
 	fr_ldap_connection_t	*c = tls_ctx->c;
 
-	struct timeval		tv = { 0, 0 };
 	int			ret;
 
 	LDAPControl		*our_serverctrls[LDAP_MAX_CONTROLS];
 	LDAPControl		*our_clientctrls[LDAP_MAX_CONTROLS];
 
 	fr_ldap_control_merge(our_serverctrls, our_clientctrls,
-			      sizeof(our_serverctrls) / sizeof(*our_serverctrls),
-			      sizeof(our_clientctrls) / sizeof(*our_clientctrls),
+			      NUM_ELEMENTS(our_serverctrls),
+			      NUM_ELEMENTS(our_clientctrls),
 			      c, tls_ctx->serverctrls, tls_ctx->clientctrls);
 
-	/*
-	 *	Set timeout to be 0.0, which is the magic
-	 *	non-blocking value.
-	 */
-	(void) ldap_set_option(c->handle, LDAP_OPT_NETWORK_TIMEOUT, &tv);
 	ret = ldap_start_tls(c->handle, our_serverctrls, our_clientctrls, &tls_ctx->msgid);
 	/*
 	 *	If the handle was not connected, this operation
@@ -172,7 +171,7 @@ static void _ldap_start_tls_io_write(fr_event_list_t *el, int fd, UNUSED int fla
 	switch (ret) {
 	case LDAP_X_CONNECTING:					/* Connection in progress - retry later */
 		ret = ldap_get_option(c->handle, LDAP_OPT_DESC, &fd);
-		if (!rad_cond_assert(ret == LDAP_OPT_SUCCESS)) {
+		if (!fr_cond_assert(ret == LDAP_OPT_SUCCESS)) {
 		error:
 			talloc_free(tls_ctx);
 			fr_ldap_connection_timeout_reset(c);
@@ -180,21 +179,26 @@ static void _ldap_start_tls_io_write(fr_event_list_t *el, int fd, UNUSED int fla
 			return;
 		}
 
-		ret = fr_event_fd_insert(tls_ctx, el, fd,
+		ret = fr_event_fd_insert(tls_ctx, NULL, el, fd,
 					 NULL,
 					 _ldap_start_tls_io_write,	/* We'll be called again when the conn is open */
 					 _ldap_start_tls_io_error,
 					 tls_ctx);
-		if (!rad_cond_assert(ret == 0)) goto error;
+		if (!fr_cond_assert(ret == 0)) goto error;
 		break;
 
 	case LDAP_SUCCESS:
-		ret = fr_event_fd_insert(tls_ctx, el, fd,
+		if (fd < 0) {
+			ret = ldap_get_option(c->handle, LDAP_OPT_DESC, &fd);
+			if ((ret != LDAP_OPT_SUCCESS) || (fd < 0)) goto error;
+		}
+		c->fd = fd;
+		ret = fr_event_fd_insert(tls_ctx, NULL, el, fd,
 					 _ldap_start_tls_io_read,
 					 NULL,
 					 _ldap_start_tls_io_error,
 					 tls_ctx);
-		if (!rad_cond_assert(ret == 0)) goto error;
+		if (!fr_cond_assert(ret == 0)) goto error;
 		break;
 
 	default:
@@ -228,17 +232,21 @@ int fr_ldap_start_tls_async(fr_ldap_connection_t *c, LDAPControl **serverctrls, 
 	tls_ctx->serverctrls = serverctrls;
 	tls_ctx->clientctrls = clientctrls;
 
-	el = fr_connection_get_el(c->conn);
+	el = c->conn->el;
 
-	if (ldap_get_option(c->handle, LDAP_OPT_DESC, &fd) == LDAP_SUCCESS) {
+	/*
+	 *	ldap_get_option can return LDAP_SUCCESS even if the fd is not yet available
+	 *	- hence the test for fd >= 0
+	 */
+	if ((ldap_get_option(c->handle, LDAP_OPT_DESC, &fd) == LDAP_SUCCESS) && (fd >= 0)) {
 		int ret;
 
-		ret = fr_event_fd_insert(tls_ctx, el, fd,
+		ret = fr_event_fd_insert(tls_ctx, NULL, el, fd,
 					 NULL,
 					 _ldap_start_tls_io_write,
 					 _ldap_start_tls_io_error,
 					 tls_ctx);
-		if (!rad_cond_assert(ret == 0)) {
+		if (!fr_cond_assert(ret == 0)) {
 			talloc_free(tls_ctx);
 			return -1;
 		}

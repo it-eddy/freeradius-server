@@ -3,17 +3,16 @@
  * @file rlm_yubikey/validate.c
  * @brief Authentication for yubikey OTP tokens using the ykclient library.
  *
- * @author Arran Cudbard-Bell <a.cudbardb@networkradius.com>
+ * @author Arran Cudbard-Bell (a.cudbardb@networkradius.com)
  * @copyright 2013 The FreeRADIUS server project
- * @copyright 2013 Network RADIUS <info@networkradius.com>
+ * @copyright 2013 Network RADIUS (legal@networkradius.com)
  */
-#define LOG_PREFIX "rlm_yubikey (%s) - "
-#define LOG_PREFIX_ARGS inst->name
+#define LOG_PREFIX inst->name
 
 #include "rlm_yubikey.h"
 
 #ifdef HAVE_YKCLIENT
-#include <freeradius-devel/pool.h>
+#include <freeradius-devel/server/pool.h>
 
 /** Frees a ykclient handle
  *
@@ -37,9 +36,9 @@ static int _mod_conn_free(ykclient_handle_t **yandle)
  * @see fr_pool_connection_create_t
  * @see connection.c
  */
-static void *mod_conn_create(TALLOC_CTX *ctx, void *instance, UNUSED struct timeval const *timeout)
+static void *mod_conn_create(TALLOC_CTX *ctx, void *instance, UNUSED fr_time_delta_t timeout)
 {
-	rlm_yubikey_t const *inst = instance;
+	rlm_yubikey_t const *inst = talloc_get_type_abort_const(instance, rlm_yubikey_t);
 	ykclient_rc status;
 	ykclient_handle_t *yandle, **marker;
 
@@ -128,7 +127,7 @@ init:
 		return -1;
 	}
 
-	inst->pool = module_connection_pool_init(conf, inst, mod_conn_create, NULL, inst->name, NULL, NULL);
+	inst->pool = module_rlm_connection_pool_init(conf, inst, mod_conn_create, NULL, inst->name, NULL, NULL);
 	if (!inst->pool) {
 		ykclient_done(&inst->ykc);
 
@@ -147,14 +146,16 @@ int rlm_yubikey_ykclient_detach(rlm_yubikey_t *inst)
 	return 0;
 }
 
-rlm_rcode_t rlm_yubikey_validate(rlm_yubikey_t const *inst, REQUEST *request, char const *passcode)
+unlang_action_t rlm_yubikey_validate(rlm_rcode_t *p_result, module_ctx_t const *mctx,
+				     request_t *request, char const *passcode)
 {
+	rlm_yubikey_t const *inst = talloc_get_type_abort(mctx->mi->data, rlm_yubikey_t);
 	rlm_rcode_t rcode = RLM_MODULE_OK;
 	ykclient_rc status;
 	ykclient_handle_t *yandle;
 
 	yandle = fr_pool_connection_get(inst->pool, request);
-	if (!yandle) return RLM_MODULE_FAIL;
+	if (!yandle) RETURN_MODULE_FAIL;
 
 	/*
 	 *	The libcurl multi-handle interface will tear down the TCP sockets for any partially completed
@@ -192,6 +193,6 @@ rlm_rcode_t rlm_yubikey_validate(rlm_yubikey_t const *inst, REQUEST *request, ch
 
 	fr_pool_connection_release(inst->pool, request, yandle);
 
-	return rcode;
+	RETURN_MODULE_RCODE(rcode);
 }
 #endif

@@ -21,15 +21,14 @@
  *
  * @author Arran Cudbard-Bell
  *
- * @copyright 2015 Arran Cudbard-Bell <a.cudbardb@freeradius.org>
+ * @copyright 2015 Arran Cudbard-Bell (a.cudbardb@freeradius.org)
  * @copyright 2015 The FreeRADIUS server project
  */
 RCSID("$Id$")
-#include <freeradius-devel/libradius.h>
-#include <freeradius-devel/cf_parse.h>
-#include <freeradius-devel/rad_assert.h>
+#include <freeradius-devel/server/cf_parse.h>
+#include <freeradius-devel/util/debug.h>
 
-#include "redis.h"
+#include "base.h"
 #include "cluster.h"
 #include "redis_ippool.h"
 
@@ -44,13 +43,15 @@ typedef enum ippool_tool_action {
 	IPPOOL_TOOL_REMOVE,			//!< Remove one or more IP addresses.
 	IPPOOL_TOOL_RELEASE,			//!< Release one or more IP addresses.
 	IPPOOL_TOOL_SHOW,			//!< Show one or more IP addresses.
-	IPPOOL_TOOL_MODIFY			//!< Modify attributes of one or more IP addresses.
+	IPPOOL_TOOL_MODIFY,			//!< Modify attributes of one or more IP addresses.
+	IPPOOL_TOOL_ASSIGN,			//!< Assign a static IP address to a device.
+	IPPOOL_TOOL_UNASSIGN			//!< Remove static IP address assignment.
 } ippool_tool_action_t;
 
 /** A single pool operation
  *
  */
-typedef struct ippool_tool_operation {
+typedef struct {
 	char const		*name;		//!< Original range or CIDR string.
 
 	uint8_t const		*pool;		//!< Pool identifier.
@@ -66,7 +67,7 @@ typedef struct ippool_tool_operation {
 	ippool_tool_action_t	action;		//!< What to do to the leases described by net/prefix.
 } ippool_tool_operation_t;
 
-typedef struct ippool_tool_lease {
+typedef struct {
 	fr_ipaddr_t		ipaddr;		//!< Prefix or address.
 	time_t			next_event;	//!< Last state change.
 	uint8_t const		*range;		//!< Range the lease belongs to.
@@ -77,34 +78,44 @@ typedef struct ippool_tool_lease {
 	size_t			gateway_len;
 } ippool_tool_lease_t;
 
-typedef struct ippool_tool_stats {
+typedef struct {
 	uint64_t		total;		//!< Addresses available.
 	uint64_t		free;		//!< Addresses in use.
 	uint64_t		expiring_1m;	//!< Addresses that expire in the next minute.
 	uint64_t		expiring_30m;	//!< Addresses that expire in the next 30 minutes.
 	uint64_t		expiring_1h;	//!< Addresses that expire in the next hour.
 	uint64_t		expiring_1d;	//!< Addresses that expire in the next day.
+	uint64_t		static_tot;	//!< Static assignments configured.
+	uint64_t		static_free;	//!< Static leases that have not been requested.
+	uint64_t		static_1m;	//!< Static leases that should renew in the next minute.
+	uint64_t		static_30m;	//!< Static leases that should renew in the next 30 minutes.
+	uint64_t		static_1h;	//!< Static leases that should renew in the next hour.
+	uint64_t		static_1d;	//!< Static leases that should renew in the next day.
 } ippool_tool_stats_t;
 
-static CONF_PARSER redis_config[] = {
+static conf_parser_t redis_config[] = {
 	REDIS_COMMON_CONFIG,
 	CONF_PARSER_TERMINATOR
 };
 
-typedef struct redis_driver_conf {
+typedef struct {
 	fr_redis_conf_t		conf;		//!< Connection parameters for the Redis server.
 	fr_redis_cluster_t	*cluster;
 } redis_driver_conf_t;
 
-typedef struct ippool_tool {
+typedef struct {
 	void			*driver;
 	CONF_SECTION		*cs;
 } ippool_tool_t;
 
+typedef struct {
+	char const		*owner;
+} ippool_tool_owner_t;
+
 typedef int (*redis_ippool_queue_t)(redis_driver_conf_t *inst, fr_redis_conn_t *conn,
 				    uint8_t const *key_prefix, size_t key_prefix_len,
 				    uint8_t const *range, size_t range_len,
-				    fr_ipaddr_t *ipaddr, uint8_t prefix);
+				    fr_ipaddr_t *ipaddr, uint8_t prefix, void *uctx);
 
 typedef int (*redis_ippool_process_t)(void *out, fr_ipaddr_t const *ipaddr, redisReply const *reply);
 
@@ -122,6 +133,23 @@ do { \
 	_p += (size_t)_slen;\
 	_p += strlcpy((char *)_p, _ip_str, sizeof(_buff) - (_p - _buff)); \
 } while (0)
+
+#if 0
+#define IPPOOL_BUILD_OWNER_KEY(_buff, _p, _key, _key_len, _owner) \
+do { \
+	ssize_t _slen; \
+	*_p++ = '{'; \
+	memcpy(_p, _key, _key_len); \
+	_p += _key_len; \
+	_slen = strlcpy((char *)_p, "}:"IPPOOL_OWNER_KEY":", sizeof(_buff) - (_p - _buff)); \
+	if (is_truncated((size_t)_slen, sizeof(_buff) - (_p - _buff))) { \
+		ERROR("Owner key too long"); \
+		return 0;\
+	} \
+	_p += (size_t)_slen;\
+	_p += strlcpy((char *)_p, _owner, sizeof(_buff) - (_p - _buff)); \
+} while (0)
+#endif
 
 #define EOL "\n"
 
@@ -160,8 +188,125 @@ static char lua_release_cmd[] =
 	/*
 	 *	Remove the association between the device and a lease
 	 */
-	"redis.call('DEL', '{' .. KEYS[1] .. '}:"IPPOOL_DEVICE_KEY":' .. found)" EOL	/* 11 */
+	"redis.call('DEL', '{' .. KEYS[1] .. '}:"IPPOOL_OWNER_KEY":' .. found)" EOL	/* 11 */
 	"return 1";									/* 12 */
+
+/** Lua script for assigning a static lease
+ *
+ * - KEYS[1] The pool name.
+ * - ARGV[1] THE ip address to create a static assignment for.
+ * - ARGV[2] The owner to assign the static lease to.
+ * - ARGV[3] The range identifier.
+ * - ARGV[4] Wall time (seconds since epoch)
+ *
+ * Checks whether the IP already has a static assignment, and
+ * whether the owner is already associated with a different IP.
+ *
+ * If check pass, sets the static flag on the IP entry in the ZSET and
+ * creates the association between the IP and the owner.
+ *
+ * Returns
+ *  - 0 if no assignment is made.
+ *  - 1 if the IP assignment is made.
+ */
+static char lua_assign_cmd[] =
+	"local pool_key = '{' .. KEYS[1] .. '}:"IPPOOL_POOL_KEY"'" EOL			/* 1 */
+	"local owner_key = '{' .. KEYS[1] .. '}:"IPPOOL_OWNER_KEY":' .. ARGV[2]" EOL	/* 2 */
+	"local ip_key = '{' .. KEYS[1]..'}:"IPPOOL_ADDRESS_KEY":' .. ARGV[1]" EOL	/* 3 */
+
+	/*
+	 *	Check the address doesn't already have a static assignment.
+	 */
+	"local expires = tonumber(redis.call('ZSCORE', pool_key, ARGV[1]))" EOL		/* 4 */
+	"if expires and expires >= " STRINGIFY(IPPOOL_STATIC_BIT) " then" EOL		/* 5 */
+	"  return 0" EOL								/* 6 */
+	"end" EOL									/* 7 */
+
+	/*
+	 *	Check current assignment for device.
+	 */
+	"local found = redis.call('GET', owner_key)" EOL				/* 8 */
+	"if found and found ~= ARGV[1] then" EOL					/* 9 */
+	"  return 0" EOL								/* 10 */
+	"end" EOL									/* 11 */
+
+	/*
+	 *	If expires is in the future, check it is not
+	 *	another owner.
+	 */
+	"if expires and expires > tonumber(ARGV[4]) then" EOL				/* 12 */
+	"  found = redis.call('HGET', ip_key, 'device')"				/* 13 */
+	"  if found and found ~= ARGV[2] then" EOL					/* 14 */
+	"    return 0" EOL								/* 15 */
+	"  end" EOL									/* 16 */
+	"end" EOL									/* 17 */
+
+	/*
+	 *	All checks passed - set the assignment.
+	 */
+	"expires = (expires or 0) + " STRINGIFY(IPPOOL_STATIC_BIT) EOL			/* 18 */
+	"redis.call('ZADD', pool_key, 'CH', expires, ARGV[1])" EOL			/* 19 */
+	"redis.call('SET', owner_key, ARGV[1])" EOL					/* 20 */
+	"redis.call('HSET', ip_key, 'device', ARGV[2], 'counter', 0)" EOL		/* 21 */
+	"if ARGV[3] then" EOL								/* 22 */
+	"  redis.call('HSET', ip_key, 'range', ARGV[3])" EOL				/* 23 */
+	"end" EOL									/* 24 */
+	"return 1";									/* 25 */
+
+/** Lua script for un-assigning a static lease
+ *
+ * - KEYS[1] The pool name.
+ * - ARGV[1] IP address to remove static lease from.
+ * - ARGV[2] The owner the static lease should be removed from.
+ * - ARGV[3] Wall time (seconds since epoch).
+ *
+ * Removes the static flag from the IP entry in the ZSET, then, depending on the remaining time
+ * determined by the ZSCORE removes the address hash, and the device key.
+ *
+ * Will do nothing if the static assignment does not exist or the IP and device do not match.
+ *
+ * Returns
+ * - 0 if no ip addresses were unassigned.
+ * - 1 if an ip address was unassigned.
+ */
+static char lua_unassign_cmd[] =
+	"local found" EOL								/* 1 */
+	"local pool_key = '{' .. KEYS[1] .. '}:"IPPOOL_POOL_KEY"'" EOL			/* 2 */
+	"local owner_key = '{' .. KEYS[1] .. '}:"IPPOOL_OWNER_KEY":' .. ARGV[2]" EOL	/* 3 */
+
+	/*
+	 *	Check that the device hash exists and points at the correct IP
+	 */
+	"found = redis.call('GET', owner_key)" EOL					/* 4 */
+	"if not found or found ~= ARGV[1] then" EOL					/* 5 */
+	"  return 0" EOL								/* 6 */
+	"end"	 EOL									/* 7 */
+
+	/*
+	 *	Check the assignment is actually static
+	 */
+	"local expires = tonumber(redis.call('ZSCORE', pool_key, ARGV[1]))" EOL		/* 8 */
+	"local static = expires >= " STRINGIFY(IPPOOL_STATIC_BIT) EOL			/* 9 */
+	"if not static then" EOL							/* 10 */
+	" return 0" EOL									/* 11 */
+	"end" EOL									/* 12 */
+
+	/*
+	 *	Remove static bit from ZSCORE
+	 */
+	"expires = expires - " STRINGIFY(IPPOOL_STATIC_BIT) EOL				/* 13 */
+	"redis.call('ZADD', pool_key, 'XX', expires, ARGV[1])" EOL			/* 14 */
+
+	/*
+	 *	If the lease still has time left, set an expiry on the device key.
+	 *	otherwise delete it.
+	 */
+	"if expires > tonumber(ARGV[3]) then" EOL					/* 15 */
+	"  redis.call('EXPIRE', owner_key, expires - tonumber(ARGV[3]))" EOL		/* 16 */
+	"else" EOL									/* 17 */
+	"  redis.call('DEL', owner_key)" EOL						/* 18 */
+	"end" EOL									/* 19 */
+	"return 1";									/* 20 */
 
 /** Lua script for removing a lease
  *
@@ -186,24 +331,27 @@ static char lua_remove_cmd[] =
 	"ret = redis.call('ZREM', '{' .. KEYS[1] .. '}:"IPPOOL_POOL_KEY"', ARGV[1])" EOL	/* 4 */
 	"address_key = '{' .. KEYS[1] .. '}:"IPPOOL_ADDRESS_KEY":' .. ARGV[1]" EOL	/* 5 */
 	"found = redis.call('HGET', address_key, 'device')" EOL				/* 6 */
-	"if not found then" EOL								/* 7 */
-	"  return ret"	EOL								/* 8 */
-	"end" EOL									/* 9 */
-	"redis.call('DEL', address_key)" EOL						/* 10 */
+	"redis.call('DEL', address_key)" EOL						/* 7 */
+	"if not found then" EOL								/* 8 */
+	"  return ret"	EOL								/* 9 */
+	"end" EOL									/* 10 */
 
 	/*
 	 *	Remove the association between the device and a lease
 	 */
-	"redis.call('DEL', '{' .. KEYS[1] .. '}:"IPPOOL_DEVICE_KEY":' .. found)" EOL	/* 11 */
+	"redis.call('DEL', '{' .. KEYS[1] .. '}:"IPPOOL_OWNER_KEY":' .. found)" EOL	/* 11 */
 	"return 1" EOL;									/* 12 */
 
-static void NEVER_RETURNS usage(int ret) {
+static NEVER_RETURNS void usage(int ret) {
 	INFO("Usage: %s -adrsm range... [-p prefix_len]... [-x]... [-oShf] server[:port] [pool] [range id]", name);
 	INFO("Pool management:");
 	INFO("  -a range               Add address(es)/prefix(es) to the pool.");
 	INFO("  -d range               Delete address(es)/prefix(es) in this range.");
 	INFO("  -r range               Release address(es)/prefix(es) in this range.");
 	INFO("  -s range               Show addresses/prefix in this range.");
+	INFO("  -A address/prefix      Assign a static lease.");
+	INFO("  -O owner               To use when assigning a static lease.");
+	INFO("  -U address/prefix      Un-assign a static lease");
 	INFO("  -p prefix_len          Length of prefix to allocate (defaults to 32/128)");
 	INFO("                         This is used primarily for IPv6 where a prefix is");
 	INFO("                         allocated to an intermediary router, which in turn");
@@ -224,11 +372,13 @@ static void NEVER_RETURNS usage(int ret) {
 	INFO("  -h                     Print this help message and exit");
 	INFO("  -x                     Increase the verbosity level");
 //	INFO("  -o attr=value          Set option, these are specific to the backends [NYI]");
-	INFO("  -f file                Load connection options from a FreeRADIUS (radisud) format config file");
+	INFO("  -f file                Load connection options from a FreeRADIUS format config file");
+	INFO("                         This file should contain a pool { ... } section and one or more");
+	INFO("                         `server = <fqdn>` pairs`");
 	INFO(" ");
 	INFO("<range> is range \"127.0.0.1-127.0.0.254\" or CIDR network \"127.0.0.1/24\" or host \"127.0.0.1\"");
 	INFO("CIDR host bits set start address, e.g. 127.0.0.200/24 -> 127.0.0.200-127.0.0.254");
-	exit(ret);
+	fr_exit_now(ret);
 }
 
 static uint32_t uint32_gen_mask(uint8_t bits)
@@ -236,148 +386,6 @@ static uint32_t uint32_gen_mask(uint8_t bits)
 	if (bits >= 32) return 0xffffffff;
 	return (1 << bits) - 1;
 }
-
-/*
- *	128bit integers are not standard on many compilers
- *	despite SSE2 instructions for dealing with them
- *	specifically.
- */
-#ifndef HAVE_128BIT_INTEGERS
-/** Create a 128 bit integer value with n bits high
- *
- */
-static uint128_t uint128_gen_mask(uint8_t bits)
-{
-	uint128_t ret;
-
-	rad_assert(bits < 128);
-
-	if (bits > 64) {
-		ret.l = 0xffffffffffffffff;
-		ret.h = (uint64_t)1 << (bits - 64);
-		ret.h ^= (ret.h - 1);
-		return ret;
-	}
-	ret.h = 0;
-	ret.l = (uint64_t)1 << bits;
-	ret.l ^= (ret.l - 1);
-
-	return ret;
-}
-/** Left shift 128 bit integer
- *
- * @note shift must be 127 bits or less.
- */
-static uint128_t uint128_lshift(uint128_t num, uint8_t bits)
-{
-	rad_assert(bits < 128);
-
-	if (bits >= 64) {
-		num.l = 0;
-		num.h = num.l << (bits - 64);
-		return num;
-	}
-	num.h = (num.h << bits) | (num.l >> (64 - bits));
-	num.l <<= bits;
-
-	return num;
-}
-
-/** Add two 128bit unsigned integers
- *
- * @author Jacob F. W
- * @note copied from http://www.codeproject.com/Tips/617214/UInt-Addition-Subtraction
- */
-static uint128_t uint128_add(uint128_t a, uint128_t b)
-{
-	uint128_t ret;
-	uint64_t tmp = (((a.l & b.l) & 1) + (a.l >> 1) + (b.l >> 1)) >> 63;
-	ret.l = a.l + b.l;
-	ret.h = a.h + b.h + tmp;
-	return ret;
-}
-
-/** Subtract one 128bit integer from another
- *
- * @author Jacob F. W
- * @note copied from http://www.codeproject.com/Tips/617214/UInt-Addition-Subtraction
- */
-static uint128_t uint128_sub(uint128_t a, uint128_t b)
-{
-	uint128_t ret;
-	uint64_t c;
-
-	ret.l = a.l - b.l;
-	c = (((ret.l & b.l) & 1) + (b.l >> 1) + (ret.l >> 1)) >> 63;
-	ret.h = a.h - (b.h + c);
-
-	return ret;
-}
-
-/** Perform bitwise & of two 128bit unsigned integers
- *
- */
-static uint128_t uint128_band(uint128_t a, uint128_t b)
-{
-	uint128_t ret;
-	ret.l = a.l & b.l;
-	ret.h = a.h & b.h;
-	return ret;
-}
-
-/** Perform bitwise | of two 128bit unsigned integers
- *
- */
-static uint128_t uint128_bor(uint128_t a, uint128_t b)
-{
-	uint128_t ret;
-	ret.l = a.l | b.l;
-	ret.h = a.h + b.h;
-	return ret;
-}
-
-/** Return whether the integers are equal
- *
- */
-static bool uint128_eq(uint128_t a, uint128_t b)
-{
-	return (a.h == b.h) && (a.l == b.l);
-}
-
-/** Return whether one integer is greater than the other
- *
- */
-static bool uint128_gt(uint128_t a, uint128_t b)
-{
-	if (a.h < b.h) return false;
-	if (a.h > b.h) return true;
-	return (a.l > b.l);
-}
-
-/** Creates a new uint128_t from an uint64_t
- *
- */
-static uint128_t uint128_new(uint64_t h, uint64_t l) {
-	uint128_t ret;
-	ret.l = l;
-	ret.h = h;
-	return ret;
-}
-#else
-static uint128_t uint128_gen_mask(uint8_t bits)
-{
-	if (bits >= 128) return ~(uint128_t)0x00;
-	return (((uint128_t)1) << bits) - 1;
-}
-#define uint128_lshift(_num, _bits) (_num << _bits)
-//#define uint128_band(_a, _b) (_a & _b)
-#define uint128_bor(_a, _b) (_a | _b)
-#define uint128_eq(_a, _b) (_a == _b)
-#define uint128_gt(_a, _b) (_a > _b)
-#define uint128_add(_a, _b) (_a + _b)
-#define uint128_sub(_a, _b) (_a - _b)
-#define uint128_new(_a, _b) ((uint128_t)_b | ((uint128_t)_a << 64))
-#endif
 
 /** Iterate over range of IP addresses
  *
@@ -395,7 +403,7 @@ static bool ipaddr_next(fr_ipaddr_t *ipaddr, fr_ipaddr_t const *end, uint8_t pre
 	switch (ipaddr->af) {
 	default:
 	case AF_UNSPEC:
-		rad_assert(0);
+		fr_assert(0);
 		return false;
 
 	case AF_INET6:
@@ -446,7 +454,7 @@ static bool ipaddr_next(fr_ipaddr_t *ipaddr, fr_ipaddr_t const *end, uint8_t pre
  * @return the number of new addresses added.
  */
 static int driver_do_lease(void *out, void *instance, ippool_tool_operation_t const *op,
-			   redis_ippool_queue_t enqueue, redis_ippool_process_t process)
+			   redis_ippool_queue_t enqueue, redis_ippool_process_t process, void *uctx)
 {
 	redis_driver_conf_t		*inst = talloc_get_type_abort(instance, redis_driver_conf_t);
 
@@ -457,51 +465,49 @@ static int driver_do_lease(void *out, void *instance, ippool_tool_operation_t co
 	fr_redis_cluster_state_t	state;
 	fr_redis_rcode_t		status;
 
-	fr_ipaddr_t			ipaddr = op->start, acked;
-	int				s_ret = REDIS_RCODE_SUCCESS;
-	REQUEST				*request = request_alloc(inst);
+	fr_ipaddr_t			ipaddr = op->start;
+	fr_redis_rcode_t		s_ret = REDIS_RCODE_SUCCESS;
 	redisReply			**replies = NULL;
 
 	unsigned int			pipelined = 0;
 
 	while (more) {
-		size_t	reply_cnt = 0;
+		fr_ipaddr_t	acked = ipaddr; 	/* Record our progress */
+		size_t		reply_cnt = 0;
 
-		/* Record our progress */
-		acked = ipaddr;
-		for (s_ret = fr_redis_cluster_state_init(&state, &conn, inst->cluster, request,
+		for (s_ret = fr_redis_cluster_state_init(&state, &conn, inst->cluster, NULL,
 							 op->pool, op->pool_len, false);
 		     s_ret == REDIS_RCODE_TRY_AGAIN;
-		     s_ret = fr_redis_cluster_state_next(&state, &conn, inst->cluster, request, status, &replies[0])) {
+		     s_ret = fr_redis_cluster_state_next(&state, &conn, inst->cluster, NULL, status, &replies[0])) {
+		     	more = true;	/* Reset to true, may have errored last loop */
 			status = REDIS_RCODE_SUCCESS;
 
 			/*
 			 *	If we got a redirect, start back at the beginning of the block.
 			 */
-			if (s_ret == REDIS_RCODE_TRY_AGAIN) ipaddr = acked;
+			ipaddr = acked;
 
 			for (i = 0; (i < MAX_PIPELINED) && more; i++, more = ipaddr_next(&ipaddr, &op->end,
 											 op->prefix)) {
 				int enqueued;
 
 				enqueued = enqueue(inst, conn, op->pool, op->pool_len,
-						   op->range, op->range_len, &ipaddr, op->prefix);
+						   op->range, op->range_len, &ipaddr, op->prefix, uctx);
 				if (enqueued < 0) break;
 				pipelined += enqueued;
 			}
 
 			if (!replies) replies = talloc_zero_array(inst, redisReply *, pipelined);
-			if (!replies) return 0;
+			if (!replies) return -1;
 
 			reply_cnt = fr_redis_pipeline_result(&pipelined, &status, replies,
 							     talloc_array_length(replies), conn);
 			for (i = 0; (size_t)i < reply_cnt; i++) fr_redis_reply_print(L_DBG_LVL_3,
-										     replies[i], request, i);
+										     replies[i], NULL, i);
 		}
 		if (s_ret != REDIS_RCODE_SUCCESS) {
 			fr_redis_pipeline_free(replies, reply_cnt);
 			talloc_free(replies);
-			talloc_free(request);
 			return -1;
 		}
 
@@ -519,7 +525,6 @@ static int driver_do_lease(void *out, void *instance, ippool_tool_operation_t co
 		fr_redis_pipeline_free(replies, reply_cnt);
 		TALLOC_FREE(replies);
 	}
-	talloc_free(request);
 
 	return 0;
 }
@@ -576,7 +581,7 @@ static int _driver_show_lease_process(void *out, fr_ipaddr_t const *ipaddr, redi
 static int _driver_show_lease_enqueue(UNUSED redis_driver_conf_t *inst, fr_redis_conn_t *conn,
 				      uint8_t const *key_prefix, size_t key_prefix_len,
 				      UNUSED uint8_t const *range, UNUSED size_t range_len,
-				      fr_ipaddr_t *ipaddr, uint8_t prefix)
+				      fr_ipaddr_t *ipaddr, uint8_t prefix, UNUSED void *uctx)
 {
 	uint8_t		key[IPPOOL_MAX_POOL_KEY_SIZE];
 	uint8_t		*key_p = key;
@@ -589,7 +594,9 @@ static int _driver_show_lease_enqueue(UNUSED redis_driver_conf_t *inst, fr_redis
 	IPPOOL_SPRINT_IP(ip_buff, ipaddr, prefix);
 	IPPOOL_BUILD_IP_KEY_FROM_STR(ip_key, ip_key_p, key_prefix, key_prefix_len, ip_buff);
 
-	DEBUG("Retrieving lease info for %s from pool %s", ip_buff, key_prefix);
+	DEBUG("Retrieving lease info for %s from pool %pV", ip_buff,
+	      fr_box_strvalue_len((char const *)key_prefix, key_prefix_len));
+
 	redisAppendCommand(conn->handle, "MULTI");
 	redisAppendCommand(conn->handle, "ZSCORE %b %s", key, key_p - key, ip_buff);
 	redisAppendCommand(conn->handle, "HGET %b device", ip_key, ip_key_p - ip_key);
@@ -604,7 +611,7 @@ static int _driver_show_lease_enqueue(UNUSED redis_driver_conf_t *inst, fr_redis
  */
 static inline int driver_show_lease(void *out, void *instance, ippool_tool_operation_t const *op)
 {
-	return driver_do_lease(out, instance, op, _driver_show_lease_enqueue, _driver_show_lease_process);
+	return driver_do_lease(out, instance, op, _driver_show_lease_enqueue, _driver_show_lease_process, NULL);
 }
 
 /** Count the number of leases we released
@@ -631,13 +638,14 @@ static int _driver_release_lease_process(void *out, UNUSED fr_ipaddr_t const *ip
 static int _driver_release_lease_enqueue(UNUSED redis_driver_conf_t *inst, fr_redis_conn_t *conn,
 					 uint8_t const *key_prefix, size_t key_prefix_len,
 					 UNUSED uint8_t const *range, UNUSED size_t range_len,
-					 fr_ipaddr_t *ipaddr, uint8_t prefix)
+					 fr_ipaddr_t *ipaddr, uint8_t prefix, UNUSED void *uctx)
 {
 	char		ip_buff[FR_IPADDR_PREFIX_STRLEN];
 
 	IPPOOL_SPRINT_IP(ip_buff, ipaddr, prefix);
 
-	DEBUG("Releasing %s to pool \"%s\"", ip_buff, key_prefix);
+	DEBUG("Releasing %pV to pool \"%pV\"", ip_buff,
+	      fr_box_strvalue_len((char const *)key_prefix, key_prefix_len));
 	redisAppendCommand(conn->handle, "EVAL %s 1 %b %s", lua_release_cmd, key_prefix, key_prefix_len, ip_buff);
 	return 1;
 }
@@ -648,7 +656,7 @@ static int _driver_release_lease_enqueue(UNUSED redis_driver_conf_t *inst, fr_re
 static inline int driver_release_lease(void *out, void *instance, ippool_tool_operation_t const *op)
 {
 	return driver_do_lease(out, instance, op,
-			       _driver_release_lease_enqueue, _driver_release_lease_process);
+			       _driver_release_lease_enqueue, _driver_release_lease_process, NULL);
 }
 
 /** Count the number of leases we removed
@@ -679,13 +687,14 @@ static int _driver_remove_lease_process(void *out, UNUSED fr_ipaddr_t const *ipa
 static int _driver_remove_lease_enqueue(UNUSED redis_driver_conf_t *inst, fr_redis_conn_t *conn,
 					uint8_t const *key_prefix, size_t key_prefix_len,
 					UNUSED uint8_t const *range, UNUSED size_t range_len,
-					fr_ipaddr_t *ipaddr, uint8_t prefix)
+					fr_ipaddr_t *ipaddr, uint8_t prefix, UNUSED void *uctx)
 {
 	char		ip_buff[FR_IPADDR_PREFIX_STRLEN];
 
 	IPPOOL_SPRINT_IP(ip_buff, ipaddr, prefix);
 
-	DEBUG("Removing %s from pool \"%s\"", ip_buff, key_prefix);
+	DEBUG("Removing %s from pool \"%pV\"", ip_buff,
+	      fr_box_strvalue_len((char const *)key_prefix, key_prefix_len));
 	redisAppendCommand(conn->handle, "EVAL %s 1 %b %s", lua_remove_cmd, key_prefix, key_prefix_len, ip_buff);
 	return 1;
 }
@@ -696,7 +705,7 @@ static int _driver_remove_lease_enqueue(UNUSED redis_driver_conf_t *inst, fr_red
 static int driver_remove_lease(void *out, void *instance, ippool_tool_operation_t const *op)
 {
 	return driver_do_lease(out, instance, op,
-			       _driver_remove_lease_enqueue, _driver_remove_lease_process);
+			       _driver_remove_lease_enqueue, _driver_remove_lease_process, NULL);
 }
 
 /** Count the number of leases we actually added
@@ -726,7 +735,7 @@ static int _driver_add_lease_process(void *out, UNUSED fr_ipaddr_t const *ipaddr
 static int _driver_add_lease_enqueue(UNUSED redis_driver_conf_t *inst, fr_redis_conn_t *conn,
 				     uint8_t const *key_prefix, size_t key_prefix_len,
 				     uint8_t const *range, size_t range_len,
-				     fr_ipaddr_t *ipaddr, uint8_t prefix)
+				     fr_ipaddr_t *ipaddr, uint8_t prefix, UNUSED void *uctx)
 {
 	uint8_t		key[IPPOOL_MAX_POOL_KEY_SIZE];
 	uint8_t		*key_p = key;
@@ -741,7 +750,7 @@ static int _driver_add_lease_enqueue(UNUSED redis_driver_conf_t *inst, fr_redis_
 	IPPOOL_SPRINT_IP(ip_buff, ipaddr, prefix);
 	IPPOOL_BUILD_IP_KEY_FROM_STR(ip_key, ip_key_p, key_prefix, key_prefix_len, ip_buff);
 
-	DEBUG("Adding %s to pool \"%.*s\" (%zu)", ip_buff, (int)(key_p - key), key, key_p - key);
+	DEBUG("Adding %s to pool \"%pV\" (%zu)", ip_buff, fr_box_strvalue_len((char *)key, (key_p - key)), key_p - key);
 	redisAppendCommand(conn->handle, "MULTI");
 	enqueued++;
 	redisAppendCommand(conn->handle, "ZADD %b NX %u %s", key, key_p - key, 0, ip_buff);
@@ -767,7 +776,7 @@ static int _driver_add_lease_enqueue(UNUSED redis_driver_conf_t *inst, fr_redis_
  */
 static int driver_add_lease(void *out, void *instance, ippool_tool_operation_t const *op)
 {
-	return driver_do_lease(out, instance, op, _driver_add_lease_enqueue, _driver_add_lease_process);
+	return driver_do_lease(out, instance, op, _driver_add_lease_enqueue, _driver_add_lease_process, NULL);
 }
 
 /** Count the number of leases we modified
@@ -799,7 +808,7 @@ static int _driver_modify_lease_process(void *out, UNUSED fr_ipaddr_t const *ipa
 static int _driver_modify_lease_enqueue(UNUSED redis_driver_conf_t *inst, fr_redis_conn_t *conn,
 					uint8_t const *key_prefix, size_t key_prefix_len,
 					uint8_t const *range, size_t range_len,
-					fr_ipaddr_t *ipaddr, uint8_t prefix)
+					fr_ipaddr_t *ipaddr, uint8_t prefix, UNUSED void *uctx)
 {
 	uint8_t		key[IPPOOL_MAX_POOL_KEY_SIZE];
 	uint8_t		*key_p = key;
@@ -812,7 +821,7 @@ static int _driver_modify_lease_enqueue(UNUSED redis_driver_conf_t *inst, fr_red
 	IPPOOL_SPRINT_IP(ip_buff, ipaddr, prefix);
 	IPPOOL_BUILD_IP_KEY_FROM_STR(ip_key, ip_key_p, key_prefix, key_prefix_len, ip_buff);
 
-	DEBUG("Modifying %s in pool \"%s\"", ip_buff, key_prefix);
+	DEBUG("Modifying %s in pool \"%pV\"", ip_buff, fr_box_strvalue_len((char const *)key_prefix, key_prefix_len));
 	redisAppendCommand(conn->handle, "HSET %b range %b", ip_key, ip_key_p - ip_key, range, range_len);
 
 	return 1;
@@ -824,7 +833,92 @@ static int _driver_modify_lease_enqueue(UNUSED redis_driver_conf_t *inst, fr_red
 static int driver_modify_lease(void *out, void *instance, ippool_tool_operation_t const *op)
 {
 	return driver_do_lease(out, instance, op,
-			       _driver_modify_lease_enqueue, _driver_modify_lease_process);
+			       _driver_modify_lease_enqueue, _driver_modify_lease_process, NULL);
+}
+
+static int _driver_assign_lease_process(void *out, UNUSED fr_ipaddr_t const *ipaddr, redisReply const *reply)
+{
+	uint64_t *modified = out;
+	if (reply->type != REDIS_REPLY_INTEGER) return -1;
+
+	*modified += reply->integer;
+	return 0;
+}
+
+/** Enqueue static lease assignment commands
+ *
+ */
+static int _driver_assign_lease_enqueue(UNUSED redis_driver_conf_t *inst, fr_redis_conn_t *conn,
+				     uint8_t const *key_prefix, size_t key_prefix_len,
+				     uint8_t const *range, size_t range_len,
+				     fr_ipaddr_t *ipaddr, uint8_t prefix, void *uctx)
+{
+	ippool_tool_owner_t	*owner = uctx;
+	char		ip_buff[FR_IPADDR_PREFIX_STRLEN];
+	fr_time_t	now;
+
+	IPPOOL_SPRINT_IP(ip_buff, ipaddr, prefix);
+	now = fr_time();
+
+	DEBUG("Assigning address %s to owner %s", ip_buff, owner->owner);
+
+	redisAppendCommand(conn->handle, "EVAL %s 1 %b %s %b %b %i", lua_assign_cmd, key_prefix, key_prefix_len,
+			   ip_buff, owner->owner, strlen(owner->owner), range, range_len, fr_time_to_sec(now));
+	return 1;
+}
+
+/** Add static lease assignments
+ *
+ */
+static int driver_assign_lease(void *out, void *instance, ippool_tool_operation_t const *op, char const *owner)
+{
+	return driver_do_lease(out, instance, op,
+			       _driver_assign_lease_enqueue, _driver_assign_lease_process,
+			       &(ippool_tool_owner_t){ .owner = owner });
+}
+
+static int _driver_unassign_lease_process(void *out, UNUSED fr_ipaddr_t const *ipaddr, redisReply const *reply)
+{
+	uint64_t *modified = out;
+	/*
+	 *	Record the actual number of addresses unassigned.
+	 */
+	if (reply->type != REDIS_REPLY_INTEGER) return -1;
+
+	*modified += reply->integer;
+
+	return 0;
+}
+
+/** Enqueue static lease un-assignment commands
+ *
+ */
+static int _driver_unassign_lease_enqueue(UNUSED redis_driver_conf_t *inst, fr_redis_conn_t *conn,
+				     uint8_t const *key_prefix, size_t key_prefix_len,
+				     UNUSED uint8_t const *range, UNUSED size_t range_len,
+				     fr_ipaddr_t *ipaddr, uint8_t prefix, void *uctx)
+{
+	ippool_tool_owner_t	*owner = uctx;
+	char			ip_buff[FR_IPADDR_PREFIX_STRLEN];
+	fr_time_t		now;
+
+	IPPOOL_SPRINT_IP(ip_buff, ipaddr, prefix);
+	now = fr_time();
+
+	DEBUG("Un-assigning address %s from owner %s", ip_buff, owner->owner);
+	redisAppendCommand(conn->handle, "EVAL %s 1 %b %s %b %i", lua_unassign_cmd, key_prefix, key_prefix_len,
+			   ip_buff, owner->owner, strlen(owner->owner), fr_time_to_sec(now));
+	return 1;
+}
+
+/** Unassign static lease assignments
+ *
+ */
+static int driver_unassign_lease(void *out, void *instance, ippool_tool_operation_t const *op, char const *owner)
+{
+	return driver_do_lease(out, instance, op,
+			       _driver_unassign_lease_enqueue, _driver_unassign_lease_process,
+			       &(ippool_tool_owner_t){ .owner = owner });
 }
 
 /** Compare two pool names
@@ -839,11 +933,11 @@ static int8_t pool_cmp(void const *a, void const *b)
 	len_a = talloc_array_length((uint8_t const *)a);
 	len_b = talloc_array_length((uint8_t const *)b);
 
-	ret = (len_a > len_b) - (len_a < len_b);
+	ret = CMP(len_a, len_b);
 	if (ret != 0) return ret;
 
 	ret = memcmp(a, b, len_a);
-	return (ret > 0) - (ret < 0);
+	return CMP(ret, 0);
 }
 
 /** Return the pools available across the cluster
@@ -857,17 +951,18 @@ static int8_t pool_cmp(void const *a, void const *b)
  */
 static ssize_t driver_get_pools(TALLOC_CTX *ctx, uint8_t **out[], void *instance)
 {
-	fr_socket_addr_t	*master;
+	fr_socket_t		*master;
 	size_t			k;
 	ssize_t			ret, i, used = 0;
 	fr_redis_conn_t		*conn = NULL;
 	redis_driver_conf_t	*inst = talloc_get_type_abort(instance, redis_driver_conf_t);
 	uint8_t			key[IPPOOL_MAX_POOL_KEY_SIZE];
 	uint8_t			*key_p = key;
-	REQUEST			*request = request_alloc(inst);
 	uint8_t 		**result;
 
-	IPPOOL_BUILD_KEY(key, key_p, "*}:pool", 1);
+	IPPOOL_BUILD_KEY(key, key_p, "*}:"IPPOOL_POOL_KEY, 1);
+
+	*out = NULL;	/* Initialise output pointer */
 
 	/*
 	 *	Get the addresses of all masters in the pool
@@ -900,11 +995,10 @@ static ssize_t driver_get_pools(TALLOC_CTX *ctx, uint8_t **out[], void *instance
 		error:
 			TALLOC_FREE(result);
 			talloc_free(master);
-			talloc_free(request);
 			return -1;
 		}
 
-		conn = fr_pool_connection_get(pool, request);
+		conn = fr_pool_connection_get(pool, NULL);
 		if (!conn) goto error;
 		do {
 			/*
@@ -914,22 +1008,22 @@ static ssize_t driver_get_pools(TALLOC_CTX *ctx, uint8_t **out[], void *instance
 			reply = redisCommand(conn->handle, "SCAN %s MATCH %b COUNT 20", cursor, key, key_p - key);
 			if (!reply) {
 				ERROR("Failed reading reply");
-				fr_pool_connection_release(pool, request, conn);
+				fr_pool_connection_release(pool, NULL, conn);
 				goto error;
 			}
-			fr_redis_reply_print(L_DBG_LVL_3, reply, request, 0);
+			fr_redis_reply_print(L_DBG_LVL_3, reply, NULL, 0);
 			if (fr_redis_command_status(conn, reply) != REDIS_RCODE_SUCCESS) {
 				PERROR("Error retrieving keys %s", cursor);
 
 			reply_error:
-				fr_pool_connection_release(pool, request, conn);
-				fr_redis_reply_free(reply);
+				fr_pool_connection_release(pool, NULL, conn);
+				fr_redis_reply_free(&reply);
 				goto error;
 			}
 
 			if (reply->type != REDIS_REPLY_ARRAY) {
 				ERROR("Failed retrieving result, expected array got %s",
-				      fr_int2str(redis_reply_types, reply->type, "<UNKNOWN>"));
+				      fr_table_str_by_value(redis_reply_types, reply->type, "<UNKNOWN>"));
 
 				goto reply_error;
 			}
@@ -937,19 +1031,19 @@ static ssize_t driver_get_pools(TALLOC_CTX *ctx, uint8_t **out[], void *instance
 			if (reply->elements != 2) {
 				ERROR("Failed retrieving result, expected array with two elements, got %zu elements",
 				      reply->elements);
-				fr_redis_reply_free(reply);
+				fr_redis_reply_free(&reply);
 				goto reply_error;
 			}
 
 			if (reply->element[0]->type != REDIS_REPLY_STRING) {
 				ERROR("Failed retrieving result, expected string got %s",
-				      fr_int2str(redis_reply_types, reply->element[0]->type, "<UNKNOWN>"));
+				      fr_table_str_by_value(redis_reply_types, reply->element[0]->type, "<UNKNOWN>"));
 				goto reply_error;
 			}
 
 			if (reply->element[1]->type != REDIS_REPLY_ARRAY) {
 				ERROR("Failed retrieving result, expected array got %s",
-				      fr_int2str(redis_reply_types, reply->element[1]->type, "<UNKNOWN>"));
+				      fr_table_str_by_value(redis_reply_types, reply->element[1]->type, "<UNKNOWN>"));
 				goto reply_error;
 			}
 
@@ -969,20 +1063,16 @@ static ssize_t driver_get_pools(TALLOC_CTX *ctx, uint8_t **out[], void *instance
 				/*
 				 *	Skip over things which are not pool names
 				 */
-				if (pool_key->len < 7) { /* { + [<name>] + }:pool */
-				skip:
-					fr_redis_reply_free(reply);
-					continue;
-				}
+				if (pool_key->len < 7) continue; /* { + [<name>] + }:pool */
 
-				if ((pool_key->str[0]) != '{') goto skip;
+				if ((pool_key->str[0]) != '{') continue;
 				p = memchr(pool_key->str + 1, '}', pool_key->len - 1);
-				if (!p) goto skip;
+				if (!p) continue;
 
 				len = (pool_key->len - ((p + 1) - pool_key->str));
-				if (len != (sizeof(IPPOOL_POOL_KEY) - 1) + 1) goto skip;
+				if (len != (sizeof(IPPOOL_POOL_KEY) - 1) + 1) continue;
 				if (memcmp(p + 1, ":" IPPOOL_POOL_KEY, (sizeof(IPPOOL_POOL_KEY) - 1) + 1) != 0) {
-					goto skip;
+					continue;
 				}
 
 				/*
@@ -991,10 +1081,10 @@ static ssize_t driver_get_pools(TALLOC_CTX *ctx, uint8_t **out[], void *instance
 				result[used++] = talloc_memdup(result, pool_key->str + 1, (p - pool_key->str) - 1);
 			}
 
-			fr_redis_reply_free(reply);
+			fr_redis_reply_free(&reply);
 		} while (!((cursor[0] == '0') && (cursor[1] == '\0')));	/* Cursor value of 0 means no more results */
 
-		fr_pool_connection_release(pool, request, conn);
+		fr_pool_connection_release(pool, NULL, conn);
 	}
 
 	if (used == 0) {
@@ -1006,12 +1096,12 @@ static ssize_t driver_get_pools(TALLOC_CTX *ctx, uint8_t **out[], void *instance
 	/*
 	 *	Sort the results
 	 */
-	{
+	if (used > 1) {
 		uint8_t const **to_sort;
 
 		memcpy(&to_sort, &result, sizeof(to_sort));
 
-		fr_quick_sort((void const **)to_sort, 0, used, pool_cmp);
+		fr_quick_sort((void const **)to_sort, 0, used - 1, pool_cmp);
 	}
 
 	*out = talloc_array(ctx, uint8_t *, used);
@@ -1031,7 +1121,6 @@ static ssize_t driver_get_pools(TALLOC_CTX *ctx, uint8_t **out[], void *instance
 		while ((i < used) && (pool_cmp(result[i - 1], result[i]) == 0)) i++;
 	} while (i < used);
 
-	talloc_free(request);
 	talloc_free(result);
 
 	return used;
@@ -1047,40 +1136,55 @@ static int driver_get_stats(ippool_tool_stats_t *out, void *instance, uint8_t co
 
 	fr_redis_cluster_state_t	state;
 	fr_redis_rcode_t		status;
-	struct timeval			now;
+	fr_time_t			now;
 
 	int				s_ret = REDIS_RCODE_SUCCESS;
-	REQUEST				*request = request_alloc(inst);
 	redisReply			**replies = NULL, *reply;
 	unsigned int			pipelined = 0;		/* Update if additional commands added */
 
 	size_t				reply_cnt = 0, i = 0;
 
-#define STATS_COMMANDS_TOTAL 8
+#define STATS_COMMANDS_TOTAL 14
 
 	IPPOOL_BUILD_KEY(key, key_p, key_prefix, key_prefix_len);
 
 	MEM(replies = talloc_zero_array(inst, redisReply *, STATS_COMMANDS_TOTAL));
 
-	gettimeofday(&now, NULL);
+	now = fr_time();
 
-	for (s_ret = fr_redis_cluster_state_init(&state, &conn, inst->cluster, request, key, key_p - key, false);
+	for (s_ret = fr_redis_cluster_state_init(&state, &conn, inst->cluster, NULL, key, key_p - key, false);
 	     s_ret == REDIS_RCODE_TRY_AGAIN;
-	     s_ret = fr_redis_cluster_state_next(&state, &conn, inst->cluster, request, status, &replies[0])) {
+	     s_ret = fr_redis_cluster_state_next(&state, &conn, inst->cluster, NULL, status, &replies[0])) {
 		status = REDIS_RCODE_SUCCESS;
 
 		redisAppendCommand(conn->handle, "MULTI");
 		redisAppendCommand(conn->handle, "ZCARD %b", key, key_p - key);		/* Total */
 		redisAppendCommand(conn->handle, "ZCOUNT %b -inf %i",
-				   key, key_p - key, now.tv_sec);			/* Free */
+				   key, key_p - key, fr_time_to_sec(now));		/* Free */
 		redisAppendCommand(conn->handle, "ZCOUNT %b -inf %i",
-				   key, key_p - key, now.tv_sec + 60);			/* Free in next 60s */
+				   key, key_p - key, fr_time_to_sec(now) + 60);		/* Free in next 60s */
 		redisAppendCommand(conn->handle, "ZCOUNT %b -inf %i",
-				   key, key_p - key, now.tv_sec + (60 * 30));		/* Free in next 30 mins */
+				   key, key_p - key, fr_time_to_sec(now) + (60 * 30));	/* Free in next 30 mins */
 		redisAppendCommand(conn->handle, "ZCOUNT %b -inf %i",
-				   key, key_p - key, now.tv_sec + (60 * 60));		/* Free in next 60 mins */
+				   key, key_p - key, fr_time_to_sec(now) + (60 * 60));	/* Free in next 60 mins */
 		redisAppendCommand(conn->handle, "ZCOUNT %b -inf %i",
-				   key, key_p - key, now.tv_sec + (60 * 60 * 24));	/* Free in next day */
+				   key, key_p - key, fr_time_to_sec(now) + (60 * 60 * 24));	/* Free in next day */
+		redisAppendCommand(conn->handle, "ZCOUNT %b " STRINGIFY(IPPOOL_STATIC_BIT) " inf",
+				   key, key_p - key);					/* Total static */
+		redisAppendCommand(conn->handle, "ZCOUNT %b " STRINGIFY(IPPOOL_STATIC_BIT) " %"PRIu64,
+				   key, key_p - key, IPPOOL_STATIC_BIT + fr_time_to_sec(now));	/* Static assignments 'free' */
+		redisAppendCommand(conn->handle, "ZCOUNT %b " STRINGIFY(IPPOOL_STATIC_BIT) " %"PRIu64,
+				   key, key_p - key,
+				   IPPOOL_STATIC_BIT + fr_time_to_sec(now) + 60);	/* Static renew in 60s */
+		redisAppendCommand(conn->handle, "ZCOUNT %b " STRINGIFY(IPPOOL_STATIC_BIT) " %"PRIu64,
+				   key, key_p - key,
+				   IPPOOL_STATIC_BIT + fr_time_to_sec(now) + (60 * 30));	/* Static renew in 30 mins */
+		redisAppendCommand(conn->handle, "ZCOUNT %b " STRINGIFY(IPPOOL_STATIC_BIT) " %"PRIu64,
+				   key, key_p - key,
+				   IPPOOL_STATIC_BIT + fr_time_to_sec(now) + (60 * 60));	/* Static renew in 60 mins */
+		redisAppendCommand(conn->handle, "ZCOUNT %b " STRINGIFY(IPPOOL_STATIC_BIT) " %"PRIu64,
+				   key, key_p - key,
+				   IPPOOL_STATIC_BIT + fr_time_to_sec(now) + (60 * 60 * 24));	/* Static renew in 1 day */
 		redisAppendCommand(conn->handle, "EXEC");
 		if (!replies) return -1;
 
@@ -1088,13 +1192,12 @@ static int driver_get_stats(ippool_tool_stats_t *out, void *instance, uint8_t co
 		reply_cnt = fr_redis_pipeline_result(&pipelined, &status, replies,
 						     talloc_array_length(replies), conn);
 		for (i = 0; (size_t)i < reply_cnt; i++) fr_redis_reply_print(L_DBG_LVL_3,
-									     replies[i], request, i);
+									     replies[i], NULL, i);
 	}
 	if (s_ret != REDIS_RCODE_SUCCESS) {
 	error:
 		fr_redis_pipeline_free(replies, reply_cnt);
 		talloc_free(replies);
-		talloc_free(request);
 		return -1;
 	}
 
@@ -1107,7 +1210,7 @@ static int driver_get_stats(ippool_tool_stats_t *out, void *instance, uint8_t co
 
 	if (reply->type != REDIS_REPLY_ARRAY) {
 		ERROR("Failed retrieving pool stats: Expected array got %s",
-		      fr_int2str(redis_reply_types, reply->element[1]->type, "<UNKNOWN>"));
+		      fr_table_str_by_value(redis_reply_types, reply->element[1]->type, "<UNKNOWN>"));
 		goto error;
 	}
 
@@ -1127,10 +1230,15 @@ static int driver_get_stats(ippool_tool_stats_t *out, void *instance, uint8_t co
 	out->expiring_30m = reply->element[3]->integer - out->free;
 	out->expiring_1h = reply->element[4]->integer - out->free;
 	out->expiring_1d = reply->element[5]->integer - out->free;
+	out->static_tot = reply->element[6]->integer;
+	out->static_free = reply->element[7]->integer;
+	out->static_1m = reply->element[8]->integer - out->static_free;
+	out->static_30m = reply->element[9]->integer - out->static_free;
+	out->static_1h = reply->element[10]->integer - out->static_free;
+	out->static_1d = reply->element[11]->integer - out->static_free;
 
 	fr_redis_pipeline_free(replies, reply_cnt);
 	talloc_free(replies);
-	talloc_free(request);
 
 	return 0;
 }
@@ -1305,7 +1413,7 @@ static int parse_ip_range(fr_ipaddr_t *start_out, fr_ipaddr_t *end_out, char con
 		uint128_t ip, p_mask;
 
 		/* cond assert to satisfy clang scan */
-		if (!rad_cond_assert((prefix > 0) && (prefix <= 128))) return -1;
+		if (!fr_cond_assert((prefix > 0) && (prefix <= 128))) return -1;
 
 		/* Don't be tempted to cast */
 		memcpy(&ip, start.addr.v6.s6_addr, sizeof(ip));
@@ -1322,7 +1430,7 @@ static int parse_ip_range(fr_ipaddr_t *start_out, fr_ipaddr_t *end_out, char con
 		uint32_t ip;
 
 		/* cond assert to satisfy clang scan */
-		if (!rad_cond_assert((prefix > 0) && (prefix <= 32))) return -1;
+		if (!fr_cond_assert((prefix > 0) && (prefix <= 32))) return -1;
 
 		ip = ntohl(start.addr.v4.s_addr);
 
@@ -1343,33 +1451,32 @@ static int parse_ip_range(fr_ipaddr_t *start_out, fr_ipaddr_t *end_out, char con
 int main(int argc, char *argv[])
 {
 	static ippool_tool_operation_t	ops[128];
-	ippool_tool_operation_t		*p = ops, *end = ops + (sizeof(ops) / sizeof(*ops));
+	ippool_tool_operation_t		*p = ops, *end = ops + (NUM_ELEMENTS(ops));
 
-	int				opt;
+	int				c;
 
 	uint8_t				*range_arg = NULL;
 	uint8_t				*pool_arg = NULL;
 	bool				do_export = false, print_stats = false, list_pools = false;
 	bool				need_pool = false;
 	char				*do_import = NULL;
+	char const			*filename = NULL;
+	char const			*owner = NULL;
 
 	CONF_SECTION			*pool_cs;
 	CONF_PAIR			*cp;
 	ippool_tool_t			*conf;
 
 	fr_debug_lvl = 0;
-	rad_debug_lvl = 0;
 	name = argv[0];
 
 	conf = talloc_zero(NULL, ippool_tool_t);
-	conf->cs = cf_section_alloc(NULL, NULL, "main", NULL);
-	if (!conf->cs) exit(EXIT_FAILURE);
-
-	trigger_exec_init(conf->cs);
+	conf->cs = cf_section_alloc(conf, NULL, "main", NULL);
+	if (!conf->cs) fr_exit_now(EXIT_FAILURE);
 
 #define ADD_ACTION(_action) \
 do { \
-	if ((size_t)(p - ops) >= sizeof(ops)) { \
+	if (p >= end) { \
 		ERROR("Too many actions, max is " STRINGIFY(sizeof(ops))); \
 		usage(64); \
 	} \
@@ -1377,84 +1484,94 @@ do { \
 	p->name = optarg; \
 	p++; \
 	need_pool = true; \
-} while (0);
+} while (0)
 
-	while ((opt = getopt(argc, argv, "a:d:r:s:Sm:p:ilLhxo:f:")) != EOF)
-	switch (opt) {
-	case 'a':
-		ADD_ACTION(IPPOOL_TOOL_ADD);
-		break;
+	while ((c = getopt(argc, argv, "a:d:r:s:Sm:A:U:O:p:ilLhxo:f:")) != -1) switch (c) {
+		case 'a':
+			ADD_ACTION(IPPOOL_TOOL_ADD);
+			break;
 
-	case 'd':
-		ADD_ACTION(IPPOOL_TOOL_REMOVE);
-		break;
+		case 'd':
+			ADD_ACTION(IPPOOL_TOOL_REMOVE);
+			break;
 
-	case 'r':
-		ADD_ACTION(IPPOOL_TOOL_RELEASE);
-		break;
+		case 'r':
+			ADD_ACTION(IPPOOL_TOOL_RELEASE);
+			break;
 
-	case 's':
-		ADD_ACTION(IPPOOL_TOOL_SHOW);
-		break;
+		case 's':
+			ADD_ACTION(IPPOOL_TOOL_SHOW);
+			break;
 
-	case 'm':
-		ADD_ACTION(IPPOOL_TOOL_MODIFY);
-		break;
+		case 'm':
+			ADD_ACTION(IPPOOL_TOOL_MODIFY);
+			break;
 
-	case 'p':
-	{
-		unsigned long tmp;
-		char *q;
+		case 'A':
+			ADD_ACTION(IPPOOL_TOOL_ASSIGN);
+			break;
 
-		if (p == ops) {
-			ERROR("Prefix may only be specified after a pool management action");
-			usage(64);
+		case 'U':
+			ADD_ACTION(IPPOOL_TOOL_UNASSIGN);
+			break;
+
+		case 'O':
+			owner = optarg;
+			break;
+
+		case 'p':
+		{
+			unsigned long tmp;
+			char *q;
+
+			if (p == ops) {
+				ERROR("Prefix may only be specified after a pool management action");
+				usage(64);
+			}
+
+			tmp = strtoul(optarg, &q, 10);
+			if (q != (optarg + strlen(optarg))) {
+				ERROR("Prefix must be an integer value");
+
+			}
+
+			(p - 1)->prefix = (uint8_t)tmp & 0xff;
 		}
+			break;
 
-		tmp = strtoul(optarg, &q, 10);
-		if (q != (optarg + strlen(optarg))) {
-			ERROR("Prefix must be an integer value");
+		case 'i':
+			do_import = optarg;
+			break;
 
-		}
+		case 'I':
+			do_export = true;
+			break;
 
-		(p - 1)->prefix = (uint8_t)tmp & 0xff;
-	}
-		break;
+		case 'l':
+			if (list_pools) usage(1);	/* Only allowed once */
+			list_pools = true;
+			break;
 
-	case 'i':
-		do_import = optarg;
-		break;
+		case 'S':
+			print_stats = true;
+			break;
 
-	case 'I':
-		do_export = true;
-		break;
+		case 'h':
+			usage(0);
 
-	case 'l':
-		if (list_pools) usage(1);	/* Only allowed once */
-		list_pools = true;
-		break;
+		case 'x':
+			fr_debug_lvl++;
+			break;
 
-	case 'S':
-		print_stats = true;
-		break;
+		case 'o':
+			break;
 
-	case 'h':
-		usage(0);
+		case 'f':
+			filename = optarg;
+			break;
 
-	case 'x':
-		fr_debug_lvl++;
-		rad_debug_lvl++;
-		break;
-
-	case 'o':
-		break;
-
-	case 'f':
-		if (cf_file_read(conf->cs, optarg) < 0) exit(EXIT_FAILURE);
-		break;
-
-	default:
-		usage(1);
+		default:
+			usage(1);
 	}
 	argc -= optind;
 	argv += optind;
@@ -1469,46 +1586,47 @@ do { \
 	}
 	if (argc > 3) usage(64);
 
+	/*
+	 *	Read configuration files if necessary.
+	 */
+	if (filename && (cf_file_read(conf->cs, filename) < 0 || (cf_section_pass2(conf->cs) < 0))) {
+		fr_exit_now(EXIT_FAILURE);
+	}
+
 	cp = cf_pair_alloc(conf->cs, "server", argv[0], T_OP_EQ, T_BARE_WORD, T_DOUBLE_QUOTED_STRING);
 	if (!cp) {
 		ERROR("Failed creating server pair");
-		exit(EXIT_FAILURE);
+		fr_exit_now(EXIT_FAILURE);
 	}
-	cf_pair_add(conf->cs, cp);
 
 	/*
 	 *	Unescape sequences in the pool name
 	 */
 	if (argv[1] && (argv[1][0] != '\0')) {
-		uint8_t	*arg;
-		size_t	len;
+		fr_sbuff_t		out;
+		fr_sbuff_uctx_talloc_t	tctx;
 
-		/*
-		 *	Be forgiving about zero length strings...
-		 */
-		len = strlen(argv[1]);
-		MEM(arg = talloc_array(conf, uint8_t, len));
-		len = value_str_unescape(arg, argv[1], len, '"');
-		rad_assert(len);
-
-		MEM(pool_arg = talloc_realloc(conf, arg, uint8_t, len));
+		MEM(fr_sbuff_init_talloc(conf, &out, &tctx, strlen(argv[1]) + 1, SIZE_MAX));
+		(void) fr_value_str_unescape(&out,
+					     &FR_SBUFF_IN(argv[1], strlen(argv[1])), SIZE_MAX, '"');
+		talloc_realloc(conf, out.buff, uint8_t, fr_sbuff_used(&out));
+		pool_arg = (uint8_t *)out.buff;
 	}
 
 	if (argc >= 3 && (argv[2][0] != '\0')) {
-		uint8_t	*arg;
-		size_t	len;
+		fr_sbuff_t		out;
+		fr_sbuff_uctx_talloc_t	tctx;
 
-		len = strlen(argv[2]);
-		MEM(arg = talloc_array(conf, uint8_t, len));
-		len = value_str_unescape(arg, argv[2], len, '"');
-		rad_assert(len);
-
-		MEM(range_arg = talloc_realloc(conf, arg, uint8_t, len));
+		MEM(fr_sbuff_init_talloc(conf, &out, &tctx, strlen(argv[1]) + 1, SIZE_MAX));
+		(void) fr_value_str_unescape(&out,
+					     &FR_SBUFF_IN(argv[2], strlen(argv[2])), SIZE_MAX, '"');
+		talloc_realloc(conf, out.buff, uint8_t, fr_sbuff_used(&out));
+		range_arg = (uint8_t *)out.buff;
 	}
 
 	if (!do_import && !do_export && !list_pools && !print_stats && (p == ops)) {
 		ERROR("Nothing to do!");
-		exit(EXIT_FAILURE);
+		fr_exit_now(EXIT_FAILURE);
 	}
 
 	/*
@@ -1517,27 +1635,36 @@ do { \
 	pool_cs = cf_section_find(conf->cs, "pool", NULL);
 	if (!pool_cs) {
 		pool_cs = cf_section_alloc(conf->cs, conf->cs, "pool", NULL);
-		cf_section_add(conf->cs, pool_cs);
 	}
 	cp = cf_pair_find(pool_cs, "start");
 	if (!cp) {
-		cp = cf_pair_alloc(pool_cs, "start", "0", T_OP_EQ, T_BARE_WORD, T_BARE_WORD);
-		cf_pair_add(pool_cs, cp);
+		/*
+		 *	Start should always default to 1
+		 *	else the cluster code doesn't
+		 *	map the cluster.
+		 */
+		(void) cf_pair_alloc(pool_cs, "start", "1", T_OP_EQ, T_BARE_WORD, T_BARE_WORD);
 	}
 	cp = cf_pair_find(pool_cs, "spare");
 	if (!cp) {
-		cp = cf_pair_alloc(pool_cs, "spare", "0", T_OP_EQ, T_BARE_WORD, T_BARE_WORD);
-		cf_pair_add(pool_cs, cp);
+		(void) cf_pair_alloc(pool_cs, "spare", "0", T_OP_EQ, T_BARE_WORD, T_BARE_WORD);
 	}
 	cp = cf_pair_find(pool_cs, "min");
 	if (!cp) {
-		cp = cf_pair_alloc(pool_cs, "min", "0", T_OP_EQ, T_BARE_WORD, T_BARE_WORD);
-		cf_pair_add(pool_cs, cp);
+		(void) cf_pair_alloc(pool_cs, "min", "0", T_OP_EQ, T_BARE_WORD, T_BARE_WORD);
+	}
+	cp = cf_pair_find(pool_cs, "max");
+	if (!cp) {
+		/*
+		 *	Set a safe default for "max" - as this is a stand alone tool,
+		 *	it can't use automatic value from the worker thread count.
+		 */
+		(void) cf_pair_alloc(pool_cs, "max", "10", T_OP_EQ, T_BARE_WORD, T_BARE_WORD);
 	}
 
 	if (driver_init(conf, conf->cs, &conf->driver) < 0) {
 		ERROR("Driver initialisation failed");
-		exit(EXIT_FAILURE);
+		fr_exit_now(EXIT_FAILURE);
 	}
 
 	if (do_import) {
@@ -1560,36 +1687,44 @@ do { \
 			pools[0] = pool_arg;
 		} else {
 			slen = driver_get_pools(conf, &pools, conf->driver);
-			if (slen < 0) exit(EXIT_FAILURE);
+			if (slen < 0) fr_exit_now(EXIT_FAILURE);
 		}
 
 		for (i = 0; i < (size_t)slen; i++) {
-			char *pool_str;
-			uint64_t acum = 0;
-
 			if (driver_get_stats(&stats, conf->driver,
-					     pools[i], talloc_array_length(pools[i])) < 0) exit(EXIT_FAILURE);
+					     pools[i], talloc_array_length(pools[i])) < 0) fr_exit_now(EXIT_FAILURE);
 
-			pool_str = fr_asprint(conf, (char *)pools[i], talloc_array_length(pools[i]), '"');
-			INFO("pool             : %s", pool_str);
-			talloc_free(pool_str);
-
-			INFO("total            : %" PRIu64, stats.total);
-			INFO("free             : %" PRIu64, stats.free);
-			INFO("used             : %" PRIu64, stats.total - stats.free);
-			if (stats.total) {
-				INFO("used (%%)         : %.2Lf",
-				     ((long double)(stats.total - stats.free) / (long double)stats.total) * 100);
+			INFO("pool                : %pV", fr_box_strvalue_len((char *)pools[i],
+									   talloc_array_length(pools[i])));
+			INFO("total               : %" PRIu64, stats.total);
+			INFO("dynamic total       : %" PRIu64, stats.total - stats.static_tot);
+			INFO("dynamic free        : %" PRIu64, stats.free);
+			INFO("dynamic used        : %" PRIu64, stats.total - stats.free - stats.static_tot);
+			if ((stats.total - stats.static_tot) > 0) {
+				INFO("dynamic used (%%)    : %.2Lf",
+				     ((long double)(stats.total - stats.free - stats.static_tot) /
+				      (long double)(stats.total - stats.static_tot)) * 100);
 			} else {
-				INFO("used (%%)         : 0");
+				INFO("used (%%)            : 0");
 			}
-			INFO("expiring 0-1m    : %" PRIu64, stats.expiring_1m);
-			acum += stats.expiring_1m;
-			INFO("expiring 1-30m   : %" PRIu64, stats.expiring_30m - acum);
-			acum += stats.expiring_30m;
-			INFO("expiring 30m-1h  : %" PRIu64, stats.expiring_1h - acum);
-			acum += stats.expiring_1h;
-			INFO("expiring 1h-1d   : %" PRIu64, stats.expiring_1d - acum);
+			INFO("expiring 0-1m       : %" PRIu64, stats.expiring_1m);
+			INFO("expiring 1-30m      : %" PRIu64, stats.expiring_30m - stats.expiring_1m);
+			INFO("expiring 30m-1h     : %" PRIu64, stats.expiring_1h - stats.expiring_30m);
+			INFO("expiring 1h-1d      : %" PRIu64, stats.expiring_1d - stats.expiring_1h);
+			INFO("static total        : %" PRIu64, stats.static_tot);
+			INFO("static 'free'       : %" PRIu64, stats.static_free);
+			INFO("static issued       : %" PRIu64, stats.static_tot - stats.static_free);
+			if (stats.static_tot) {
+				INFO("static issued (%%)   : %.2Lf",
+				     ((long double)(stats.static_tot - stats.static_free) /
+				      (long double)(stats.static_tot)) * 100);
+			} else {
+				INFO("static issued (%%)   : 0");
+			}
+			INFO("static renew 0-1m   : %" PRIu64, stats.static_1m);
+			INFO("static renew 1-30m  : %" PRIu64, stats.static_30m - stats.static_1m);
+			INFO("static renew 30m-1h : %" PRIu64, stats.static_1h - stats.static_30m);
+			INFO("static renew 1h-1d  : %" PRIu64, stats.static_1d - stats.static_1h);
 			INFO("--");
 		}
 	}
@@ -1600,14 +1735,10 @@ do { \
 		uint8_t 	**pools;
 
 		slen = driver_get_pools(conf, &pools, conf->driver);
-		if (slen < 0) exit(EXIT_FAILURE);
+		if (slen < 0) fr_exit_now(EXIT_FAILURE);
 		if (slen > 0) {
 			for (i = 0; i < (size_t)slen; i++) {
-				char *pool_str;
-
-				pool_str = fr_asprint(conf, (char *)pools[i], talloc_array_length(pools[i]), '"');
-				INFO("%s", pool_str);
-				talloc_free(pool_str);
+				INFO("%pV", fr_box_strvalue_len((char *)pools[i], talloc_array_length(pools[i])));
 			}
 			INFO("--");
 		}
@@ -1640,7 +1771,7 @@ do { \
 		uint64_t count = 0;
 
 		if (driver_add_lease(&count, conf->driver, p) < 0) {
-			exit(EXIT_FAILURE);
+			fr_exit_now(EXIT_FAILURE);
 		}
 		INFO("Added %" PRIu64 " address(es)/prefix(es)", count);
 	}
@@ -1651,7 +1782,7 @@ do { \
 		uint64_t count = 0;
 
 		if (driver_remove_lease(&count, conf->driver, p) < 0) {
-			exit(EXIT_FAILURE);
+			fr_exit_now(EXIT_FAILURE);
 		}
 		INFO("Removed %" PRIu64 " address(es)/prefix(es)", count);
 	}
@@ -1662,7 +1793,7 @@ do { \
 		uint64_t count = 0;
 
 		if (driver_release_lease(&count, conf->driver, p) < 0) {
-			exit(EXIT_FAILURE);
+			fr_exit_now(EXIT_FAILURE);
 		}
 		INFO("Released %" PRIu64 " address(es)/prefix(es)", count);
 	}
@@ -1674,9 +1805,9 @@ do { \
 		size_t len, i;
 
 		if (driver_show_lease(&leases, conf->driver, p) < 0) {
-			exit(EXIT_FAILURE);
+			fr_exit_now(EXIT_FAILURE);
 		}
-		rad_assert(leases);
+		if (!fr_cond_assert(leases)) continue;
 
 		len = talloc_array_length(leases);
 		INFO("Retrieved information for %zu address(es)/prefix(es)", len - 1);
@@ -1692,7 +1823,7 @@ do { \
 
 			leases[i] = talloc_get_type_abort(leases[i], ippool_tool_lease_t);
 
-			gettimeofday(&now, NULL);
+			now = fr_time_to_timeval(fr_time());
 			is_active = now.tv_sec <= leases[i]->next_event;
 			if (leases[i]->next_event) {
 				strftime(time_buff, sizeof(time_buff), "%b %e %Y %H:%M:%S %Z",
@@ -1739,9 +1870,49 @@ do { \
 		uint64_t count = 0;
 
 		if (driver_modify_lease(&count, conf->driver, p) < 0) {
-			exit(EXIT_FAILURE);
+			fr_exit_now(EXIT_FAILURE);
 		}
 		INFO("Modified %" PRIu64 " address(es)/prefix(es)", count);
+	}
+		continue;
+
+	case IPPOOL_TOOL_ASSIGN:
+	{
+		uint64_t count = 0;
+
+		if (fr_ipaddr_cmp(&p->start, &p->end) != 0) {
+			ERROR("Static assignment requires a single IP");
+			fr_exit_now(EXIT_FAILURE);
+		}
+		if (!owner) {
+			ERROR("Static assignment requires an owner");
+			fr_exit_now(EXIT_FAILURE);
+		}
+
+		if (driver_assign_lease(&count, conf->driver, p, owner) < 0) {
+			fr_exit_now(EXIT_FAILURE);
+		}
+		INFO("Assigned %" PRIu64 " address(es)/prefix(es)", count);
+	}
+		continue;
+
+	case IPPOOL_TOOL_UNASSIGN:
+	{
+		uint64_t count = 0;
+
+		if (fr_ipaddr_cmp(&p->start, &p->end) != 0) {
+			ERROR("Static lease un-assignment requires a single IP");
+			fr_exit_now(EXIT_FAILURE);
+		}
+		if (!owner) {
+			ERROR("Static lease un-assignment requires an owner");
+			fr_exit_now(EXIT_FAILURE);
+		}
+
+		if (driver_unassign_lease(&count, conf->driver, p, owner) < 0) {
+			fr_exit_now(EXIT_FAILURE);
+		}
+		INFO("Un-assigned %" PRIu64 " address(es)/prefix(es)", count);
 	}
 		continue;
 
@@ -1750,8 +1921,6 @@ do { \
 	}
 
 	talloc_free(conf);
-
-	trigger_exec_free();
 
 	return 0;
 }

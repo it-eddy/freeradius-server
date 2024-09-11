@@ -19,327 +19,159 @@
  * @file rlm_sqlippool.c
  * @brief Allocates an IPv4 address from pools stored in SQL.
  *
- * @copyright 2002  Globe.Net Communications Limited
- * @copyright 2006  The FreeRADIUS server project
- * @copyright 2006  Suntel Communications
+ * @copyright 2002 Globe.Net Communications Limited
+ * @copyright 2006 The FreeRADIUS server project
+ * @copyright 2006 Suntel Communications
  */
 RCSID("$Id$")
 
-#define LOG_PREFIX "rlm_sql_ippool (%s) - "
-#define LOG_PREFIX_ARGS inst->sql_instance_name
+#define LOG_PREFIX inst->name
 
 #include <rlm_sql.h>
-#include <freeradius-devel/rad_assert.h>
+#include <freeradius-devel/util/debug.h>
+#include <freeradius-devel/radius/radius.h>
+#include <freeradius-devel/unlang/function.h>
 
 #include <ctype.h>
-
-
-#define MAX_QUERY_LEN 4096
 
 /*
  *	Define a structure for our module configuration.
  */
-typedef struct rlm_sqlippool_t {
-	char const	*sql_instance_name;
+typedef struct {
+	char const      *name;
+	char const	*sql_name;
 
-	uint32_t	lease_duration;
-
-	rlm_sql_t const	*sql_inst;
-
-	char const	*pool_name;
-	fr_dict_attr_t const *framed_ip_address; //!< the attribute for IP address allocation
-	char const	*attribute_name;	//!< name of the IP address attribute
-
-	time_t		last_clear;		//!< So we only do it once a second.
-	char const	*allocate_begin;	//!< SQL query to begin.
-	char const	*allocate_clear;	//!< SQL query to clear an IP.
-	char const	*allocate_find;		//!< SQL query to find an unused IP.
-	char const	*allocate_update;	//!< SQL query to mark an IP as used.
-	char const	*allocate_commit;	//!< SQL query to commit.
-
-	char const	*pool_check;		//!< Query to check for the existence of the pool.
-
-						/* Start sequence */
-	char const	*start_begin;		//!< SQL query to begin.
-	char const	*start_update;		//!< SQL query to update an IP entry.
-	char const	*start_commit;		//!< SQL query to commit.
-
-						/* Alive sequence */
-	char const	*alive_begin;		//!< SQL query to begin.
-	char const	*alive_update;		//!< SQL query to update an IP entry.
-	char const	*alive_commit;		//!< SQL query to commit.
-
-						/* Stop sequence */
-	char const	*stop_begin;		//!< SQL query to begin.
-	char const	*stop_clear;		//!< SQL query to clear an IP.
-	char const	*stop_commit;		//!< SQL query to commit.
-
-						/* On sequence */
-	char const	*on_begin;		//!< SQL query to begin.
-	char const	*on_clear;		//!< SQL query to clear an entire NAS.
-	char const	*on_commit;		//!< SQL query to commit.
-
-						/* Off sequence */
-	char const	*off_begin;		//!< SQL query to begin.
-	char const	*off_clear;		//!< SQL query to clear an entire NAS.
-	char const	*off_commit;		//!< SQL query to commit.
-
-						/* Logging Section */
-	char const	*log_exists;		//!< There was an ip address already assigned.
-	char const	*log_success;		//!< We successfully allocated ip address from pool.
-	char const	*log_clear;		//!< We successfully deallocated ip address from pool.
-	char const	*log_failed;		//!< Failed to allocate ip from the pool.
-	char const	*log_nopool;		//!< There was no Framed-IP-Address but also no Pool-Name.
-
-						/* Reserved to handle 255.255.255.254 Requests */
-	char const	*defaultpool;		//!< Default Pool-Name if there is none in the check items.
-
+	rlm_sql_t const	*sql;
 } rlm_sqlippool_t;
 
-static CONF_PARSER message_config[] = {
-	{ FR_CONF_OFFSET("exists", FR_TYPE_STRING | FR_TYPE_XLAT, rlm_sqlippool_t, log_exists) },
-	{ FR_CONF_OFFSET("success", FR_TYPE_STRING | FR_TYPE_XLAT, rlm_sqlippool_t, log_success) },
-	{ FR_CONF_OFFSET("clear", FR_TYPE_STRING | FR_TYPE_XLAT, rlm_sqlippool_t, log_clear) },
-	{ FR_CONF_OFFSET("failed", FR_TYPE_STRING | FR_TYPE_XLAT, rlm_sqlippool_t, log_failed) },
-	{ FR_CONF_OFFSET("nopool", FR_TYPE_STRING | FR_TYPE_XLAT, rlm_sqlippool_t, log_nopool) },
-	CONF_PARSER_TERMINATOR
-};
-
-static CONF_PARSER module_config[] = {
-	{ FR_CONF_OFFSET("sql_module_instance", FR_TYPE_STRING | FR_TYPE_REQUIRED, rlm_sqlippool_t, sql_instance_name), .dflt = "sql" },
-
-	{ FR_CONF_OFFSET("lease_duration", FR_TYPE_UINT32, rlm_sqlippool_t, lease_duration), .dflt = "86400" },
-
-	{ FR_CONF_OFFSET("pool_name", FR_TYPE_STRING, rlm_sqlippool_t, pool_name), .dflt = "" },
-
-	{ FR_CONF_OFFSET("attribute_name", FR_TYPE_STRING | FR_TYPE_REQUIRED | FR_TYPE_NOT_EMPTY, rlm_sqlippool_t, attribute_name), .dflt = "Framed-IP-Address" },
-
-	{ FR_CONF_OFFSET("default_pool", FR_TYPE_STRING, rlm_sqlippool_t, defaultpool), .dflt = "main_pool" },
-
-
-	{ FR_CONF_OFFSET("allocate_begin", FR_TYPE_STRING | FR_TYPE_XLAT, rlm_sqlippool_t, allocate_begin), .dflt = "START TRANSACTION" },
-
-	{ FR_CONF_OFFSET("allocate_clear", FR_TYPE_STRING | FR_TYPE_XLAT , rlm_sqlippool_t, allocate_clear), .dflt = "" },
-
-	{ FR_CONF_OFFSET("allocate_find", FR_TYPE_STRING | FR_TYPE_XLAT | FR_TYPE_REQUIRED, rlm_sqlippool_t, allocate_find), .dflt = "" },
-
-	{ FR_CONF_OFFSET("allocate_update", FR_TYPE_STRING | FR_TYPE_XLAT , rlm_sqlippool_t, allocate_update), .dflt = "" },
-
-	{ FR_CONF_OFFSET("allocate_commit", FR_TYPE_STRING | FR_TYPE_XLAT, rlm_sqlippool_t, allocate_commit), .dflt = "COMMIT" },
-
-
-	{ FR_CONF_OFFSET("pool_check", FR_TYPE_STRING | FR_TYPE_XLAT, rlm_sqlippool_t, pool_check), .dflt = "" },
-
-
-	{ FR_CONF_OFFSET("start_begin", FR_TYPE_STRING | FR_TYPE_XLAT, rlm_sqlippool_t, start_begin), .dflt = "START TRANSACTION" },
-
-	{ FR_CONF_OFFSET("start_update", FR_TYPE_STRING | FR_TYPE_XLAT , rlm_sqlippool_t, start_update), .dflt = "" },
-
-	{ FR_CONF_OFFSET("start_commit", FR_TYPE_STRING | FR_TYPE_XLAT, rlm_sqlippool_t, start_commit), .dflt = "COMMIT" },
-
-
-	{ FR_CONF_OFFSET("alive_begin", FR_TYPE_STRING | FR_TYPE_XLAT, rlm_sqlippool_t, alive_begin), .dflt = "START TRANSACTION" },
-
-	{ FR_CONF_OFFSET("alive_update", FR_TYPE_STRING | FR_TYPE_XLAT , rlm_sqlippool_t, alive_update), .dflt = "" },
-
-	{ FR_CONF_OFFSET("alive_commit", FR_TYPE_STRING | FR_TYPE_XLAT, rlm_sqlippool_t, alive_commit), .dflt = "COMMIT" },
-
-
-	{ FR_CONF_OFFSET("stop_begin", FR_TYPE_STRING | FR_TYPE_XLAT, rlm_sqlippool_t, stop_begin), .dflt = "START TRANSACTION" },
-
-	{ FR_CONF_OFFSET("stop_clear", FR_TYPE_STRING | FR_TYPE_XLAT , rlm_sqlippool_t, stop_clear), .dflt = "" },
-
-	{ FR_CONF_OFFSET("stop_commit", FR_TYPE_STRING | FR_TYPE_XLAT, rlm_sqlippool_t, stop_commit), .dflt = "COMMIT" },
-
-
-	{ FR_CONF_OFFSET("on_begin", FR_TYPE_STRING | FR_TYPE_XLAT, rlm_sqlippool_t, on_begin), .dflt = "START TRANSACTION" },
-
-	{ FR_CONF_OFFSET("on_clear", FR_TYPE_STRING | FR_TYPE_XLAT , rlm_sqlippool_t, on_clear), .dflt = "" },
-
-	{ FR_CONF_OFFSET("on_commit", FR_TYPE_STRING | FR_TYPE_XLAT, rlm_sqlippool_t, on_commit), .dflt = "COMMIT" },
-
-
-	{ FR_CONF_OFFSET("off_begin", FR_TYPE_STRING | FR_TYPE_XLAT, rlm_sqlippool_t, off_begin), .dflt = "START TRANSACTION" },
-
-	{ FR_CONF_OFFSET("off_clear", FR_TYPE_STRING | FR_TYPE_XLAT , rlm_sqlippool_t, off_clear), .dflt = "" },
-
-	{ FR_CONF_OFFSET("off_commit", FR_TYPE_STRING | FR_TYPE_XLAT, rlm_sqlippool_t, off_commit), .dflt = "COMMIT" },
-
-	{ FR_CONF_POINTER("messages", FR_TYPE_SUBSECTION, NULL), .subcs = (void const *) message_config },
-	CONF_PARSER_TERMINATOR
-};
-
-/*
- *	Replace %<whatever> in a string.
- *
- *	%P	pool_name
- *	%I	param
- *	%J	lease_duration
- *
+/**  Call environment used by module alloc method
  */
-static int sqlippool_expand(char * out, int outlen, char const * fmt,
-			    rlm_sqlippool_t *data, char * param, int param_len)
+typedef struct {
+	fr_value_box_t	pool_name;			//!< Name of pool address will be allocated from.
+	tmpl_t		*pool_name_tmpl;		//!< Tmpl used to expand pool_name
+	fr_value_box_t	requested_address;		//!< IP address being requested by client.
+	tmpl_t		*allocated_address_attr;	//!< Attribute to populate with allocated IP.
+	fr_value_box_t	allocated_address;		//!< Existing value for allocated IP.
+	fr_value_box_t	begin;				//!< SQL query to begin transaction.
+	tmpl_t		*existing;			//!< tmpl to expand as query for finding the existing IP.
+	tmpl_t		*requested;			//!< tmpl to expand as query for finding the requested IP.
+	tmpl_t		*find;				//!< tmpl to expand as query for finding an unused IP.
+	tmpl_t		*update;			//!< tmpl to expand as query for updating the found IP.
+	tmpl_t		*pool_check;			//!< tmpl to expand as query for checking for existence of the pool.
+	fr_value_box_t	commit;				//!< SQL query to commit transaction.
+} ippool_alloc_call_env_t;
+
+/**  Call environment used by all other module methods
+ */
+typedef struct {
+	fr_value_box_t	free;			//!< SQL query to clear other offered IPs.  Only used in "update" method.
+	fr_value_box_t	update;			//!< SQL query to update an IP record.
+} ippool_common_call_env_t;
+
+/** Current step in IP allocation state machine
+ */
+typedef enum {
+	IPPOOL_ALLOC_BEGIN_RUN,			//!< Run the "begin" query
+	IPPOOL_ALLOC_EXISTING,			//!< Expanding the "existing" query
+	IPPOOL_ALLOC_EXISTING_RUN,		//!< Run the "existing" query
+	IPPOOL_ALLOC_REQUESTED,			//!< Expanding the "requested" query
+	IPPOOL_ALLOC_REQUESTED_RUN,		//!< Run the "requested" query
+	IPPOOL_ALLOC_FIND,			//!< Expanding the "find" query
+	IPPOOL_ALLOC_FIND_RUN,			//!< Run the "find" query
+	IPPOOL_ALLOC_NO_ADDRESS,		//!< No address was found
+	IPPOOL_ALLOC_POOL_CHECK,		//!< Expanding the "pool_check" query
+	IPPOOL_ALLOC_POOL_CHECK_RUN,		//!< Run the "pool_check" query
+	IPPOOL_ALLOC_MAKE_PAIR,			//!< Make the pair.
+	IPPOOL_ALLOC_UPDATE,			//!< Expanding the "update" query
+	IPPOOL_ALLOC_UPDATE_RUN,		//!< Run the "update" query
+	IPPOOL_ALLOC_COMMIT_RUN,		//!< RUn the "commit" query
+} ippool_alloc_status_t;
+
+/**  Resume context for IP allocation
+ */
+typedef struct {
+	request_t		*request;	//!< Current request.
+	ippool_alloc_status_t	status;		//!< Status of the allocation.
+	ippool_alloc_call_env_t	*env;		//!< Call environment for the allocation.
+	rlm_sql_handle_t	*handle;	//!< SQL handle being used for queries.
+	trunk_t		*trunk;		//!< Trunk connection for queries.
+	rlm_sql_t const		*sql;		//!< SQL module instance.
+	fr_value_box_list_t	values;		//!< Where to put the expanded queries ready for execution.
+	fr_value_box_t		*query;		//!< Current query being run.
+	fr_sql_query_t		*query_ctx;	//!< Query context for allocation queries.
+	rlm_rcode_t		rcode;		//!< Result code to return after running "commit".
+} ippool_alloc_ctx_t;
+
+/** Resume context for IP update / release
+ */
+typedef struct {
+	request_t			*request;	//!< Current request.
+	ippool_common_call_env_t	*env;		//!< Call environment for the update.
+	rlm_sql_handle_t		*handle;	//!< SQL handle being used for queries.
+	rlm_sql_t const			*sql;		//!< SQL module instance.
+	fr_sql_query_t			*query_ctx;	//!< Query context for allocation queries.
+} ippool_common_ctx_t;
+
+static conf_parser_t module_config[] = {
+	{ FR_CONF_OFFSET("sql_module_instance", rlm_sqlippool_t, sql_name), .dflt = "sql" },
+
+	CONF_PARSER_TERMINATOR
+};
+
+static int _sql_escape_uxtx_free(void *uctx)
 {
-	char *q;
-	char const *p;
-	char tmp[40]; /* For temporary storing of integers */
-
-	q = out;
-	for (p = fmt; *p ; p++) {
-		int freespace;
-		int c;
-
-		/* Calculate freespace in output */
-		freespace = outlen - (q - out);
-		if (freespace <= 1)
-			break;
-
-		c = *p;
-		if (c != '%') {
-			*q++ = *p;
-			continue;
-		}
-
-		if (*++p == '\0') {
-			break;
-		}
-
-		if (c == '%') {
-			switch (*p) {
-			case 'P': /* pool name */
-				strlcpy(q, data->pool_name, freespace);
-				q += strlen(q);
-				break;
-			case 'I': /* IP address */
-				if (param && param_len > 0) {
-					if (param_len > freespace) {
-						strlcpy(q, param, freespace);
-						q += strlen(q);
-					}
-					else {
-						memcpy(q, param, param_len);
-						q += param_len;
-					}
-				}
-				break;
-			case 'J': /* lease duration */
-				sprintf(tmp, "%d", data->lease_duration);
-				strlcpy(q, tmp, freespace);
-				q += strlen(q);
-				break;
-
-			default:
-				*q++ = '%';
-				*q++ = *p;
-				break;
-			}
-		}
-	}
-	*q = '\0';
-
-#if 0
-	DEBUG2("sqlippool_expand: \"%s\"", out);
-#endif
-
-	return strlen(out);
+	return talloc_free(uctx);
 }
 
-/** Perform a single sqlippool query
- *
- * Mostly wrapper around sql_query which does some special sqlippool sequence substitutions and expands
- * the format string.
- *
- * @param fmt sql query to expand.
- * @param handle sql connection handle.
- * @param data Instance of rlm_sqlippool.
- * @param request Current request.
- * @param param ip address string.
- * @param param_len ip address string len.
- * @return
- *	- 0 on success.
- *	- < 0 on error.
- */
-static int sqlippool_command(char const *fmt, rlm_sql_handle_t **handle,
-			     rlm_sqlippool_t *data, REQUEST *request,
-			     char *param, int param_len)
+static void *sql_escape_uctx_alloc(request_t *request, void const *uctx)
 {
-	char query[MAX_QUERY_LEN];
-	char *expanded = NULL;
+	static _Thread_local rlm_sql_escape_uctx_t	*t_ctx;
 
-	int ret;
+	if (unlikely(t_ctx == NULL)) {
+		rlm_sql_escape_uctx_t *ctx;
 
-	/*
-	 *	If we don't have a command, do nothing.
-	 */
-	if (!fmt || !*fmt) return 0;
-
-	/*
-	 *	@todo this needs to die (should just be done in xlat expansion)
-	 */
-	sqlippool_expand(query, sizeof(query), fmt, data, param, param_len);
-
-	if (xlat_aeval(request, &expanded, request, query, data->sql_inst->sql_escape_func, *handle) < 0) return -1;
-
-	ret = data->sql_inst->sql_query(data->sql_inst, request, handle, expanded);
-	if (ret < 0){
-		talloc_free(expanded);
-		return -1;
+		MEM(ctx = talloc_zero(NULL, rlm_sql_escape_uctx_t));
+		fr_atexit_thread_local(t_ctx, _sql_escape_uxtx_free, ctx);
 	}
-	talloc_free(expanded);
+	t_ctx->sql = uctx;
+	t_ctx->handle = request_data_reference(request, (void *)sql_escape_uctx_alloc, 0);
 
-	if (*handle) (data->sql_inst->driver->sql_finish_query)(*handle, data->sql_inst->config);
-	return 0;
+	return t_ctx;
 }
 
 /*
  *	Don't repeat yourself
  */
-#undef DO
-#define DO(_x) sqlippool_command(inst->_x, handle, inst, request, NULL, 0)
-#define DO_PART(_x) sqlippool_command(inst->_x, &handle, inst, request, NULL, 0)
+#define RESERVE_CONNECTION(_handle, _sql, _request) if (!_sql->driver->uses_trunks) { \
+	handle = fr_pool_connection_get(_sql->pool, _request); \
+	if (!_handle) { \
+		REDEBUG("Failed reserving SQL connection"); \
+		RETURN_MODULE_FAIL; \
+	} \
+}
+
 
 /*
- * Query the database expecting a single result row
+ *	Process the results of an SQL query expected to return a single row
  */
-static int CC_HINT(nonnull (1, 3, 4, 5)) sqlippool_query1(char *out, int outlen, char const *fmt,
-							  rlm_sql_handle_t *handle, rlm_sqlippool_t *data,
-							  REQUEST *request, char *param, int param_len)
+static int sqlippool_result_process(char *out, int outlen, fr_sql_query_t *query_ctx)
 {
-	char query[MAX_QUERY_LEN];
-	char *expanded = NULL;
-
-	int rlen, retval;
-
-	rlm_sql_row_t row;
-
-	/*
-	 *	@todo this needs to die (should just be done in xlat expansion)
-	 */
-	sqlippool_expand(query, sizeof(query), fmt, data, param, param_len);
+	rlm_rcode_t	p_result;
+	int		rlen, retval = 0;
+	rlm_sql_row_t	row;
+	request_t	*request = query_ctx->request;
 
 	*out = '\0';
 
-	/*
-	 *	Do an xlat on the provided string
-	 */
-	if (xlat_aeval(request, &expanded, request, query, data->sql_inst->sql_escape_func, handle) < 0) {
-		return 0;
-	}
-	retval = data->sql_inst->sql_select_query(data->sql_inst, request, &handle, expanded);
-	talloc_free(expanded);
-
-	if (retval != 0){
-		REDEBUG("database query error on '%s'", query);
-		return 0;
-	}
-
-	if (data->sql_inst->sql_fetch_row(&row, data->sql_inst, request, &handle) < 0) {
-		REDEBUG("Failed fetching query result");
+	query_ctx->inst->fetch_row(&p_result, NULL, query_ctx->request, query_ctx);
+	if (query_ctx->rcode < 0) {
+		REDEBUG("Failed fetching query_result");
 		goto finish;
 	}
 
+	row = query_ctx->row;
 	if (!row) {
-		REDEBUG("SQL query did not return any results");
+		RDEBUG2("SQL query did not return any results");
 		goto finish;
 	}
 
@@ -350,15 +182,15 @@ static int CC_HINT(nonnull (1, 3, 4, 5)) sqlippool_query1(char *out, int outlen,
 
 	rlen = strlen(row[0]);
 	if (rlen >= outlen) {
-		RDEBUG("insufficient string space");
+		REDEBUG("The first column of the result was too long (%d)", rlen);
 		goto finish;
 	}
 
 	strcpy(out, row[0]);
 	retval = rlen;
-finish:
-	(data->sql_inst->driver->sql_finish_select_query)(handle, data->sql_inst->config);
 
+finish:
+	query_ctx->inst->driver->sql_finish_select_query(query_ctx, &query_ctx->inst->config);
 	return retval;
 }
 
@@ -372,355 +204,657 @@ finish:
  *	that must be referenced in later calls, store a handle to it
  *	in *instance otherwise put a null pointer there.
  */
-static int mod_instantiate(void *instance, CONF_SECTION *conf)
+static int mod_instantiate(module_inst_ctx_t const *mctx)
 {
-	module_instance_t	*sql_inst;
-	rlm_sqlippool_t		*inst = instance;
-	char const		*pool_name = NULL;
+	module_instance_t	*sql;
+	rlm_sqlippool_t		*inst = talloc_get_type_abort(mctx->mi->data, rlm_sqlippool_t);
+	CONF_SECTION		*conf = mctx->mi->conf;
 
-	pool_name = cf_section_name2(conf);
-	if (pool_name != NULL) {
-		inst->pool_name = talloc_typed_strdup(inst, pool_name);
-	} else {
-		inst->pool_name = talloc_typed_strdup(inst, "ippool");
-	}
-	sql_inst = module_find(cf_section_find(main_config.config, "modules", NULL), inst->sql_instance_name);
-	if (!sql_inst) {
+	inst->name = talloc_asprintf(inst, "%s - %s", mctx->mi->name, inst->sql_name);
+
+	sql = module_rlm_static_by_name(NULL, inst->sql_name);
+	if (!sql) {
 		cf_log_err(conf, "failed to find sql instance named %s",
-			   inst->sql_instance_name);
+			   inst->sql_name);
 		return -1;
 	}
 
-	inst->framed_ip_address = fr_dict_attr_by_name(NULL, inst->attribute_name);
-	if (!inst->framed_ip_address) {
-		cf_log_err(conf, "Unknown attribute '%s'", inst->attribute_name);
-		return -1;
-	}
+	inst->sql = (rlm_sql_t *) sql->data;
 
-	switch (inst->framed_ip_address->type) {
-	default:
-		cf_log_err(conf, "Cannot use non-IP attributes for 'attribute_name = %s'", inst->attribute_name);
-		return -1;
-
-	case FR_TYPE_IPV4_ADDR:
-	case FR_TYPE_IPV4_PREFIX:
-	case FR_TYPE_IPV6_ADDR:
-	case FR_TYPE_IPV6_PREFIX:
-		break;
-	}
-
-	inst->sql_inst = (rlm_sql_t *) sql_inst->dl_inst->data;
-
-	if (strcmp(inst->sql_inst->driver->name, "sql") != 0) {
+	if (strcmp(talloc_get_name(inst->sql), "rlm_sql_t") != 0) {
 		cf_log_err(conf, "Module \"%s\" is not an instance of the rlm_sql module",
-			      inst->sql_instance_name);
+			      inst->sql_name);
 		return -1;
 	}
 
 	return 0;
 }
 
-
-/*
- *	If we have something to log, then we log it.
- *	Otherwise we return the retcode as soon as possible
+/** Release SQL pool connections when alloc context is freed.
  */
-static int do_logging(REQUEST *request, char const *str, int rcode)
+static int sqlippool_alloc_ctx_free(ippool_alloc_ctx_t *to_free)
 {
-	char *expanded = NULL;
-
-	if (!str || !*str) return rcode;
-
-	if (xlat_aeval(request, &expanded, request, str, NULL, NULL) < 0) {
-		return rcode;
-	}
-
-	pair_make_config("Module-Success-Message", expanded, T_OP_SET);
-
-	talloc_free(expanded);
-
-	return rcode;
+	if (!to_free->sql->sql_escape_arg) (void) request_data_get(to_free->request, (void *)sql_escape_uctx_alloc, 0);
+	if (to_free->handle) fr_pool_connection_release(to_free->sql->pool, to_free->request, to_free->handle);
+	return 0;
 }
 
+#define REPEAT_MOD_ALLOC_RESUME if (unlang_function_repeat_set(request, mod_alloc_resume) < 0) RETURN_MODULE_FAIL
+#define SUBMIT_QUERY(_query_str, _new_status, _type, _function) do { \
+	alloc_ctx->status = _new_status; \
+	REPEAT_MOD_ALLOC_RESUME; \
+	query_ctx->query_str = _query_str; \
+	query_ctx->type = _type; \
+	query_ctx->status = SQL_QUERY_PREPARED; \
+	alloc_ctx->query = query; \
+	return unlang_function_push(request, sql->_function, NULL, NULL, 0, UNLANG_SUB_FRAME, query_ctx); \
+} while (0)
 
-/*
- *	Allocate an IP number from the pool.
+/** Resume function called after each IP allocation query is expanded
+ *
+ * Executes the query and, if appropriate, pushes the next tmpl for expansion
+ *
+ * Following the final (successful) query, the destination attribute is populated.
+ *
+ * @param p_result	Result of IP allocation.
+ * @param priority	Unused.
+ * @param request	Current request.
+ * @param uctx		Current allocation context.
+ * @return One of the UNLANG_ACTION_* values.
  */
-static rlm_rcode_t CC_HINT(nonnull) mod_post_auth(void *instance, UNUSED void *thread, REQUEST *request)
+static unlang_action_t mod_alloc_resume(rlm_rcode_t *p_result, UNUSED int *priority, request_t *request, void *uctx)
 {
-	rlm_sqlippool_t *inst = instance;
-	char allocation[FR_MAX_STRING_LEN];
-	int allocation_len;
-	VALUE_PAIR *vp;
-	rlm_sql_handle_t *handle;
-	time_t now;
+	ippool_alloc_ctx_t	*alloc_ctx = talloc_get_type_abort(uctx, ippool_alloc_ctx_t);
+	ippool_alloc_call_env_t	*env = alloc_ctx->env;
+	int			allocation_len = 0;
+	char			allocation[FR_MAX_STRING_LEN];
+	rlm_sql_t const		*sql = alloc_ctx->sql;
+	fr_value_box_t		*query = fr_value_box_list_pop_head(&alloc_ctx->values);
+	fr_sql_query_t		*query_ctx = alloc_ctx->query_ctx;
 
 	/*
-	 *	If there is a Framed-IP-Address attribute in the reply do nothing
+	 *	If a previous async call returned one of the "failure" results just return.
 	 */
-	if (fr_pair_find_by_da(request->reply->vps, inst->framed_ip_address, TAG_ANY) != NULL) {
-		RDEBUG("Framed-IP-Address already exists");
-
-		return do_logging(request, inst->log_exists, RLM_MODULE_NOOP);
-	}
-
-	if (fr_pair_find_by_num(request->control, 0, FR_POOL_NAME, TAG_ANY) == NULL) {
-		RDEBUG("No Pool-Name defined");
-
-		return do_logging(request, inst->log_nopool, RLM_MODULE_NOOP);
-	}
-
-	handle = fr_pool_connection_get(inst->sql_inst->pool, request);
-	if (!handle) {
-		REDEBUG("Failed reserving SQL connection");
-		return RLM_MODULE_FAIL;
-	}
-
-	if (inst->sql_inst->sql_set_user(inst->sql_inst, request, NULL) < 0) {
-		return RLM_MODULE_FAIL;
-	}
-
-	/*
-	 *	Limit the number of clears we do.  There are minor
-	 *	race conditions for the check, but so what.  The
-	 *	actual work is protected by a transaction.  The idea
-	 *	here is that if we're allocating 100 IPs a second,
-	 *	we're only do 1 CLEAR per second.
-	 */
-	now = time(NULL);
-	if (inst->last_clear < now) {
-		inst->last_clear = now;
-
-		DO_PART(allocate_begin);
-		DO_PART(allocate_clear);
-		DO_PART(allocate_commit);
-	}
-
-	DO_PART(allocate_begin);
-
-	allocation_len = sqlippool_query1(allocation, sizeof(allocation),
-					  inst->allocate_find, handle,
-					  inst, request, (char *) NULL, 0);
-
-	/*
-	 *	Nothing found...
-	 */
-	if (allocation_len == 0) {
-		DO_PART(allocate_commit);
-
-		/*
-		 *Should we perform pool-check ?
-		 */
-		if (inst->pool_check && *inst->pool_check) {
-
-			/*
-			 *Ok, so the allocate-find query found nothing ...
-			 *Let's check if the pool exists at all
-			 */
-			allocation_len = sqlippool_query1(allocation, sizeof(allocation),
-							  inst->pool_check, handle, inst, request,
-							  (char *) NULL, 0);
-
-			fr_pool_connection_release(inst->sql_inst->pool, request, handle);
-
-			if (allocation_len) {
-
-				/*
-				 *	Pool exists after all... So,
-				 *	the failure to allocate the IP
-				 *	address was most likely due to
-				 *	the depletion of the pool. In
-				 *	that case, we should return
-				 *	NOTFOUND
-				 */
-				RDEBUG("pool appears to be full");
-				return do_logging(request, inst->log_failed, RLM_MODULE_NOTFOUND);
-
-			}
-
-			/*
-			 *	Pool doesn't exist in the table. It
-			 *	may be handled by some other instance of
-			 *	sqlippool, so we should just ignore this
-			 *	allocation failure and return NOOP
-			 */
-			RDEBUG("IP address could not be allocated as no pool exists with that name");
-			return RLM_MODULE_NOOP;
-
-		}
-
-		fr_pool_connection_release(inst->sql_inst->pool, request, handle);
-
-		RDEBUG("IP address could not be allocated");
-		return do_logging(request, inst->log_failed, RLM_MODULE_NOOP);
-	}
-
-	/*
-	 *	See if we can create the VP from the returned data.  If not,
-	 *	error out.  If so, add it to the list.
-	 */
-	MEM(vp = fr_pair_afrom_da(request->reply, inst->framed_ip_address));
-	if (fr_pair_value_from_str(vp, allocation, allocation_len) < 0) {
-		DO_PART(allocate_commit);
-
-		RDEBUG("Invalid IP number [%s] returned from instbase query.", allocation);
-		fr_pool_connection_release(inst->sql_inst->pool, request, handle);
-		return do_logging(request, inst->log_failed, RLM_MODULE_NOOP);
-	}
-
-	RDEBUG("Allocated IP %s", allocation);
-	fr_pair_add(&request->reply->vps, vp);
-
-	/*
-	 *	UPDATE
-	 */
-	sqlippool_command(inst->allocate_update, &handle, inst, request,
-			  allocation, allocation_len);
-
-	DO_PART(allocate_commit);
-
-	fr_pool_connection_release(inst->sql_inst->pool, request, handle);
-
-	return do_logging(request, inst->log_success, RLM_MODULE_OK);
-}
-
-static int mod_accounting_start(rlm_sql_handle_t **handle,
-				rlm_sqlippool_t *inst, REQUEST *request)
-{
-	DO(start_begin);
-	DO(start_update);
-	DO(start_commit);
-
-	return RLM_MODULE_OK;
-}
-
-static int mod_accounting_alive(rlm_sql_handle_t **handle,
-				rlm_sqlippool_t *inst, REQUEST *request)
-{
-	DO(alive_begin);
-	DO(alive_update);
-	DO(alive_commit);
-	return RLM_MODULE_OK;
-}
-
-static int mod_accounting_stop(rlm_sql_handle_t **handle,
-			       rlm_sqlippool_t *inst, REQUEST *request)
-{
-	DO(stop_begin);
-	DO(stop_clear);
-	DO(stop_commit);
-
-	return do_logging(request, inst->log_clear, RLM_MODULE_OK);
-}
-
-static int mod_accounting_on(rlm_sql_handle_t **handle,
-			     rlm_sqlippool_t *inst, REQUEST *request)
-{
-	DO(on_begin);
-	DO(on_clear);
-	DO(on_commit);
-
-	return RLM_MODULE_OK;
-}
-
-static int mod_accounting_off(rlm_sql_handle_t **handle,
-			      rlm_sqlippool_t *inst, REQUEST *request)
-{
-	DO(off_begin);
-	DO(off_clear);
-	DO(off_commit);
-
-	return RLM_MODULE_OK;
-}
-
-/*
- *	Check for an Accounting-Stop
- *	If we find one and we have allocated an IP to this nas/port
- *	combination, then deallocate it.
- */
-static rlm_rcode_t CC_HINT(nonnull) mod_accounting(void *instance, UNUSED void *thread, REQUEST *request)
-{
-	int			rcode = RLM_MODULE_NOOP;
-	VALUE_PAIR		*vp;
-
-	int			acct_status_type;
-
-	rlm_sqlippool_t		*inst = (rlm_sqlippool_t *) instance;
-	rlm_sql_handle_t	*handle;
-
-	vp = fr_pair_find_by_num(request->packet->vps, 0, FR_ACCT_STATUS_TYPE, TAG_ANY);
-	if (!vp) {
-		RDEBUG("Could not find account status type in packet");
-		return RLM_MODULE_NOOP;
-	}
-	acct_status_type = vp->vp_uint32;
-
-	switch (acct_status_type) {
-	case FR_STATUS_START:
-	case FR_STATUS_ALIVE:
-	case FR_STATUS_STOP:
-	case FR_STATUS_ACCOUNTING_ON:
-	case FR_STATUS_ACCOUNTING_OFF:
-		break;		/* continue through to the next section */
+	switch (*p_result) {
+	case RLM_MODULE_USER_SECTION_REJECT:
+		return UNLANG_ACTION_CALCULATE_RESULT;
 
 	default:
-		/* We don't care about any other accounting packet */
-		return RLM_MODULE_NOOP;
-	}
-
-	handle = fr_pool_connection_get(inst->sql_inst->pool, request);
-	if (!handle) {
-		RDEBUG("Failed reserving SQL connection");
-		return RLM_MODULE_FAIL;
-	}
-
-	if (inst->sql_inst->sql_set_user(inst->sql_inst, request, NULL) < 0) return RLM_MODULE_FAIL;
-
-	switch (acct_status_type) {
-	case FR_STATUS_START:
-		rcode = mod_accounting_start(&handle, inst, request);
-		break;
-
-	case FR_STATUS_ALIVE:
-		rcode = mod_accounting_alive(&handle, inst, request);
-		break;
-
-	case FR_STATUS_STOP:
-		rcode = mod_accounting_stop(&handle, inst, request);
-		break;
-
-	case FR_STATUS_ACCOUNTING_ON:
-		rcode = mod_accounting_on(&handle, inst, request);
-		break;
-
-	case FR_STATUS_ACCOUNTING_OFF:
-		rcode = mod_accounting_off(&handle, inst, request);
 		break;
 	}
-	fr_pool_connection_release(inst->sql_inst->pool, request, handle);
 
-	return rcode;
+	switch (alloc_ctx->status) {
+	case IPPOOL_ALLOC_BEGIN_RUN:
+		if ((env->begin.type == FR_TYPE_STRING) &&
+		    env->begin.vb_length) sql->driver->sql_finish_query(query_ctx, &query_ctx->inst->config);
+
+		/*
+		 *	The first call of this function will always land here, whether or not a "begin" query is actually run.
+		 *
+		 *	Having (possibly) run the "begin" query, establish which tmpl needs expanding
+		 *
+		 *	If there is a query for finding the existing IP expand that first
+		 */
+		if (env->existing) {
+			alloc_ctx->status = IPPOOL_ALLOC_EXISTING;
+			REPEAT_MOD_ALLOC_RESUME;
+			if (unlang_tmpl_push(alloc_ctx, &alloc_ctx->values, request, env->existing, NULL) < 0) {
+			error:
+				talloc_free(alloc_ctx);
+				RETURN_MODULE_FAIL;
+			}
+			return UNLANG_ACTION_PUSHED_CHILD;
+		}
+		goto expand_requested;
+
+	case IPPOOL_ALLOC_EXISTING:
+		if (query && query->vb_length) SUBMIT_QUERY(query->vb_strvalue, IPPOOL_ALLOC_EXISTING_RUN, SQL_QUERY_SELECT, select);
+		goto expand_requested;
+
+	case IPPOOL_ALLOC_EXISTING_RUN:
+		TALLOC_FREE(alloc_ctx->query);
+		if (query_ctx->rcode != RLM_SQL_OK) goto error;
+
+		allocation_len = sqlippool_result_process(allocation, sizeof(allocation), query_ctx);
+		sql->driver->sql_finish_select_query(query_ctx, &query_ctx->inst->config);
+		if (allocation_len > 0) goto make_pair;
+
+		/*
+		 *	If there's a requested address and associated query, expand that
+		 */
+	expand_requested:
+		if (env->requested && (env->requested_address.type != FR_TYPE_NULL)) {
+			alloc_ctx->status = IPPOOL_ALLOC_REQUESTED;
+			REPEAT_MOD_ALLOC_RESUME;
+			if (unlang_tmpl_push(alloc_ctx, &alloc_ctx->values, request, env->requested, NULL) < 0) goto error;
+			return UNLANG_ACTION_PUSHED_CHILD;
+		}
+		goto expand_find;
+
+	case IPPOOL_ALLOC_REQUESTED:
+		if (query && query->vb_length) SUBMIT_QUERY(query->vb_strvalue, IPPOOL_ALLOC_REQUESTED_RUN, SQL_QUERY_SELECT, select);
+
+		goto expand_find;
+
+	case IPPOOL_ALLOC_REQUESTED_RUN:
+		TALLOC_FREE(alloc_ctx->query);
+		if (query_ctx->rcode != RLM_SQL_OK) goto error;
+
+		allocation_len = sqlippool_result_process(allocation, sizeof(allocation), query_ctx);
+		sql->driver->sql_finish_select_query(query_ctx, &query_ctx->inst->config);
+		if (allocation_len > 0) goto make_pair;
+
+	expand_find:
+		/*
+		 *	Neither "existing" nor "requested" found an address, expand "find" query
+		 */
+		alloc_ctx->status = IPPOOL_ALLOC_FIND;
+		REPEAT_MOD_ALLOC_RESUME;
+		if (unlang_tmpl_push(alloc_ctx, &alloc_ctx->values, request, env->find, NULL) < 0) goto error;
+		return UNLANG_ACTION_PUSHED_CHILD;
+
+	case IPPOOL_ALLOC_FIND:
+		SUBMIT_QUERY(query->vb_strvalue, IPPOOL_ALLOC_FIND_RUN, SQL_QUERY_SELECT, select);
+
+	case IPPOOL_ALLOC_FIND_RUN:
+		TALLOC_FREE(alloc_ctx->query);
+		if (query_ctx->rcode != RLM_SQL_OK) goto error;
+
+		allocation_len = sqlippool_result_process(allocation, sizeof(allocation), query_ctx);
+		sql->driver->sql_finish_select_query(query_ctx, &query_ctx->inst->config);
+
+		if (allocation_len > 0) goto make_pair;
+
+		/*
+		 *  Nothing found
+		 */
+		if ((env->commit.type == FR_TYPE_STRING) &&
+		    env->commit.vb_length) SUBMIT_QUERY(env->commit.vb_strvalue, IPPOOL_ALLOC_NO_ADDRESS, SQL_QUERY_OTHER, query);
+		FALL_THROUGH;
+
+	case IPPOOL_ALLOC_NO_ADDRESS:
+		if ((env->commit.type == FR_TYPE_STRING) &&
+		    env->commit.vb_length) sql->driver->sql_finish_query(query_ctx, &query_ctx->inst->config);
+
+		/*
+		 *  Should we perform pool-check?
+		 */
+		if (env->pool_check) {
+			alloc_ctx->status = IPPOOL_ALLOC_POOL_CHECK;
+			REPEAT_MOD_ALLOC_RESUME;
+			if (unlang_tmpl_push(alloc_ctx, &alloc_ctx->values, request, env->pool_check, NULL) < 0) goto error;
+			return UNLANG_ACTION_PUSHED_CHILD;
+		}
+	no_address:
+		RWDEBUG("IP address could not be allocated");
+		RETURN_MODULE_NOOP;
+
+	case IPPOOL_ALLOC_MAKE_PAIR:
+	{
+		tmpl_t	ip_rhs;
+		map_t	ip_map;
+
+	make_pair:
+		/*
+		 *	See if we can create the VP from the returned data.  If not,
+		 *	error out.  If so, add it to the list.
+		 */
+		ip_map = (map_t) {
+			.lhs = env->allocated_address_attr,
+			.op = T_OP_SET,
+			.rhs = &ip_rhs
+		};
+
+		tmpl_init_shallow(&ip_rhs, TMPL_TYPE_DATA, T_BARE_WORD, "", 0, NULL);
+		fr_value_box_bstrndup_shallow(&ip_map.rhs->data.literal, NULL, allocation, allocation_len, false);
+		if (map_to_request(request, &ip_map, map_to_vp, NULL) < 0) {
+			alloc_ctx->rcode = RLM_MODULE_FAIL;
+
+			REDEBUG("Invalid IP address [%s] returned from database query.", allocation);
+			goto finish;
+		}
+
+		RDEBUG2("Allocated IP %s", allocation);
+		alloc_ctx->rcode = RLM_MODULE_UPDATED;
+
+		/*
+		 *	If we have an update query expand it
+		 */
+		if (env->update) {
+			alloc_ctx->status = IPPOOL_ALLOC_UPDATE;
+			REPEAT_MOD_ALLOC_RESUME;
+			if (unlang_tmpl_push(alloc_ctx, &alloc_ctx->values, request, env->update, NULL) < 0) goto error;
+			return UNLANG_ACTION_PUSHED_CHILD;
+		}
+
+		goto finish;
+	}
+
+	case IPPOOL_ALLOC_POOL_CHECK:
+		/*
+		 *	Ok, so the allocate-find query found nothing ...
+		 *	Let's check if the pool exists at all
+		 */
+		if (query && query->vb_length) SUBMIT_QUERY(query->vb_strvalue, IPPOOL_ALLOC_POOL_CHECK_RUN, SQL_QUERY_SELECT, select);
+		goto no_address;
+
+	case IPPOOL_ALLOC_POOL_CHECK_RUN:
+		TALLOC_FREE(alloc_ctx->query);
+		allocation_len = sqlippool_result_process(allocation, sizeof(allocation), query_ctx);
+		sql->driver->sql_finish_select_query(query_ctx, &query_ctx->inst->config);
+
+		if (allocation_len) {
+			/*
+			 *	Pool exists after all... So,
+			 *	the failure to allocate the IP
+			 *	address was most likely due to
+			 *	the depletion of the pool. In
+			 *	that case, we should return
+			 *	NOTFOUND
+			 */
+			RWDEBUG("Pool \"%pV\" appears to be full", &env->pool_name);
+			RETURN_MODULE_NOTFOUND;
+		}
+
+		/*
+		 *	Pool doesn't exist in the table. It
+		 *	may be handled by some other instance of
+		 *	sqlippool, so we should just ignore this
+		 *	allocation failure and return NOOP
+		 */
+		RWDEBUG("IP address could not be allocated as no pool exists with the name \"%pV\"",
+			&env->pool_name);
+		RETURN_MODULE_NOOP;
+
+	case IPPOOL_ALLOC_UPDATE:
+		if (query && query->vb_length) SUBMIT_QUERY(query->vb_strvalue, IPPOOL_ALLOC_UPDATE_RUN, SQL_QUERY_OTHER, query);
+
+		goto finish;
+
+	case IPPOOL_ALLOC_UPDATE_RUN:
+		TALLOC_FREE(alloc_ctx->query);
+		sql->driver->sql_finish_query(query_ctx, &query_ctx->inst->config);
+
+	finish:
+		if ((env->commit.type == FR_TYPE_STRING) &&
+		    env->commit.vb_length) SUBMIT_QUERY(env->commit.vb_strvalue, IPPOOL_ALLOC_COMMIT_RUN, SQL_QUERY_OTHER, query);
+
+		FALL_THROUGH;
+
+	case IPPOOL_ALLOC_COMMIT_RUN:
+	{
+		rlm_rcode_t	rcode = alloc_ctx->rcode;
+		talloc_free(alloc_ctx);
+		RETURN_MODULE_RCODE(rcode);
+	}
+	}
+
+	/*
+	 *	All return paths are handled within the switch statement.
+	 */
+	fr_assert(0);
+	RETURN_MODULE_FAIL;
 }
+
+/** Initiate the allocation of an IP address from the pool.
+ *
+ * Based on configured queries and attributes which exist, determines the first
+ * query tmpl to expand.
+ *
+ * @param p_result	Result of the allocation (if it fails).
+ * @param mctx		Module context.
+ * @param request	Current request.
+ * @return One of the UNLANG_ACTION_* values.
+ */
+static unlang_action_t CC_HINT(nonnull) mod_alloc(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request)
+{
+	rlm_sqlippool_t		*inst = talloc_get_type_abort(mctx->mi->data, rlm_sqlippool_t);
+	ippool_alloc_call_env_t	*env = talloc_get_type_abort(mctx->env_data, ippool_alloc_call_env_t);
+	rlm_sql_t const		*sql = inst->sql;
+	rlm_sql_handle_t	*handle = NULL;
+	ippool_alloc_ctx_t	*alloc_ctx = NULL;
+	rlm_sql_thread_t	*thread = talloc_get_type_abort(module_thread(sql->mi)->data, rlm_sql_thread_t);
+
+	/*
+	 *	If the allocated IP attribute already exists, do nothing
+	 */
+	if (env->allocated_address.type) {
+		RDEBUG2("%s already exists (%pV)", env->allocated_address_attr->name, &env->allocated_address);
+		RETURN_MODULE_NOOP;
+	}
+
+	if (env->pool_name.type == FR_TYPE_NULL) {
+		RDEBUG2("No %s defined", env->pool_name_tmpl->name);
+		RETURN_MODULE_NOOP;
+	}
+
+	RESERVE_CONNECTION(handle, inst->sql, request);
+	if (!sql->sql_escape_arg && !thread->sql_escape_arg && handle)
+		request_data_add(request, (void *)sql_escape_uctx_alloc, 0, handle, false, false, false);
+
+	MEM(alloc_ctx = talloc(unlang_interpret_frame_talloc_ctx(request), ippool_alloc_ctx_t));
+	*alloc_ctx = (ippool_alloc_ctx_t) {
+		.env = env,
+		.handle = handle,
+		.trunk = thread->trunk,
+		.sql = inst->sql,
+		.request = request,
+	};
+	talloc_set_destructor(alloc_ctx, sqlippool_alloc_ctx_free);
+
+	/*
+	 *	Allocate a query_ctx which will be used for all queries in the allocation.
+	 *	Since they typically form an SQL transaction, they all need to be on the same
+	 *	connection, and use the same trunk request if using trunks.
+	 */
+	MEM(alloc_ctx->query_ctx = sql->query_alloc(alloc_ctx, sql, request, handle, thread->trunk, "", SQL_QUERY_OTHER));
+
+	fr_value_box_list_init(&alloc_ctx->values);
+	if (unlang_function_push(request, NULL, mod_alloc_resume, NULL, 0, UNLANG_SUB_FRAME, alloc_ctx) < 0 ) {
+		talloc_free(alloc_ctx);
+		RETURN_MODULE_FAIL;
+	}
+
+	if ((env->begin.type == FR_TYPE_STRING) && env->begin.vb_length) {
+		alloc_ctx->query_ctx->query_str = env->begin.vb_strvalue;
+		return unlang_function_push(request, sql->query, NULL, NULL, 0, UNLANG_SUB_FRAME, alloc_ctx->query_ctx);
+	}
+
+	return UNLANG_ACTION_PUSHED_CHILD;
+}
+
+/** Resume function called after mod_common "update" query has completed
+ */
+static unlang_action_t mod_common_update_resume(rlm_rcode_t *p_result, UNUSED int *priority, UNUSED request_t *request, void *uctx)
+{
+	ippool_common_ctx_t	*common_ctx = talloc_get_type_abort(uctx, ippool_common_ctx_t);
+	fr_sql_query_t		*query_ctx = common_ctx->query_ctx;
+	rlm_sql_t const		*sql = common_ctx->sql;
+	int			affected = 0;
+
+	switch (*p_result) {
+	case RLM_MODULE_USER_SECTION_REJECT:
+		return UNLANG_ACTION_CALCULATE_RESULT;
+
+	default:
+		break;
+	}
+
+	affected = sql->driver->sql_affected_rows(query_ctx, &sql->config);
+
+	talloc_free(common_ctx);
+
+	if (affected > 0) RETURN_MODULE_UPDATED;
+	RETURN_MODULE_NOTFOUND;
+}
+
+/** Resume function called after mod_common "free" query has completed
+ */
+static unlang_action_t mod_common_free_resume(rlm_rcode_t *p_result, UNUSED int *priority, request_t *request, void *uctx)
+{
+	ippool_common_ctx_t	*common_ctx = talloc_get_type_abort(uctx, ippool_common_ctx_t);
+	fr_sql_query_t		*query_ctx = common_ctx->query_ctx;
+	rlm_sql_t const		*sql = common_ctx->sql;
+
+	switch (*p_result) {
+	case RLM_MODULE_USER_SECTION_REJECT:
+		return UNLANG_ACTION_CALCULATE_RESULT;
+
+	default:
+		break;
+	}
+	if (common_ctx->env->update.type != FR_TYPE_STRING) RETURN_MODULE_NOOP;
+
+	sql->driver->sql_finish_query(query_ctx, &sql->config);
+
+	if (unlang_function_push(request, NULL, mod_common_update_resume, NULL, 0, UNLANG_SUB_FRAME, common_ctx) < 0) {
+		talloc_free(common_ctx);
+		RETURN_MODULE_FAIL;
+	}
+
+	common_ctx->query_ctx->query_str = common_ctx->env->update.vb_strvalue;
+	query_ctx->status = SQL_QUERY_PREPARED;
+	return unlang_function_push(request, sql->query, NULL, NULL, 0, UNLANG_SUB_FRAME, query_ctx);
+}
+
+/** Return connection to pool when mod_common context is freed.
+ */
+static int sqlippool_common_ctx_free(ippool_common_ctx_t *to_free)
+{
+	if (to_free->handle) fr_pool_connection_release(to_free->sql->pool, to_free->request, to_free->handle);
+	return 0;
+}
+
+/** Common function used by module methods which perform an optional "free" then "update"
+ *	- update
+ *	- release
+ *	- bulk_release
+ *	- mark
+ */
+static unlang_action_t CC_HINT(nonnull) mod_common(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request)
+{
+	rlm_sqlippool_t			*inst = talloc_get_type_abort(mctx->mi->data, rlm_sqlippool_t);
+	ippool_common_call_env_t	*env = talloc_get_type_abort(mctx->env_data, ippool_common_call_env_t);
+	rlm_sql_t const			*sql = inst->sql;
+	rlm_sql_thread_t		*thread = talloc_get_type_abort(module_thread(sql->mi)->data, rlm_sql_thread_t);
+	rlm_sql_handle_t		*handle = NULL;
+	ippool_common_ctx_t		*common_ctx = NULL;
+
+	if ((env->free.type != FR_TYPE_STRING) && (env->update.type != FR_TYPE_STRING)) RETURN_MODULE_NOOP;
+
+	RESERVE_CONNECTION(handle, inst->sql, request);
+	MEM(common_ctx = talloc(unlang_interpret_frame_talloc_ctx(request), ippool_common_ctx_t));
+	*common_ctx = (ippool_common_ctx_t) {
+		.request = request,
+		.env = env,
+		.handle = handle,
+		.sql = sql,
+	};
+	talloc_set_destructor(common_ctx, sqlippool_common_ctx_free);
+
+	MEM(common_ctx->query_ctx = sql->query_alloc(common_ctx, sql, request, handle, thread->trunk, "", SQL_QUERY_OTHER));
+
+	/*
+	 *  An optional query which can be used to tidy up before updates
+	 *  primarily intended for multi-server setups sharing a common database
+	 *  allowing for tidy up of multiple offered addresses in a DHCP context.
+	 */
+	if (env->free.type == FR_TYPE_STRING) {
+		common_ctx->query_ctx->query_str = env->free.vb_strvalue;
+		if (unlang_function_push(request, NULL, mod_common_free_resume, NULL, 0, UNLANG_SUB_FRAME, common_ctx) < 0) {
+			talloc_free(common_ctx);
+			RETURN_MODULE_FAIL;
+		}
+		return unlang_function_push(request, sql->query, NULL, NULL, 0, UNLANG_SUB_FRAME, common_ctx->query_ctx);
+	}
+
+	common_ctx->query_ctx->query_str = env->update.vb_strvalue;
+	if (unlang_function_push(request, NULL, mod_common_update_resume, NULL, 0, UNLANG_SUB_FRAME, common_ctx) < 0) {
+		talloc_free(common_ctx);
+		RETURN_MODULE_FAIL;
+	}
+	return unlang_function_push(request, sql->query, NULL, NULL, 0, UNLANG_SUB_FRAME, common_ctx->query_ctx);
+}
+
+/** Call SQL module box_escape_func to escape tainted values
+ */
+static int sqlippool_box_escape(fr_value_box_t *vb, void *uctx) {
+	rlm_sql_escape_uctx_t	*ctx = talloc_get_type_abort(uctx, rlm_sql_escape_uctx_t);
+
+	return ctx->sql->box_escape_func(vb, uctx);
+}
+
+/** Custom parser for sqlippool call env
+ *
+ * Needed as the escape function needs to reference
+ * the correct instance of the SQL module since escaping functions
+ * are dependent on the driver used by a given module instance.
+ */
+static int call_env_parse(TALLOC_CTX *ctx, void *out, tmpl_rules_t const *t_rules, CONF_ITEM *ci,
+			  call_env_ctx_t const *cec, UNUSED call_env_parser_t const *rule)
+{
+	rlm_sqlippool_t const	*inst = talloc_get_type_abort_const(cec->mi->data, rlm_sqlippool_t);
+	module_instance_t const	*sql_inst;
+	rlm_sql_t const		*sql;
+	tmpl_t			*parsed_tmpl;
+	CONF_PAIR const		*to_parse = cf_item_to_pair(ci);
+	tmpl_rules_t		our_rules = *t_rules;
+
+	/*
+	 *	Lookup the sql module instance.
+	 */
+	sql_inst = module_rlm_static_by_name(NULL, inst->sql_name);
+	if (!sql_inst) return -1;
+	sql = talloc_get_type_abort(sql_inst->data, rlm_sql_t);
+
+	/*
+	 *	Set the sql module instance data as the uctx for escaping
+	 *	and use the same "safe_for" as the sql module.
+	 */
+	our_rules.escape.uctx.func.uctx = sql;
+	our_rules.escape.safe_for = (fr_value_box_safe_for_t)sql->driver;
+	our_rules.literals_safe_for = (fr_value_box_safe_for_t)sql->driver;
+
+	if (tmpl_afrom_substr(ctx, &parsed_tmpl,
+			      &FR_SBUFF_IN(cf_pair_value(to_parse), talloc_array_length(cf_pair_value(to_parse)) - 1),
+			      cf_pair_value_quote(to_parse), NULL, &our_rules) < 0) return -1;
+	*(void **)out = parsed_tmpl;
+	return 0;
+}
+
+#define QUERY_ESCAPE .pair.escape = { \
+	.func = sqlippool_box_escape, \
+	.mode = TMPL_ESCAPE_PRE_CONCAT, \
+	.uctx = { .func = { .alloc = sql_escape_uctx_alloc }, .type = TMPL_ESCAPE_UCTX_ALLOC_FUNC }, \
+}, .pair.func = call_env_parse
+
+static const call_env_method_t sqlippool_alloc_method_env = {
+	FR_CALL_ENV_METHOD_OUT(ippool_alloc_call_env_t),
+	.env = (call_env_parser_t[]) {
+		{ FR_CALL_ENV_PARSE_OFFSET("pool_name", FR_TYPE_STRING, CALL_ENV_FLAG_REQUIRED | CALL_ENV_FLAG_CONCAT | CALL_ENV_FLAG_NULLABLE,
+	     				   ippool_alloc_call_env_t, pool_name, pool_name_tmpl),
+					   .pair.dflt = "&control.IP-Pool.Name", .pair.dflt_quote = T_BARE_WORD },
+		{ FR_CALL_ENV_OFFSET("requested_address", FR_TYPE_VOID, CALL_ENV_FLAG_NULLABLE,
+				     ippool_alloc_call_env_t, requested_address) },
+		{ FR_CALL_ENV_PARSE_OFFSET("allocated_address_attr", FR_TYPE_VOID,
+					   CALL_ENV_FLAG_ATTRIBUTE | CALL_ENV_FLAG_REQUIRED | CALL_ENV_FLAG_NULLABLE,
+					   ippool_alloc_call_env_t, allocated_address, allocated_address_attr) },
+		{ FR_CALL_ENV_OFFSET("alloc_begin", FR_TYPE_STRING, CALL_ENV_FLAG_CONCAT | CALL_ENV_FLAG_NULLABLE,
+				     ippool_alloc_call_env_t, begin), QUERY_ESCAPE,
+				     .pair.dflt = "START TRANSACTION", .pair.dflt_quote = T_SINGLE_QUOTED_STRING },
+		{ FR_CALL_ENV_PARSE_ONLY_OFFSET("alloc_existing", FR_TYPE_STRING, CALL_ENV_FLAG_PARSE_ONLY,
+						ippool_alloc_call_env_t, existing), QUERY_ESCAPE },
+		{ FR_CALL_ENV_PARSE_ONLY_OFFSET("alloc_requested", FR_TYPE_STRING, CALL_ENV_FLAG_PARSE_ONLY,
+						ippool_alloc_call_env_t, requested), QUERY_ESCAPE },
+		{ FR_CALL_ENV_PARSE_ONLY_OFFSET("alloc_find", FR_TYPE_STRING, CALL_ENV_FLAG_PARSE_ONLY | CALL_ENV_FLAG_REQUIRED,
+						ippool_alloc_call_env_t, find), QUERY_ESCAPE },
+		{ FR_CALL_ENV_PARSE_ONLY_OFFSET("alloc_update", FR_TYPE_STRING, CALL_ENV_FLAG_PARSE_ONLY,
+						ippool_alloc_call_env_t, update), QUERY_ESCAPE },
+		{ FR_CALL_ENV_PARSE_ONLY_OFFSET("pool_check", FR_TYPE_STRING, CALL_ENV_FLAG_PARSE_ONLY,
+						ippool_alloc_call_env_t, pool_check), QUERY_ESCAPE },
+		{ FR_CALL_ENV_OFFSET("alloc_commit", FR_TYPE_STRING, CALL_ENV_FLAG_CONCAT | CALL_ENV_FLAG_NULLABLE,
+				     ippool_alloc_call_env_t, commit), QUERY_ESCAPE,
+				     .pair.dflt = "COMMIT", .pair.dflt_quote = T_SINGLE_QUOTED_STRING },
+		CALL_ENV_TERMINATOR
+	}
+};
+
+static const call_env_method_t sqlippool_update_method_env = {
+	FR_CALL_ENV_METHOD_OUT(ippool_common_call_env_t),
+	.env = (call_env_parser_t[]) {
+		{ FR_CALL_ENV_OFFSET("update_free", FR_TYPE_STRING, CALL_ENV_FLAG_CONCAT | CALL_ENV_FLAG_NULLABLE,
+				     ippool_common_call_env_t, free), QUERY_ESCAPE },
+		{ FR_CALL_ENV_OFFSET("update_update", FR_TYPE_STRING, CALL_ENV_FLAG_REQUIRED | CALL_ENV_FLAG_CONCAT | CALL_ENV_FLAG_NULLABLE,
+				     ippool_common_call_env_t, update), QUERY_ESCAPE },
+		CALL_ENV_TERMINATOR
+	}
+};
+
+static const call_env_method_t sqlippool_release_method_env = {
+	FR_CALL_ENV_METHOD_OUT(ippool_common_call_env_t),
+	.env = (call_env_parser_t[]) {
+		{ FR_CALL_ENV_OFFSET("release_clear", FR_TYPE_STRING, CALL_ENV_FLAG_REQUIRED | CALL_ENV_FLAG_CONCAT | CALL_ENV_FLAG_NULLABLE,
+				     ippool_common_call_env_t, update), QUERY_ESCAPE },
+		CALL_ENV_TERMINATOR
+	}
+};
+
+static const call_env_method_t sqlippool_bulk_release_method_env = {
+	FR_CALL_ENV_METHOD_OUT(ippool_common_call_env_t),
+	.env = (call_env_parser_t[]) {
+		{ FR_CALL_ENV_OFFSET("bulk_release_clear", FR_TYPE_STRING, CALL_ENV_FLAG_CONCAT | CALL_ENV_FLAG_NULLABLE,
+				     ippool_common_call_env_t, update), QUERY_ESCAPE },
+		CALL_ENV_TERMINATOR
+	}
+};
+
+static const call_env_method_t sqlippool_mark_method_env = {
+	FR_CALL_ENV_METHOD_OUT(ippool_common_call_env_t),
+	.env = (call_env_parser_t[]) {
+		{ FR_CALL_ENV_OFFSET("mark_clear", FR_TYPE_STRING, CALL_ENV_FLAG_CONCAT | CALL_ENV_FLAG_NULLABLE,
+				     ippool_common_call_env_t, update), QUERY_ESCAPE },
+		CALL_ENV_TERMINATOR
+	}
+};
 
 /*
  *	The module name should be the only globally exported symbol.
  *	That is, everything else should be 'static'.
  *
  *	If the module needs to temporarily modify it's instantiation
- *	data, the type should be changed to RLM_TYPE_THREAD_UNSAFE.
+ *	data, the type should be changed to MODULE_TYPE_THREAD_UNSAFE.
  *	The server will then take care of ensuring that the module
  *	is single-threaded.
  */
-extern rad_module_t rlm_sqlippool;
-rad_module_t rlm_sqlippool = {
-	.magic		= RLM_MODULE_INIT,
-	.name		= "sqlippool",
-	.type		= RLM_TYPE_THREAD_SAFE,
-	.inst_size	= sizeof(rlm_sqlippool_t),
-	.config		= module_config,
-	.instantiate	= mod_instantiate,
-	.methods = {
-		[MOD_ACCOUNTING]	= mod_accounting,
-		[MOD_POST_AUTH]		= mod_post_auth
+extern module_rlm_t rlm_sqlippool;
+module_rlm_t rlm_sqlippool = {
+	.common = {
+		.magic		= MODULE_MAGIC_INIT,
+		.name		= "sqlippool",
+		.inst_size	= sizeof(rlm_sqlippool_t),
+		.config		= module_config,
+		.instantiate	= mod_instantiate
 	},
+	.method_group = {
+		.bindings = (module_method_binding_t[]){
+			/*
+			*	RADIUS specific
+			*/
+			{ .section = SECTION_NAME("recv", "Access-Request"), .method = mod_alloc, .method_env = &sqlippool_alloc_method_env },
+			{ .section = SECTION_NAME("accounting", "Start"), .method = mod_common, .method_env = &sqlippool_update_method_env },
+			{ .section = SECTION_NAME("accounting", "Alive"), .method = mod_common, .method_env = &sqlippool_update_method_env },
+			{ .section = SECTION_NAME("accounting", "Stop"), .method = mod_common, .method_env = &sqlippool_release_method_env },
+			{ .section = SECTION_NAME("accounting", "Accounting-On"), .method = mod_common, .method_env = &sqlippool_bulk_release_method_env },
+			{ .section = SECTION_NAME("accounting", "Accounting-Off"), .method = mod_common, .method_env = &sqlippool_bulk_release_method_env },
+
+			/*
+			*	DHCPv4
+			*/
+			{ .section = SECTION_NAME("recv", "Discover"), .method = mod_alloc, .method_env = &sqlippool_alloc_method_env },
+			{ .section = SECTION_NAME("recv", "Request"), .method = mod_common, .method_env = &sqlippool_update_method_env },
+			{ .section = SECTION_NAME("recv", "Confirm"), .method = mod_common, .method_env = &sqlippool_update_method_env },
+			{ .section = SECTION_NAME("recv", "Rebind"), .method = mod_common, .method_env = &sqlippool_update_method_env },
+			{ .section = SECTION_NAME("recv", "Renew"), .method = mod_common, .method_env = &sqlippool_update_method_env },
+			{ .section = SECTION_NAME("recv", "Release"), .method = mod_common, .method_env = &sqlippool_release_method_env },
+			{ .section = SECTION_NAME("recv", "Decline"), .method = mod_common, .method_env = &sqlippool_mark_method_env },
+
+			/*
+			*	Generic
+			*/
+			{ .section = SECTION_NAME("recv", CF_IDENT_ANY), .method = mod_common, .method_env = &sqlippool_update_method_env },
+			{ .section = SECTION_NAME("send", CF_IDENT_ANY),.method = mod_alloc, .method_env = &sqlippool_alloc_method_env },
+
+			/*
+			*	Named methods matching module operations
+			*/
+			{ .section = SECTION_NAME("allocate", NULL), .method = mod_alloc, .method_env = &sqlippool_alloc_method_env },
+			{ .section = SECTION_NAME("update", NULL), .method = mod_common, .method_env = &sqlippool_update_method_env },
+			{ .section = SECTION_NAME("renew", NULL), .method = mod_common, .method_env = &sqlippool_update_method_env },
+			{ .section = SECTION_NAME("release", NULL), .method = mod_common, .method_env = &sqlippool_release_method_env },
+			{ .section = SECTION_NAME("bulk-release", NULL), .method = mod_common, .method_env = &sqlippool_bulk_release_method_env },
+			{ .section = SECTION_NAME("mark", NULL),.method = mod_common,.method_env = &sqlippool_mark_method_env },
+
+			MODULE_BINDING_TERMINATOR
+		}
+	}
 };

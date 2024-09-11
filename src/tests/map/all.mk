@@ -1,50 +1,53 @@
-MAP_TESTS	:= $(patsubst $(top_srcdir)/src/tests/map/%,%,$(filter-out %.conf %.md %.attrs %.c %.mk %~ %.rej %.out,$(wildcard $(top_srcdir)/src/tests/map/*)))
-MAP_OUTPUT	:= $(addsuffix .out,$(addprefix $(BUILD_DIR)/tests/map/,$(MAP_TESTS)))
-MAP_UNIT_BIN	:= $(BUILD_DIR)/bin/local/unit_test_map
-MAP_UNIT	:= ./build/make/jlibtool --silent --mode=execute $(MAP_UNIT_BIN)
-
-.PHONY: $(BUILD_DIR)/tests/map/
-$(BUILD_DIR)/tests/map/:
-	${Q}mkdir -p $@
+#
+#  Unit tests for individual pieces of functionality.
+#
 
 #
-#	Re-run the tests if the test program changes
+#  Test name
 #
-#	Create the output directory before the files
+TEST := test.map
+
 #
-$(MAP_OUTPUT): $(MAP_UNIT_BIN) | $(BUILD_DIR)/tests/map/
+#  The files are put here in order.  Later tests need
+#  functionality from earlier test.
+#
+FILES  := \
+	base \
+	count-error \
+	count-list-error
+
+$(eval $(call TEST_BOOTSTRAP))
+
+MAP_UNIT := $(TEST_BIN)/unit_test_map
 
 #
 #	Re-run the tests if the input file changes
 #
-$(BUILD_DIR)/tests/map/%.out: $(top_srcdir)/src/tests/map/%
-	${Q}echo MAP_TEST $(notdir $<)
-	${Q}if ! $(MAP_UNIT) -d $(top_srcdir)/raddb -D $(top_srcdir)/share $< > $@ 2>&1; then \
+$(OUTPUT)/%: $(DIR)/% $(TEST_BIN_DIR)/unit_test_map
+	@echo "MAP-TEST $(notdir $<)"
+	${Q}if ! $(MAP_UNIT) -d $(top_srcdir)/raddb -D $(top_srcdir)/share/dictionary -r "$@" "$<" > "$@.log" 2>&1 || ! test -f "$@"; then \
 		if ! grep ERROR $< 2>&1 > /dev/null; then \
-			cat $@; \
+			cat "$@.log"; \
 			echo "# $@"; \
-			echo FAILED: "$(MAP_UNIT) -d $(top_srcdir)/raddb -D $(top_srcdir)/share $<"; \
+			echo FAILED: "$(MAP_UNIT) -d $(top_srcdir)/raddb -D $(top_srcdir)/share/dictionary -r \"$@\" \"$<\""; \
 			exit 1; \
 		fi; \
-		FOUND=$$(grep $< $@ | head -1 | sed 's,^.*$(top_srcdir),,;s/:.*//;s/.*\[//;s/\].*//'); \
+		FOUND=$$(grep -E '^(Error : )?$<' $@.log | head -1 | sed 's/.*\[//;s/\].*//'); \
 		EXPECTED=$$(grep -n ERROR $< | sed 's/:.*//'); \
 		if [ "$$EXPECTED" != "$$FOUND" ]; then \
-			cat $@; \
+			cat "$@.log"; \
 			echo "# $@"; \
 			echo "E $$EXPECTED F $$FOUND"; \
-			echo UNEXPECTED ERROR: "$(MAP_UNIT) -d $(top_srcdir)/raddb -D $(top_srcdir)/share $<"; \
+			echo "UNEXPECTED ERROR: $(MAP_UNIT) -d $(top_srcdir)/raddb -D $(top_srcdir)/share/dictionary -r \"$@\" \"$<\""; \
 			exit 1; \
-		fi; \
+		else \
+			touch "$@"; \
+		fi \
 	else \
-		if ! diff $<.out $@; then \
-			echo FAILED: " diff $<.out $@"; \
-			echo FAILED: "$(MAP_UNIT) -d $(top_srcdir)/raddb -D $(top_srcdir)/share $<"; \
+		sed -i.bak -e '$${/Executing: /d;}' "$@.log"; \
+		if ! diff "$<.log" "$@.log"; then \
+			echo "FAILED: diff \"$<.log\" \"$@.log\""; \
+			echo "FAILED: $(MAP_UNIT) -d $(top_srcdir)/raddb -D $(top_srcdir)/share/dictionary -r \"$@\" \"$<\""; \
 			exit 1; \
 		fi; \
 	fi
-
-TESTS.MAP_FILES := $(MAP_OUTPUT)
-
-$(TESTS.MAP_FILES): $(TESTS.UNIT_FILES)
-
-tests.map: $(MAP_OUTPUT)

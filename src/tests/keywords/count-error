@@ -1,7 +1,2 @@
-update control {
-       Cleartext-Password := 'hello'
-}
-
-update request {
-	Tmp-String-0 := &reply:Filter-Id[#]	# ERROR
-}
+string result_string
+result_string := reply.Filter-Id[#]	# ERROR

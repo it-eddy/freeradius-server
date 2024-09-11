@@ -17,18 +17,20 @@
  *   along with this program; if not, write to the Free Software
  *   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  *
- * Copyright 2016  Alan DeKok <aland@freeradius.org>
+ * @copyright 2016 Alan DeKok (aland@freeradius.org)
  */
 
 RCSID("$Id$")
 
 #include <freeradius-devel/io/control.h>
-#include <freeradius-devel/io/worker.h>
 #include <freeradius-devel/io/listen.h>
-#include <freeradius-devel/rad_assert.h>
+#include <freeradius-devel/io/worker.h>
+#include <freeradius-devel/util/debug.h>
+#include <freeradius-devel/util/syserror.h>
+#include <freeradius-devel/util/talloc.h>
 
 #ifdef HAVE_GETOPT_H
-#	include <getopt.h>
+#  include <getopt.h>
 #endif
 
 #include <pthread.h>
@@ -44,7 +46,7 @@ RCSID("$Id$")
 #define MPRINT1 if (debug_lvl) printf
 #define MPRINT2 if (debug_lvl > 1) printf
 
-typedef struct fr_schedule_worker_t {
+typedef struct {
 	int		id;			//!< ID of the worker 0..N
 	pthread_t	pthread_id;		//!< pthread ID of the worker
 	fr_worker_t	*worker;		//!< pointer to the worker
@@ -64,28 +66,20 @@ static bool		quiet = false;
 static fr_schedule_worker_t workers[MAX_WORKERS];
 
 /**********************************************************************/
-typedef struct rad_request REQUEST;
+typedef struct request_s request_t;
 
-REQUEST *request_alloc(UNUSED TALLOC_CTX *ctx)
+request_t *request_alloc(UNUSED TALLOC_CTX *ctx, UNUSED request_init_args_t const *args)
 {
 	return NULL;
 }
 
-void request_verify(UNUSED char const *file, UNUSED int line, UNUSED REQUEST const *request)
+void request_verify(UNUSED char const *file, UNUSED int line, UNUSED request_t const *request)
 {
 }
 
-void talloc_const_free(void const *ptr)
-{
-	void *tmp;
-	if (!ptr) return;
-
-	memcpy(&tmp, &ptr, sizeof(tmp));
-	talloc_free(tmp);
-}
 /**********************************************************************/
 
-static void NEVER_RETURNS usage(void)
+static NEVER_RETURNS void usage(void)
 {
 	fprintf(stderr, "usage: worker_test [OPTS]\n");
 	fprintf(stderr, "  -c <control-plane>     Size of the control plane queue.\n");
@@ -96,16 +90,16 @@ static void NEVER_RETURNS usage(void)
 	fprintf(stderr, "  -w N                   Create N workers.  Default is 1.\n");
 	fprintf(stderr, "  -x                     Debugging mode.\n");
 
-	exit(EXIT_FAILURE);
+	fr_exit_now(EXIT_FAILURE);
 }
 
-static fr_io_final_t test_process(REQUEST *request, fr_io_action_t action)
+static rlm_rcode_t test_process(UNUSED void const *inst, request_t *request, fr_io_action_t action)
 {
 	MPRINT1("\t\tPROCESS --- request %"PRIu64" action %d\n", request->number, action);
-	return FR_IO_REPLY;
+	RETURN_MODULE_OK;
 }
 
-static int test_decode(UNUSED void const *instance, REQUEST *request, uint8_t *const data, size_t data_len)
+static int test_decode(UNUSED void const *instance, request_t *request, uint8_t *const data, size_t data_len)
 {
 	uint32_t number;
 
@@ -122,7 +116,7 @@ static int test_decode(UNUSED void const *instance, REQUEST *request, uint8_t *c
 	return 0;
 }
 
-static ssize_t test_encode(void const *instance, REQUEST *request, uint8_t *const data, size_t data_len)
+static ssize_t test_encode(void const *instance, request_t *request, uint8_t *const data, size_t data_len)
 {
 	MPRINT1("\t\tENCODE >>> request %"PRIu64" - data %p %p size %zd\n", request->number,
 		instance, data, data_len);
@@ -130,7 +124,7 @@ static ssize_t test_encode(void const *instance, REQUEST *request, uint8_t *cons
 	return data_len;
 }
 
-static size_t test_nak(void const *packet_ctx, uint8_t *const packet, size_t packet_len, uint8_t *reply, UNUSED size_t reply_len)
+static size_t test_nak(UNUSED void const *instance, void *packet_ctx, uint8_t *const packet, size_t packet_len, uint8_t *reply, UNUSED size_t reply_len)
 {
 	uint32_t number;
 
@@ -159,23 +153,25 @@ static void *worker_thread(void *arg)
 	fr_worker_t *worker;
 	fr_schedule_worker_t *sw;
 	fr_event_list_t *el;
+	char buffer[16];
 
 	sw = (fr_schedule_worker_t *) arg;
 
 	MPRINT1("\tWorker %d started.\n", sw->id);
 
-	MEM(ctx = talloc_init("worker"));
+	MEM(ctx = talloc_init_const("worker"));
 
 	el = fr_event_list_alloc(ctx, NULL, NULL);
 	if (!el) {
 		fprintf(stderr, "worker_test: Failed to create the event list\n");
-		exit(EXIT_FAILURE);
+		fr_exit_now(EXIT_FAILURE);
 	}
 
-	worker = sw->worker = fr_worker_create(ctx, el, &default_log, L_DBG_LVL_MAX);
+	snprintf(buffer, sizeof(buffer), "%d", sw->id);
+	worker = sw->worker = fr_worker_create(ctx, el, buffer, &default_log, L_DBG_LVL_MAX);
 	if (!worker) {
 		fprintf(stderr, "worker_test: Failed to create the worker\n");
-		exit(EXIT_FAILURE);
+		fr_exit_now(EXIT_FAILURE);
 	}
 
 	MPRINT1("\tWorker %d looping.\n", sw->id);
@@ -204,12 +200,12 @@ static void master_process(void)
 	fr_listen_t		listen = { .app_io = &app_io };
 	struct kevent		events[MAX_KEVENTS];
 
-	MEM(ctx = talloc_init("master"));
+	MEM(ctx = talloc_init_const("master"));
 
 	ms = fr_message_set_create(ctx, MAX_MESSAGES, sizeof(fr_channel_data_t), MAX_MESSAGES * 1024);
 	if (!ms) {
 		fprintf(stderr, "Failed creating message set\n");
-		exit(EXIT_FAILURE);
+		fr_exit_now(EXIT_FAILURE);
 	}
 
 	MPRINT1("Master started.\n");
@@ -242,7 +238,7 @@ static void master_process(void)
 			 */
 			MPRINT1("Master creating channel to worker %d.\n", num_workers);
 			workers[i].ch = fr_worker_channel_create(workers[i].worker, ctx, control_master);
-			rad_assert(workers[i].ch != NULL);
+			fr_assert(workers[i].ch != NULL);
 
 			(void) fr_channel_master_ctx_add(workers[i].ch, &workers[i]);
 
@@ -282,7 +278,7 @@ static void master_process(void)
 
 		for (i = 0; i < num_to_send; i++) {
 			cd = (fr_channel_data_t *) fr_message_alloc(ms, NULL, 100);
-			rad_assert(cd != NULL);
+			fr_assert(cd != NULL);
 
 			num_outstanding++;
 			num_messages++;
@@ -307,12 +303,12 @@ static void master_process(void)
 			MPRINT1("Master sent message %d to worker %d\n", num_messages, which_worker);
 			rcode = fr_channel_send_request(workers[which_worker].ch, cd, &reply);
 			if (rcode < 0) {
-				fprintf(stderr, "Failed sending request: %s\n", strerror(errno));
+				fprintf(stderr, "Failed sending request: %s\n", fr_syserror(errno));
 			}
 			which_worker++;
 			if (which_worker >= num_workers) which_worker = 0;
 
-			rad_assert(rcode == 0);
+			fr_assert(rcode == 0);
 			if (reply) {
 				num_replies++;
 				num_outstanding--;
@@ -335,18 +331,18 @@ check_close:
 					fr_worker_debug(workers[i].worker, stdout);
 				}
 
-				rcode = fr_channel_signal_worker_close(workers[i].ch);
+				rcode = fr_channel_signal_responder_close(workers[i].ch);
 				MPRINT1("Master asked exit for worker %d.\n", workers[i].id);
 				if (rcode < 0) {
-					fprintf(stderr, "Failed signaling close %d: %s\n", i, strerror(errno));
-					exit(EXIT_FAILURE);
+					fprintf(stderr, "Failed signaling close %d: %s\n", i, fr_syserror(errno));
+					fr_exit_now(EXIT_FAILURE);
 				}
 			}
 			signaled_close = true;
 		}
 
 		MPRINT1("Master waiting on events.\n");
-		rad_assert(num_messages <= max_messages);
+		fr_assert(num_messages <= max_messages);
 
 		num_events = kevent(kq_master, NULL, 0, events, MAX_KEVENTS, NULL);
 		MPRINT1("Master kevent returned %d\n", num_events);
@@ -354,8 +350,8 @@ check_close:
 		if (num_events < 0) {
 			if (errno == EINTR) continue;
 
-			fprintf(stderr, "Failed waiting for kevent: %s\n", strerror(errno));
-			exit(EXIT_FAILURE);
+			fprintf(stderr, "Failed waiting for kevent: %s\n", fr_syserror(errno));
+			fr_exit_now(EXIT_FAILURE);
 		}
 
 		if (num_events == 0) continue;
@@ -381,13 +377,13 @@ check_close:
 			data_size = fr_control_message_pop(aq_master, &id, data, sizeof(data));
 			if (!data_size) break;
 
-			rad_assert(id == FR_CONTROL_ID_CHANNEL);
+			fr_assert(id == FR_CONTROL_ID_CHANNEL);
 
 			ce = fr_channel_service_message(now, &ch, data, data_size);
 			MPRINT1("Master got channel event %d\n", ce);
 
 			switch (ce) {
-			case FR_CHANNEL_DATA_READY_NETWORK:
+			case FR_CHANNEL_DATA_READY_REQUESTOR:
 				MPRINT1("Master got data ready signal\n");
 
 				reply = fr_channel_recv_reply(ch);
@@ -407,17 +403,11 @@ check_close:
 
 			case FR_CHANNEL_CLOSE:
 				sw = fr_channel_master_ctx_get(ch);
-				rad_assert(sw != NULL);
+				fr_assert(sw != NULL);
 
 				MPRINT1("Master received close signal for worker %d\n", sw->id);
-				rad_assert(signaled_close == true);
+				fr_assert(signaled_close == true);
 
-
-				/*
-				 *	Tell the event loop to exit, and signal the worker
-				 *	so that it stops waiting on the KQ.
-				 */
-				(void) fr_worker_exit(sw->worker);
 				(void) pthread_kill(sw->pthread_id, SIGTERM);
 				running = false;
 				break;
@@ -431,7 +421,7 @@ check_close:
 				/*
 				 *	Not written yet!
 				 */
-				rad_assert(0 == 1);
+				fr_assert(0 == 1);
 				break;
 			} /* switch over signal returned */
 		} /* drain the control plane */
@@ -453,7 +443,7 @@ check_close:
 			if (!workers[i].worker) num_outstanding--;
 		}
 
-		if ((now - last_checked) > (NANOSEC / 10)) {
+		if ((now - last_checked) > (NSEC / 10)) {
 			MPRINT1("still num_outstanding %d\n", num_outstanding);
 		}
 
@@ -472,7 +462,7 @@ check_close:
 	 */
 	rcode = fr_message_set_messages_used(ms);
 	MPRINT2("Master messages used = %d\n", rcode);
-	rad_assert(rcode == 0);
+	fr_assert(rcode == 0);
 
 	talloc_free(ctx);
 
@@ -486,16 +476,16 @@ static void sig_ignore(int sig)
 int main(int argc, char *argv[])
 {
 	int c;
-	TALLOC_CTX	*autofree = talloc_init("main");
+	TALLOC_CTX	*autofree = talloc_autofree_context();
 
 	if (fr_time_start() < 0) {
-		fprintf(stderr, "Failed to start time: %s\n", strerror(errno));
-		exit(EXIT_FAILURE);
+		fprintf(stderr, "Failed to start time: %s\n", fr_syserror(errno));
+		fr_exit_now(EXIT_FAILURE);
 	}
 
-	fr_log_init(&default_log, false);
+	fr_log_init_legacy(&default_log, false);
 
-	while ((c = getopt(argc, argv, "c:hm:o:qtw:x")) != EOF) switch (c) {
+	while ((c = getopt(argc, argv, "c:hm:o:qtw:x")) != -1) switch (c) {
 		case 'x':
 			debug_lvl++;
 			break;
@@ -544,13 +534,13 @@ int main(int argc, char *argv[])
 #endif
 
 	kq_master = kqueue();
-	rad_assert(kq_master >= 0);
+	fr_assert(kq_master >= 0);
 
-	aq_master = fr_atomic_queue_create(autofree, max_control_plane);
-	rad_assert(aq_master != NULL);
+	aq_master = fr_atomic_queue_alloc(autofree, max_control_plane);
+	fr_assert(aq_master != NULL);
 
 	control_master = fr_control_create(autofree, kq_master, aq_master, 1024);
-	rad_assert(control_master != NULL);
+	fr_assert(control_master != NULL);
 
 	signal(SIGTERM, sig_ignore);
 
@@ -562,7 +552,5 @@ int main(int argc, char *argv[])
 
 	close(kq_master);
 
-	talloc_free(autofree);
-
-	return 0;
+	return EXIT_SUCCESS;
 }

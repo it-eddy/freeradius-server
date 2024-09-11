@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, Network RADIUS SARL <license@networkradius.com>
+ * @copyright (c) 2016, Network RADIUS SAS (license@networkradius.com)
  *  All rights reserved.
  *
  *  Redistribution and use in source and binary forms, with or without
@@ -9,7 +9,7 @@
  *    * Redistributions in binary form must reproduce the above copyright
  *      notice, this list of conditions and the following disclaimer in the
  *      documentation and/or other materials provided with the distribution.
- *    * Neither the name of Network RADIUS SARL nor the
+ *    * Neither the name of Network RADIUS SAS nor the
  *      names of its contributors may be used to endorse or promote products
  *      derived from this software without specific prior written permission.
  *
@@ -32,7 +32,7 @@
  *
  * @author Arran Cudbard-Bell
  *
- * @copyright 2016 Network RADIUS SARL <license@networkradius.com>
+ * @copyright 2016 Network RADIUS SAS (license@networkradius.com)
  */
 #include <osmocom/core/linuxlist.h>
 #include <osmocom/core/timer.h>
@@ -73,6 +73,8 @@ typedef enum {
  * and won't mind extra memory being allocated from this ctx.
  */
 typedef struct sigtran_transaction {
+	fr_rb_node_t			node;				//!< Entry in the tree of transactions.
+
 	struct {
 		sigtran_request_type_t		type;			//!< Type of request
 		void				*data;			//!< Data for the request.
@@ -83,13 +85,16 @@ typedef struct sigtran_transaction {
 	} response;
 
 	struct {
-		REQUEST			*request;
-		struct osmo_fd		*ofd;		//!< The FD the txn was received on.
-		struct osmo_timer_list	timer;		//!< Timer data.
+		request_t			*request;
+		struct osmo_fd		*ofd;				//!< The FD the txn was received on.
+		struct osmo_timer_list	timer;				//!< Timer data.
 
 
-		uint32_t		otid;		//!< Transaction ID.
-		uint8_t			invoke_id;	//!< Sequence number (within transaction).
+		uint32_t		otid;				//!< Transaction ID.
+		uint8_t			invoke_id;			//!< Sequence number (within transaction).
+
+		bool			defunct;			//!< Response should be deleted and not
+									///< processed.
 	} ctx;
 } sigtran_transaction_t;
 
@@ -165,7 +170,7 @@ typedef struct sigtran_conn_conf {
 	sigtran_sccp_address_t		sccp_called;			//!< The calling SCCP address.
 	struct sockaddr_sccp		sccp_called_sockaddr;		//!< Parsed version of the above
 
-	vp_tmpl_t			*map_version;			//!< Application context version.
+	tmpl_t			*map_version;			//!< Application context version.
 } sigtran_conn_conf_t;
 
 /** Represents a connection to a remote SS7 entity
@@ -224,14 +229,16 @@ typedef struct sigtran_map_send_auth_info_res {
 } sigtran_map_send_auth_info_res_t;
 
 typedef struct rlm_sigtran {
-	char const		*name;					//!< Instance name.
-
 	sigtran_conn_t const	*conn;					//!< Linkset associated with this instance.
 
 	sigtran_conn_conf_t	conn_conf;				//!< Connection configuration
 
-	vp_tmpl_t		*imsi;					//!< Subscriber identifier.
+	tmpl_t			*imsi;					//!< Subscriber identifier.
 } rlm_sigtran_t;
+
+typedef struct rlm_sigtran_thread {
+        int                     fd;                                     //!< File descriptor
+} rlm_sigtran_thread_t;
 
 extern int ctrl_pipe[2];
 extern uint8_t const ascii_to_tbcd[];
@@ -242,16 +249,16 @@ extern uint8_t const is_char_tbcd[];
  */
 int	sigtran_client_do_transaction(int fd, sigtran_transaction_t *txn);
 
-int	sigtran_client_thread_register(void);
+int	sigtran_client_thread_register(fr_event_list_t *el);
 
-int	sigtran_client_thread_unregister(int req_pipe_fd);
+int	sigtran_client_thread_unregister(fr_event_list_t *el, int req_pipe_fd);
 
 int	sigtran_client_link_up(sigtran_conn_t const **out, sigtran_conn_conf_t const *conf);
 
 int	sigtran_client_link_down(sigtran_conn_t const **conn);
 
-rlm_rcode_t sigtran_client_map_send_auth_info(rlm_sigtran_t *inst, REQUEST *request,
-					      sigtran_conn_t const *conn, int fd);
+unlang_action_t sigtran_client_map_send_auth_info(rlm_rcode_t *p_result, rlm_sigtran_t const *inst, request_t *request,
+				  		  sigtran_conn_t const *conn, int fd);
 
 /*
  *	event.c

@@ -1,3 +1,4 @@
+#pragma once
 /*
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -13,27 +14,26 @@
  *  along with this program; if not, write to the Free Software
  *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
-#ifndef _FR_QUEUE_H
-#define _FR_QUEUE_H
+
 /**
  * $Id$
  *
  * @file io/queue.h
  * @brief Thread-unsafe queues.
  *
- * @copyright 2016 Alan DeKok <aland@freeradius.org>
+ * @copyright 2016 Alan DeKok (aland@freeradius.org)
  */
 RCSIDH(queue_h, "$Id$")
 
-#include <talloc.h>
 #include <stdbool.h>
 #include <freeradius-devel/io/atomic_queue.h>
+#include <freeradius-devel/util/talloc.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-typedef struct fr_queue_t fr_queue_t;
+typedef struct fr_queue_s fr_queue_t;
 
 fr_queue_t *fr_queue_create(TALLOC_CTX *ctx, int size);
 fr_queue_t *fr_queue_resize(fr_queue_t *fq, int size) CC_HINT(nonnull);
@@ -54,5 +54,3 @@ void fr_queue_debug(fr_queue_t *fq, FILE *fp) CC_HINT(nonnull);
 #ifdef __cplusplus
 }
 #endif
-
-#endif /* _FR_QUEUE_H */

@@ -12,15 +12,15 @@ team.
 
 Each directory has several dockerfiles:
 
- - Dockerfile.source will build an image which has full
-   dependencies installed, ready for building FreeRADIUS.
+- Dockerfile.deps will build an image which has full dependencies
+  installed, ready for building FreeRADIUS.
 
- - Dockerfile is based on Dockerfile.source and will build
-   the FreeRADIUS source and run the server.
+- Dockerfile is based on Dockerfile.deps and will build the
+  FreeRADIUS source and run the server.
 
- - Dockerfile.jenkins is based on Dockerfile.source and
-   will add components required for use in a jenkins build
-   environment.
+- Dockerfile.jenkins is based on Dockerfile.deps and will
+  add components required for use in a jenkins build environment.
+
 
 ## Getting started
 
@@ -30,7 +30,7 @@ As with any Dockerfile you'll first need to build the image:
 
 ```bash
 cd scripts/docker/build-<os_name>
-docker build -f Dockerfile.source -t freeradius/<os_name>-source .
+docker build -f Dockerfile.deps -t freeradius/<os_name>-deps .
 ```
 
 This will download the OS base image, install/build any dependencies
@@ -43,7 +43,7 @@ Once built, running ``docker images`` should show the image.
 ```bash
 $ docker images
 REPOSITORY                 TAG                 IMAGE ID            CREATED             SIZE
-freeradius/centos7-source  latest              0b7af2e27bef        10 minutes ago      2.15 GB
+freeradius/centos7-deps    latest              0b7af2e27bef        10 minutes ago      2.15 GB
 centos                     centos7             3bee3060bfc8        2 weeks ago         193 MB
 ```
 You will now be able to execute the built image with an interactive
@@ -67,13 +67,13 @@ Building all these docker images can be done with the supplied
 script, for example:
 
 ```bash
-$ ./dockerbuild build-centos7
+./dockerbuild build-centos7
 ```
 
 to build the server, and
 
 ```bash
-$ ./dockerbuild -j build-centos7
+./dockerbuild -j build-centos7
 ```
 
 to build the jenkins image.
@@ -86,11 +86,11 @@ example below the ``-it`` flags tell docker to open an interactive
 terminal on the container.
 
 ```bash
-$ docker run -it freeradius/centos7-source
+$ docker run -it freeradius/centos7-deps
 [root@08a222f5fdfe freeradius-server]# ls
 acinclude.m4  config.guess  configure.ac  debian      install-sh  main.mk      man      raddb      scripts  suse
 aclocal.m4    config.sub    COPYRIGHT     doc         LICENSE     Makefile     mibs     README.md  share    VERSION
-autogen.sh    configure     CREDITS       INSTALL.md  m4          Make.inc.in  missing  redhat     src
+autogen.sh    configure     CREDITS       m4          Make.inc.in  missing  redhat     src
 ```
 
 To run FreeRADIUS, use:
@@ -140,3 +140,12 @@ See
 [here](https://docs.docker.com/engine/userguide/networking/#embedded-dns-server)
 for more details on docker networking.
 
+### Example
+
+Here are the steps you would follow to debug FreeRADIUS on centos7.
+
+```bash
+cd scripts/docker/build-centos7
+docker build -f Dockerfile.deps -t freeradius/centos7-deps .
+docker run --privileged -it freeradius/centos7-deps
+```

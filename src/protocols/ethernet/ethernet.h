@@ -1,3 +1,4 @@
+#pragma once
 /*
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -13,16 +14,16 @@
  *  along with this program; if not, write to the Free Software
  *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
-#ifndef _FR_ETHERNET_H
-#define _FR_ETHERNET_H
+
 /**
  * $Id$
  *
- * @file include/net.h
+ * @file protocols/ethernet/ethernet.h
  * @brief Structures and functions for parsing ethernet headers.
  *
  * @copyright 2017 Arran Cudbard-Bell (a.cudbardb@freeradius.org)
  */
+#include <freeradius-devel/util/inet.h>
 #include <stdint.h>
 #include <stddef.h>
 
@@ -46,7 +47,7 @@
  */
 #define VLAN_VID_UNPACK(_vlan)		((htons((_vlan)->tag_control) & 0x0fff))
 
-/** Pack the PCP (Priority Code Point) DEI (Drop Eligable Indicator) and VID (VLAN ID)
+/** Pack the PCP (Priority Code Point) DEI (Drop Eligible Indicator) and VID (VLAN ID)
  *
  * Packs the PCP, DEI and VID into the TCI (Tag control information). Output will be a 16bit integer
  * in network byte order.
@@ -63,7 +64,7 @@
  *
  * Represents a single layer of 802.1Q or QinQ tagging.
  */
-typedef struct CC_HINT(__packed__) vlan_header {
+typedef struct CC_HINT(__packed__) {
 	uint16_t	tag_type;		//!< Tag type.  One of (0x8100 - CVLAN, 0x9100,
 						///< 0x9200, 0x9300 - SVLAN).
 	uint16_t	tag_control;		//!< - 3 bits priority.
@@ -84,8 +85,8 @@ typedef struct CC_HINT(__packed__) {
  *
  */
 typedef struct {
-	uint8_t		src_addr[ETHER_ADDR_LEN];
-	uint8_t		dst_addr[ETHER_ADDR_LEN];
+	fr_ethernet_t	src_addr;
+	fr_ethernet_t	dst_addr;
 	uint16_t	ether_type;		//!< Ether type.  Usually 0x0800 (IPv4) 0x086DD (IPv6).
 
 	uint16_t	cvlan_tpid;		//!< CVLAN tag type.  If 0, no CVLAN/SVLAN present.
@@ -114,4 +115,3 @@ typedef enum {
 	PROTO_OPT_ETHERNET_CVLAN_DEI,		//!< Inner VLAN drop eligible indicator.
 	PROTO_OPT_ETHERNET_CVLAN_VID		//!< Inner VLAN ID.
 } fr_ethernet_options_t;
-#endif

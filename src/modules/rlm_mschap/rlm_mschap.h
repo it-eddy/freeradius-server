@@ -1,47 +1,63 @@
-/* Copyright 2006-2015 The FreeRADIUS server project */
-
-#ifndef _RLM_MSCHAP_H
-#define _RLM_MSCHAP_H
-
+#pragma once
+/* @copyright 2006-2015 The FreeRADIUS server project */
 RCSIDH(rlm_mschap_h, "$Id$")
 
 #include "config.h"
 
+#include <freeradius-devel/util/dict.h>
+#include <freeradius-devel/server/tmpl.h>
+
 #ifdef WITH_AUTH_WINBIND
 #  include <wbclient.h>
 
-#include <freeradius-devel/pool.h>
+#include <freeradius-devel/server/pool.h>
 #endif
 
 /* Method of authentication we are going to use */
 typedef enum {
-	AUTH_INTERNAL		= 0,
-	AUTH_NTLMAUTH_EXEC	= 1
+	AUTH_INTERNAL		= 0, /* MS-CHAP-Use-NTLM-Auth = no */
+	AUTH_NTLMAUTH_EXEC	= 1, /* MS-CHAP-Use-NTLM-Auth = yes */
+	AUTH_AUTO		= 2, /* MS-CHAP-Use-NTLM-Auth = auto */
 #ifdef WITH_AUTH_WINBIND
-	,AUTH_WBCLIENT       	= 2
+	AUTH_WBCLIENT       	= 3
 #endif
 } MSCHAP_AUTH_METHOD;
 
-typedef struct rlm_mschap_t {
+extern HIDDEN fr_dict_attr_t const *attr_auth_type;
+extern HIDDEN fr_dict_attr_t const *attr_cleartext_password;
+extern HIDDEN fr_dict_attr_t const *attr_eap_identity;
+extern HIDDEN fr_dict_attr_t const *attr_nt_password;
+extern HIDDEN fr_dict_attr_t const *attr_lm_password;
+extern HIDDEN fr_dict_attr_t const *attr_ms_chap_use_ntlm_auth;
+
+extern HIDDEN fr_dict_attr_t const *attr_ms_chap_user_name;
+
+extern HIDDEN fr_dict_attr_t const *attr_ms_chap_peer_challenge;
+extern HIDDEN fr_dict_attr_t const *attr_ms_chap_new_nt_password;
+extern HIDDEN fr_dict_attr_t const *attr_ms_chap_new_cleartext_password;
+extern HIDDEN fr_dict_attr_t const *attr_smb_account_ctrl;
+extern HIDDEN fr_dict_attr_t const *attr_smb_account_ctrl_text;
+
+typedef struct {
+	fr_dict_enum_value_t	*auth_type;
+
+	bool			normify;
+
 	bool			use_mppe;
 	bool			require_encryption;
 	bool			require_strong;
 	bool			with_ntdomain_hack;	/* this should be in another module */
-	char const		*xlat_name;
+
 	char const		*ntlm_auth;
-	uint32_t		ntlm_auth_timeout;
+	fr_time_delta_t		ntlm_auth_timeout;
 	char const		*ntlm_cpw;
-	char const		*ntlm_cpw_username;
-	char const		*ntlm_cpw_domain;
-	char const		*local_cpw;
-	char const		*auth_type;
+
 	bool			allow_retry;
 	char const		*retry_msg;
 	MSCHAP_AUTH_METHOD	method;
-	vp_tmpl_t		*wb_username;
-	vp_tmpl_t		*wb_domain;
+	char const		*wb_username;
 #ifdef WITH_AUTH_WINBIND
-	fr_pool_t	*wb_pool;
+	fr_pool_t		*wb_pool;
 	bool			wb_retry_with_normalised_username;
 #endif
 #ifdef __APPLE__
@@ -49,5 +65,23 @@ typedef struct rlm_mschap_t {
 #endif
 } rlm_mschap_t;
 
-#endif
-
+typedef struct {
+	tmpl_t const	*username;
+	tmpl_t const	*chap_error;
+	tmpl_t const	*chap_challenge;
+	tmpl_t const	*chap_response;
+	tmpl_t const	*chap2_response;
+	tmpl_t const	*chap2_success;
+	tmpl_t const	*chap_mppe_keys;
+	tmpl_t const	*mppe_encryption_policy;
+	tmpl_t const	*mppe_recv_key;
+	tmpl_t const	*mppe_send_key;
+	tmpl_t const	*mppe_encryption_types;
+	tmpl_t const	*chap2_cpw;
+	tmpl_t const	*chap_nt_enc_pw;
+	fr_value_box_t	wb_username;
+	fr_value_box_t	wb_domain;
+	tmpl_t const	*ntlm_cpw_username;
+	tmpl_t const	*ntlm_cpw_domain;
+	tmpl_t const	*local_cpw;
+} mschap_auth_call_env_t;

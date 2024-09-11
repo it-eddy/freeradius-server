@@ -1,3 +1,4 @@
+#pragma once
 /*
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -13,24 +14,23 @@
  *  along with this program; if not, write to the Free Software
  *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
-#ifndef _FR_CONTROL_H
-#define _FR_CONTROL_H
+
 /**
  * $Id$
  *
  * @file io/control.h
  * @brief control-plane signaling
  *
- * @copyright 2016 Alan DeKok <aland@freeradius.org>
+ * @copyright 2016 Alan DeKok (aland@freeradius.org)
  */
 RCSIDH(control_h, "$Id$")
 
 #include <freeradius-devel/io/atomic_queue.h>
 #include <freeradius-devel/io/ring_buffer.h>
-#include <freeradius-devel/io/time.h>
+#include <freeradius-devel/util/time.h>
+#include <freeradius-devel/util/event.h>
 
 #include <sys/types.h>
-#include <sys/event.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -41,7 +41,7 @@ extern "C" {
  *
  *  Multiple-producer, single consumer.
  */
-typedef struct fr_control_t fr_control_t;
+typedef struct fr_control_s fr_control_t;
 typedef	void (*fr_control_callback_t)(void *ctx, void const *data, size_t data_size, fr_time_t now);
 
 /*
@@ -54,13 +54,13 @@ typedef	void (*fr_control_callback_t)(void *ctx, void const *data, size_t data_s
  *	A list of pre-allocated IDs, so that the callers don't have to manage their own.
  */
 #define FR_CONTROL_ID_CHANNEL	(1)
-#define FR_CONTROL_ID_SOCKET	(2)
+#define FR_CONTROL_ID_LISTEN	(2)
 #define FR_CONTROL_ID_WORKER	(3)
 #define FR_CONTROL_ID_DIRECTORY (4)
 #define FR_CONTROL_ID_INJECT 	(5)
+#define FR_CONTROL_ID_LISTEN_DEAD (6)
 
-fr_control_t *fr_control_create(TALLOC_CTX *ctx, int kq, fr_atomic_queue_t *aq, uintptr_t ident) CC_HINT(nonnull(3));
-void fr_control_free(fr_control_t *c) CC_HINT(nonnull);
+fr_control_t *fr_control_create(TALLOC_CTX *ctx, fr_event_list_t *el, fr_atomic_queue_t *aq) CC_HINT(nonnull(3));
 
 int fr_control_gc(fr_control_t *c, fr_ring_buffer_t *rb) CC_HINT(nonnull);
 
@@ -72,10 +72,8 @@ ssize_t fr_control_message_pop(fr_atomic_queue_t *aq, uint32_t *p_id, void *data
 int fr_control_callback_add(fr_control_t *c, uint32_t id, void *ctx, fr_control_callback_t callback) CC_HINT(nonnull(1,4));
 int fr_control_callback_delete(fr_control_t *c, uint32_t id) CC_HINT(nonnull);
 
-void fr_control_service(fr_control_t *c, void *data, size_t data_size, fr_time_t now) CC_HINT(nonnull);
+int fr_control_same_thread(fr_control_t *c);
 
 #ifdef __cplusplus
 }
 #endif
-
-#endif /* _FR_CONTROL_H */

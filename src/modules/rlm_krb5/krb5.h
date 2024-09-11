@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
@@ -19,8 +20,8 @@
  * @file krb5.h
  * @brief types and function signatures for rlm_krb5.
  *
- * @copyright 2013  The FreeRADIUS server project
- * @copyright 2013  Arran Cudbard-Bell <a.cudbardb@freeradius.org>
+ * @copyright 2013 The FreeRADIUS server project
+ * @copyright 2013 Arran Cudbard-Bell (a.cudbardb@freeradius.org)
  */
 RCSIDH(krb5_h, "$Id$")
 
@@ -29,10 +30,10 @@ USES_APPLE_DEPRECATED_API
 #include <krb5.h>
 
 #ifdef KRB5_IS_THREAD_SAFE
-#  include <freeradius-devel/pool.h>
+#  include <freeradius-devel/server/pool.h>
 #endif
 
-typedef struct rlm_krb5_handle {
+typedef struct {
 	krb5_context	context;
 	krb5_keytab	keytab;
 
@@ -46,7 +47,7 @@ typedef struct rlm_krb5_handle {
  *
  * Holds the configuration and preparsed data for a instance of rlm_krb5.
  */
-typedef struct rlm_krb5_t {
+typedef struct {
 #ifdef KRB5_IS_THREAD_SAFE
 	fr_pool_t	*pool;		//!< Connection pool instance.
 #else
@@ -86,8 +87,10 @@ typedef struct rlm_krb5_t {
 #    include <com_err.h>
 #  endif
 #  define rlm_krb5_error(_x, _y, _z) error_message(_z)
+#  define KRB5_UNUSED UNUSED
 #else
 char const *rlm_krb5_error(rlm_krb5_t const *inst, krb5_context context, krb5_error_code code);
+# define KRB5_UNUSED
 #endif
 
-void *mod_conn_create(TALLOC_CTX *ctx, void *instance, struct timeval const *timeout);
+void *krb5_mod_conn_create(TALLOC_CTX *ctx, void *instance, fr_time_delta_t timeout);

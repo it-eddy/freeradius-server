@@ -1,9 +1,7 @@
-#ifndef _EAP_MSCHAPV2_H
-#define _EAP_MSCHAPV2_H
-
+#pragma once
 RCSIDH(eap_mschapv2_h, "$Id$")
 
-#include "eap.h"
+#include <freeradius-devel/eap/base.h>
 
 /*
  *	draft-kamath-pppext-eap-mschapv2-00.txt says:
@@ -34,20 +32,18 @@ RCSIDH(eap_mschapv2_h, "$Id$")
 #define MSCHAPV2_CHALLENGE_LEN  16
 #define MSCHAPV2_RESPONSE_LEN  50
 
-typedef struct mschapv2_header_t {
+typedef struct {
 	uint8_t opcode;
 	uint8_t mschapv2_id;
 	uint8_t ms_length[2];
 	uint8_t value_size;
 } mschapv2_header_t;
 
-typedef struct mschapv2_opaque_t {
+typedef struct {
 	int		code;
 	bool		has_peer_challenge;
 	uint8_t		auth_challenge[MSCHAPV2_CHALLENGE_LEN];
 	uint8_t		peer_challenge[MSCHAPV2_CHALLENGE_LEN];
-	VALUE_PAIR	*mppe_keys;
-	VALUE_PAIR	*reply;
+	fr_pair_list_t	mppe_keys;
+	fr_pair_list_t	reply;
 } mschapv2_opaque_t;
-
-#endif /*_EAP_MSCHAPV2_H*/

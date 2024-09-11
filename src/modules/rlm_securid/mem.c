@@ -15,16 +15,16 @@
  *   along with this program; if not, write to the Free Software
  *   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  *
- * Copyright 2012  The FreeRADIUS server project
- * Copyright 2012  Alan DeKok <aland@networkradius.com>
+ * @copyright 2012 The FreeRADIUS server project
+ * @copyright 2012 Alan DeKok (aland@networkradius.com)
  */
 
-#define LOG_PREFIX "rlm_securid - "
+#define LOG_PREFIX "securid"
 
 #include <stdio.h>
 #include "rlm_securid.h"
 
-static void securid_sessionlist_clean_expired(rlm_securid_t *inst, REQUEST *request, time_t timestamp);
+static void securid_sessionlist_clean_expired(rlm_securid_t *inst, request_t *request, time_t timestamp);
 
 static SECURID_SESSION* securid_sessionlist_delete(rlm_securid_t *inst,
 						   SECURID_SESSION *session);
@@ -39,7 +39,7 @@ SECURID_SESSION* securid_session_alloc(void)
 	return session;
 }
 
-void securid_session_free(UNUSED rlm_securid_t *inst,REQUEST *request,
+void securid_session_free(UNUSED rlm_securid_t *inst,request_t *request,
 			  SECURID_SESSION *session)
 {
 	if (!session) return;
@@ -56,7 +56,7 @@ void securid_session_free(UNUSED rlm_securid_t *inst,REQUEST *request,
 }
 
 
-void securid_sessionlist_free(rlm_securid_t *inst,REQUEST *request)
+void securid_sessionlist_free(rlm_securid_t *inst,request_t *request)
 {
 	SECURID_SESSION *node, *next;
 
@@ -80,16 +80,16 @@ void securid_sessionlist_free(rlm_securid_t *inst,REQUEST *request)
  *	Since we're adding it to the list, we guess that this means
  *	the packet needs a State attribute.  So add one.
  */
-int securid_sessionlist_add(rlm_securid_t *inst,REQUEST *request, SECURID_SESSION *session)
+int securid_sessionlist_add(rlm_securid_t *inst,request_t *request, SECURID_SESSION *session)
 {
 	int		status = 0;
-	VALUE_PAIR	*state;
+	fr_pair_t	*state;
 
 	/*
 	 *	The time at which this request was made was the time
 	 *	at which it was received by the RADIUS server.
 	 */
-	session->timestamp = request->packet->timestamp;
+	session->timestamp = fr_time_to_sec(request->packet->timestamp);
 
 	session->src_ipaddr = request->packet->src_ipaddr;
 
@@ -102,7 +102,7 @@ int securid_sessionlist_add(rlm_securid_t *inst,REQUEST *request, SECURID_SESSIO
 	/*
 	 *	If we have a DoS attack, discard new sessions.
 	 */
-	if (rbtree_num_elements(inst->session_tree) >= inst->max_sessions) {
+	if (fr_rb_num_elements(inst->session_tree) >= inst->max_sessions) {
 		securid_sessionlist_clean_expired(inst, request, session->timestamp);
 		goto done;
 	}
@@ -113,20 +113,21 @@ int securid_sessionlist_add(rlm_securid_t *inst,REQUEST *request, SECURID_SESSIO
 		session->session_id = inst->last_session_id;
 		RDEBUG2("Creating a new session with id=%d\n",session->session_id);
 	}
+
+	memset(session->state, 0, sizeof(session->state));
 	snprintf(session->state,sizeof(session->state)-1,"FRR-CH %d|%d",session->session_id,session->trips+1);
 	RDEBUG2("Inserting session id=%d identity='%s' state='%s' to the session list",
-			 session->session_id,SAFE_STR(session->identity),session->state);
+		session->session_id,SAFE_STR(session->identity),session->state);
 
 
 	/*
 	 *	Generate State, since we've been asked to add it to
 	 *	the list.
 	 */
-	state = pair_make_reply("State", session->state, T_OP_EQ);
-	if (!state) return -1;
-	state->vp_length = SECURID_STATE_LEN;
+	MEM(pair_update_reply(&state, attr_state) >= 0);
+	fr_pair_value_memdup(state, session->state, sizeof(session->state), true);
 
-	status = rbtree_insert(inst->session_tree, session);
+	status = fr_rb_insert(inst->session_tree, session);
 	if (status) {
 		/* tree insert SUCCESS */
 		/* insert the session to the linked list of sessions */
@@ -168,21 +169,21 @@ int securid_sessionlist_add(rlm_securid_t *inst,REQUEST *request, SECURID_SESSIO
  *	the caller.
  *
  */
-SECURID_SESSION *securid_sessionlist_find(rlm_securid_t *inst, REQUEST *request)
+SECURID_SESSION *securid_sessionlist_find(rlm_securid_t *inst, request_t *request)
 {
-	VALUE_PAIR	*state;
+	fr_pair_t	*state;
 	SECURID_SESSION* session;
 	SECURID_SESSION mySession;
 
 	/* clean expired sessions if any */
 	pthread_mutex_lock(&(inst->session_mutex));
-	securid_sessionlist_clean_expired(inst, request, request->packet->timestamp);
+	securid_sessionlist_clean_expired(inst, request, fr_time_to_sec(request->packet->timestamp));
 	pthread_mutex_unlock(&(inst->session_mutex));
 
 	/*
 	 *	We key the sessions off of the 'state' attribute
 	 */
-	state = fr_pair_find_by_num(request->packet->vps, 0, FR_STATE, TAG_ANY);
+	state = fr_pair_find_by_da(&request->request_pairs, NULL, attr_state);
 	if (!state) {
 		return NULL;
 	}
@@ -228,17 +229,12 @@ SECURID_SESSION *securid_sessionlist_find(rlm_securid_t *inst, REQUEST *request)
 /************ private functions *************/
 static SECURID_SESSION *securid_sessionlist_delete(rlm_securid_t *inst, SECURID_SESSION *session)
 {
-	rbnode_t *node;
-
-	node = rbtree_find(inst->session_tree, session);
-	if (!node) return NULL;
-
-	session = rbtree_node2data(inst->session_tree, node);
+	fr_assert(fr_rb_find(inst->session_tree, session) == session);
 
 	/*
 	 *	Delete old session from the tree.
 	 */
-	rbtree_delete(inst->session_tree, node);
+	fr_rb_delete(inst->session_tree, node);
 
 	/*
 	 *	And unsplice it from the linked list.
@@ -259,12 +255,12 @@ static SECURID_SESSION *securid_sessionlist_delete(rlm_securid_t *inst, SECURID_
 }
 
 
-static void securid_sessionlist_clean_expired(rlm_securid_t *inst, REQUEST *request, time_t timestamp)
+static void securid_sessionlist_clean_expired(rlm_securid_t *inst, request_t *request, time_t timestamp)
 {
-	int num_sessions;
+	uint64_t num_sessions;
 	SECURID_SESSION *session;
 
-	num_sessions = rbtree_num_elements(inst->session_tree);
+	num_sessions = fr_rb_num_elements(inst->session_tree);
 	RDEBUG2("There are %d sessions in the tree\n",num_sessions);
 
 	/*
@@ -273,10 +269,7 @@ static void securid_sessionlist_clean_expired(rlm_securid_t *inst, REQUEST *requ
 	 */
 	while((session = inst->session_head)) {
 		if ((timestamp - session->timestamp) > inst->timer_limit) {
-			rbnode_t *node;
-			node = rbtree_find(inst->session_tree, session);
-			rad_assert(node != NULL);
-			rbtree_delete(inst->session_tree, node);
+			fr_rb_delete(inst->session_tree, session);
 
 			/*
 			 *	session == inst->session_head

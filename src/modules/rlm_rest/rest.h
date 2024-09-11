@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
@@ -20,165 +21,168 @@
  * @brief Function prototypes and datatypes for the REST (HTTP) transport.
  * @file rest.h
  *
- * @copyright 2012-2016 Arran Cudbard-Bell <a.cudbardb@freeradius.org>
+ * @copyright 2012-2016 Arran Cudbard-Bell (a.cudbardb@freeradius.org)
  */
-RCSIDH(other_h, "$Id$")
+RCSIDH(rest_h, "$Id$")
 
-#include <freeradius-devel/pool.h>
-#include "config.h"
-
-#define CURL_NO_OLDIES 1
-#include <curl/curl.h>
+#include <freeradius-devel/curl/base.h>
+#include <freeradius-devel/curl/config.h>
+#include <freeradius-devel/server/pairmove.h>
+#include <freeradius-devel/util/slab.h>
 
 /*
  *	The common JSON library (also tells us if we have json-c)
  */
-#include "../rlm_json/json.h"
+#include <freeradius-devel/json/base.h>
 
 #define REST_URI_MAX_LEN		2048
 #define REST_BODY_MAX_LEN		8192
-#define REST_BODY_INIT			1024
+#define REST_BODY_ALLOC_CHUNK		1024
 #define REST_BODY_MAX_ATTRS		256
 
 typedef enum {
-	HTTP_METHOD_UNKNOWN = 0,
-	HTTP_METHOD_GET,
-	HTTP_METHOD_POST,
-	HTTP_METHOD_PUT,
-	HTTP_METHOD_PATCH,
-	HTTP_METHOD_DELETE,
-	HTTP_METHOD_CUSTOM		//!< Must always come last, should not be in method table
+	REST_HTTP_METHOD_UNKNOWN = 0,
+	REST_HTTP_METHOD_GET,
+	REST_HTTP_METHOD_POST,
+	REST_HTTP_METHOD_PUT,
+	REST_HTTP_METHOD_PATCH,
+	REST_HTTP_METHOD_DELETE,
+	REST_HTTP_METHOD_CUSTOM		//!< Must always come last, should not be in method table
 } http_method_t;
 
 typedef enum {
-	HTTP_BODY_UNKNOWN = 0,
-	HTTP_BODY_UNSUPPORTED,
-	HTTP_BODY_UNAVAILABLE,
-	HTTP_BODY_INVALID,
-	HTTP_BODY_NONE,
-	HTTP_BODY_CUSTOM_XLAT,
-	HTTP_BODY_CUSTOM_LITERAL,
-	HTTP_BODY_POST,
-	HTTP_BODY_JSON,
-	HTTP_BODY_XML,
-	HTTP_BODY_YAML,
-	HTTP_BODY_HTML,
-	HTTP_BODY_PLAIN,
-	HTTP_BODY_NUM_ENTRIES
+	REST_HTTP_BODY_UNKNOWN = 0,
+	REST_HTTP_BODY_UNSUPPORTED,
+	REST_HTTP_BODY_UNAVAILABLE,
+	REST_HTTP_BODY_INVALID,
+	REST_HTTP_BODY_NONE,
+	REST_HTTP_BODY_CUSTOM,
+	REST_HTTP_BODY_POST,
+	REST_HTTP_BODY_JSON,
+	REST_HTTP_BODY_XML,
+	REST_HTTP_BODY_YAML,
+	REST_HTTP_BODY_HTML,
+	REST_HTTP_BODY_PLAIN,
+	REST_HTTP_BODY_NUM_ENTRIES
 } http_body_type_t;
 
 typedef enum {
-	HTTP_AUTH_UNKNOWN = 0,
-	HTTP_AUTH_NONE,
-	HTTP_AUTH_TLS_SRP,
-	HTTP_AUTH_BASIC,
-	HTTP_AUTH_DIGEST,
-	HTTP_AUTH_DIGEST_IE,
-	HTTP_AUTH_GSSNEGOTIATE,
-	HTTP_AUTH_NTLM,
-	HTTP_AUTH_NTLM_WB,
-	HTTP_AUTH_ANY,
-	HTTP_AUTH_ANY_SAFE,
-	HTTP_AUTH_NUM_ENTRIES
+	REST_HTTP_AUTH_UNKNOWN = 0,
+	REST_HTTP_AUTH_NONE,
+	REST_HTTP_AUTH_TLS_SRP,
+	REST_HTTP_AUTH_BASIC,
+	REST_HTTP_AUTH_DIGEST,
+	REST_HTTP_AUTH_DIGEST_IE,
+	REST_HTTP_AUTH_GSSNEGOTIATE,
+	REST_HTTP_AUTH_NTLM,
+	REST_HTTP_AUTH_NTLM_WB,
+	REST_HTTP_AUTH_ANY,
+	REST_HTTP_AUTH_ANY_SAFE,
+	REST_HTTP_AUTH_NUM_ENTRIES
 } http_auth_type_t;
+
+/** Magic pointer value for determining if we should disable proxying
+ */
+extern char const *rest_no_proxy;
 
 /*
  *	Must be updated (in rest.c) if additional values are added to
  *	http_body_type_t
  */
-extern const http_body_type_t http_body_type_supported[HTTP_BODY_NUM_ENTRIES];
+extern const http_body_type_t http_body_type_supported[REST_HTTP_BODY_NUM_ENTRIES];
 
-extern const unsigned long http_curl_auth[HTTP_AUTH_NUM_ENTRIES];
+extern const unsigned long http_curl_auth[REST_HTTP_AUTH_NUM_ENTRIES];
 
-extern const FR_NAME_NUMBER http_auth_table[];
+extern fr_table_num_sorted_t const http_auth_table[];
+extern size_t http_auth_table_len;
 
-extern const FR_NAME_NUMBER http_method_table[];
+extern fr_table_num_sorted_t const http_method_table[];
+extern size_t http_method_table_len;
 
-extern const FR_NAME_NUMBER http_body_type_table[];
+extern fr_table_num_sorted_t const http_body_type_table[];
+extern size_t http_body_type_table_len;
 
-extern const FR_NAME_NUMBER http_content_type_table[];
+extern fr_table_num_sorted_t const http_content_type_table[];
+extern size_t http_content_type_table_len;
+
+typedef struct {
+	char const			*proxy;		//!< Send request via this proxy.
+
+	char const			*method_str;	//!< The string version of the HTTP method.
+	http_method_t			method;		//!< What HTTP method should be used, GET, POST etc...
+
+	char const			*body_str;	//!< The string version of the encoding/content type.
+	http_body_type_t		body;		//!< What encoding type should be used.
+
+	bool				auth_is_set;	//!< Whether a value was provided for auth_str.
+
+	http_auth_type_t		auth;		//!< HTTP auth type.
+
+	bool				require_auth;	//!< Whether HTTP-Auth is required or not.
+
+	uint32_t			chunk;		//!< Max chunk-size (mainly for testing the encoders)
+} rlm_rest_section_request_t;
+
+typedef struct {
+	char const			*force_to_str;	//!< Force decoding with this decoder.
+	http_body_type_t		force_to;	//!< Override the Content-Type header in the response
+							//!< to force decoding as a particular type.
+
+	size_t				max_body_in;	//!< Maximum size of incoming data.
+} rlm_rest_section_response_t;
 
 /*
  *	Structure for section configuration
  */
 typedef struct {
-	char const		*name;		//!< Section name.
-	char const		*uri;		//!< URI to send HTTP request to.
+	char const			*name;		//!< Section name.
 
-	char const		*proxy;		//!< Send request via this proxy.
+	fr_time_delta_t			timeout;	//!< Timeout timeval.
 
-	char const		*method_str;	//!< The string version of the HTTP method.
-	http_method_t		method;		//!< What HTTP method should be used, GET, POST etc...
+	rlm_rest_section_request_t	request;	//!< Request configuration.
+	rlm_rest_section_response_t	response;	//!< Response configuration.
 
-	char const		*body_str;	//!< The string version of the encoding/content type.
-	http_body_type_t	body;		//!< What encoding type should be used.
-
-	char const		*force_to_str;	//!< Force decoding with this decoder.
-	http_body_type_t	force_to;	//!< Override the Content-Type header in the response
-						//!< to force decoding as a particular type.
-
-	char const		*data;		//!< Custom body data (optional).
-
-	char const		*auth_str;	//!< The string version of the Auth-Type.
-	http_auth_type_t	auth;		//!< HTTP auth type.
-	bool			require_auth;	//!< Whether HTTP-Auth is required or not.
-	char const		*username;	//!< Username used for HTTP-Auth
-	char const		*password;	//!< Password used for HTTP-Auth
-
-	char const		*tls_certificate_file;
-	char const		*tls_private_key_file;
-	char const		*tls_private_key_password;
-	char const		*tls_ca_file;
-	char const		*tls_ca_path;
-	char const		*tls_random_file;
-	bool			tls_check_cert;
-	bool			tls_check_cert_cn;
-	bool			tls_extract_cert_attrs;
-
-	struct timeval		timeout_tv;	//!< Timeout timeval.
-	uint32_t		chunk;		//!< Max chunk-size (mainly for testing the encoders)
+	fr_curl_tls_t			tls;
 } rlm_rest_section_t;
 
 /*
  *	Structure for module configuration
  */
 typedef struct {
-	char const		*xlat_name;	//!< Instance name.
-
 	char const		*connect_proxy;	//!< Send request via this proxy.
 
-	fr_pool_t	*pool;		//!< Pointer to the connection pool.
+	int			http_negotiation; //!< What HTTP version to negotiate, and how to
+						///< negotiate it.  One or the CURL_HTTP_VERSION_ macros.
+
+	bool			multiplex;	//!< Whether to perform multiple requests using a single
+						///< connection.
+
+	fr_curl_conn_config_t	conn_config;	//!< Configuration of slab allocated connection handles.
 
 	rlm_rest_section_t	xlat;		//!< Configuration specific to xlat.
 	rlm_rest_section_t	authorize;	//!< Configuration specific to authorisation.
 	rlm_rest_section_t	authenticate;	//!< Configuration specific to authentication.
 	rlm_rest_section_t	accounting;	//!< Configuration specific to accounting.
-	rlm_rest_section_t	checksimul;	//!< Configuration specific to simultaneous session
-						//!< checking.
 	rlm_rest_section_t	post_auth;	//!< Configuration specific to Post-auth
+
+#ifndef NDEBUG
+	bool			fail_header_decode;	//!< Force header decoding to fail for debugging purposes.
+	bool			fail_body_decode;	//!< Force body decoding to fail for debugging purposes.
+#endif
 } rlm_rest_t;
+
+FR_SLAB_TYPES(rest, fr_curl_io_request_t)
+FR_SLAB_FUNCS(rest, fr_curl_io_request_t)
 
 /** Thread specific rlm_rest instance data
  *
  */
 typedef struct {
 	rlm_rest_t const	*inst;		//!< Instance of rlm_rest.
-	fr_pool_t		*pool;		//!< Thread specific connection pool.
-	CURLM			*mandle;	//!< Thread specific multi handle.  Serves as the dispatch
+	rest_slab_list_t	*slab;		//!< Slab list for connection handles.
+	fr_curl_handle_t	*mhandle;	//!< Thread specific multi handle.  Serves as the dispatch
 						//!< and coralling structure for REST requests.
-	fr_event_list_t		*el;		//!< This thread's event list.
-	fr_event_timer_t const	*ev;		//!< Used to manage IO timers for libcurl.
-	unsigned int		transfers;	//!< Keep track of how many outstanding transfers
-						//!< we think there are.
 } rlm_rest_thread_t;
-
-/** Wrapper around the module thread stuct for individual xlats
- *
- */
-typedef struct {
-	rlm_rest_t const	*inst;		//!< Instance of rlm_rest.
-	rlm_rest_thread_t	*t;		//!< rlm_rest thread instance.
-} rest_xlat_thread_inst_t;
 
 /*
  *	States for stream based attribute encoders
@@ -205,10 +209,12 @@ typedef enum {
  */
 typedef struct {
 	rlm_rest_t const	*instance;	//!< This instance of rlm_rest.
-	REQUEST			*request;	//!< Current request.
+	rlm_rest_section_t const *section;	//!< Section configuration.
+
+	request_t		*request;	//!< Current request.
 	read_state_t		state;		//!< Encoder state
 
-	vp_cursor_t		cursor;		//!< Cursor pointing to the start of the list to encode.
+	fr_dcursor_t		cursor;		//!< Cursor pointing to the start of the list to encode.
 
 	size_t			chunk;		//!< Chunk size
 
@@ -221,7 +227,9 @@ typedef struct {
  */
 typedef struct {
 	rlm_rest_t const	*instance;	//!< This instance of rlm_rest.
-	REQUEST			*request;	//!< Current request.
+	rlm_rest_section_t const *section;	//!< Section configuration.
+
+	request_t		*request;	//!< Current request.
 	write_state_t		state;		//!< Decoder state.
 
 	char 			*buffer;	//!< Raw incoming HTTP data.
@@ -231,6 +239,9 @@ typedef struct {
 	int		 	code;		//!< HTTP Status Code.
 	http_body_type_t	type;		//!< HTTP Content Type.
 	http_body_type_t	force_to;	//!< Force decoding the body type as a particular encoding.
+
+	tmpl_t			*header;	//!< Where to create pairs representing HTTP response headers.
+						///< If NULL no headers will be parsed other than content-type.
 
 	void			*decoder;	//!< Decoder specific data.
 } rlm_rest_response_t;
@@ -249,13 +260,33 @@ typedef struct {
 	rlm_rest_response_t	response;	//!< Response context data.
 } rlm_rest_curl_context_t;
 
-/*
- *	Connection API handle
+/** Stores the state of a yielded xlat
+ *
  */
 typedef struct {
-	CURL			*candle;	//!< Libcurl easy handle
-	rlm_rest_curl_context_t	*ctx;		//!< Context, re-initialised after each request.
-} rlm_rest_handle_t;
+	rlm_rest_section_t	section;	//!< Our mutated section config.
+	fr_curl_io_request_t	*handle;	//!< curl easy handle servicing our request.
+} rlm_rest_xlat_rctx_t;
+
+typedef struct {
+	struct {
+		fr_value_box_t		*uri;		//!< URI to send HTTP request to.
+		fr_value_box_list_t	*header;	//!< Headers to place in the request
+		fr_value_box_t		*data;		//!< Custom data to send in requests.
+		fr_value_box_t		*username;	//!< Username to use for authentication
+		fr_value_box_t		*password;	//!< Password to use for authentication
+	} request;
+
+	struct {
+		tmpl_t			*header;	//!< Where to write response headers
+	} response;
+} rlm_rest_call_env_t;
+
+extern HIDDEN fr_dict_t const *dict_freeradius;
+
+extern HIDDEN fr_dict_attr_t const *attr_rest_http_body;
+extern HIDDEN fr_dict_attr_t const *attr_rest_http_header;
+extern HIDDEN fr_dict_attr_t const *attr_rest_http_status_code;
 
 /*
  *	Function prototype for rest_read_wrapper. Matches CURL's
@@ -265,46 +296,38 @@ typedef size_t (*rest_read_t)(void *ptr, size_t size, size_t nmemb,
 			      void *userdata);
 
 
-void *mod_conn_create(TALLOC_CTX *ctx, void *instance, struct timeval const *timeout);
+void *rest_mod_conn_create(TALLOC_CTX *ctx, void *instance, fr_time_delta_t timeout);
 
 /*
  *	Request processing API
  */
-int rest_request_config(rlm_rest_t const *instance, rlm_rest_thread_t *thread,
-			rlm_rest_section_t const *section, REQUEST *request,
-			void *handle, http_method_t method,
-			http_body_type_t type, char const *uri,
-			char const *username, char const *password) CC_HINT(nonnull (1,2,3,4,5,8));
-
-int rest_response_certinfo(UNUSED rlm_rest_t const *instance, rlm_rest_section_t const *section,
-			   REQUEST *request, void *handle);
+int rest_request_config(module_ctx_t const *mctx, rlm_rest_section_t const *section,
+			request_t *request, fr_curl_io_request_t *randle, http_method_t method,
+			http_body_type_t type,
+			char const *uri, char const *body_data) CC_HINT(nonnull (1,2,4,7));
 
 int rest_response_decode(rlm_rest_t const *instance,
-			UNUSED rlm_rest_section_t const *section, REQUEST *request,
-			void *handle);
+			UNUSED rlm_rest_section_t const *section, request_t *request,
+			fr_curl_io_request_t *randle);
 
-void rest_response_error(REQUEST *request, rlm_rest_handle_t *handle);
+void rest_response_error(request_t *request, fr_curl_io_request_t *handle);
+void rest_response_debug(request_t *request, fr_curl_io_request_t *handle);
 
-void rest_request_cleanup(rlm_rest_t const *instance, void *handle);
+#define rest_get_handle_code(_handle)(((rlm_rest_curl_context_t*)((fr_curl_io_request_t*)(_handle))->uctx)->response.code)
 
-#define rest_get_handle_code(_handle)(((rlm_rest_curl_context_t*)((rlm_rest_handle_t*)_handle)->ctx)->response.code)
+#define rest_get_handle_type(_handle)(((rlm_rest_curl_context_t*)((fr_curl_io_request_t*)(_handle))->uctx)->response.type)
 
-#define rest_get_handle_type(_handle)(((rlm_rest_curl_context_t*)((rlm_rest_handle_t*)_handle)->ctx)->response.type)
-
-size_t rest_get_handle_data(char const **out, rlm_rest_handle_t *handle);
+size_t rest_get_handle_data(char const **out, fr_curl_io_request_t *handle);
 
 /*
  *	Helper functions
  */
-size_t rest_uri_escape(UNUSED REQUEST *request, char *out, size_t outlen, char const *raw, UNUSED void *arg);
-ssize_t rest_uri_build(char **out, rlm_rest_t const *instance, REQUEST *request, char const *uri);
-ssize_t rest_uri_host_unescape(char **out, UNUSED rlm_rest_t const *mod_inst, REQUEST *request,
-			       void *handle, char const *uri);
+size_t rest_uri_escape(UNUSED request_t *request, char *out, size_t outlen, char const *raw, UNUSED void *arg);
+ssize_t rest_uri_host_unescape(char **out, UNUSED rlm_rest_t const *mod_inst, request_t *request,
+			       fr_curl_io_request_t *randle, char const *uri);
 
 /*
  *	Async IO helpers
  */
-void rest_io_action(REQUEST *request, void *instance, void *thread, void *ctx, fr_state_signal_t action);
-int rest_io_request_enqueue(rlm_rest_thread_t *thread, REQUEST *request, void *handle);
-int rest_io_init(rlm_rest_thread_t *thread);
-
+void rest_io_module_signal(module_ctx_t const *mctx, request_t *request, fr_signal_t action);
+void rest_io_xlat_signal(xlat_ctx_t const *xctx, request_t *request, fr_signal_t action);

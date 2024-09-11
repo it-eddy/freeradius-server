@@ -22,7 +22,7 @@ CREATE TABLE radacct (
   groupname varchar(64) NOT NULL default '',
   realm varchar(64) default '',
   nasipaddress varchar(15) NOT NULL default '',
-  nasportid varchar(50) default NULL,
+  nasportid varchar(32) default NULL,
   nasporttype varchar(32) default NULL,
   acctstarttime datetime NULL default NULL,
   acctupdatetime datetime NULL default NULL,
@@ -40,10 +40,19 @@ CREATE TABLE radacct (
   servicetype varchar(32) default NULL,
   framedprotocol varchar(32) default NULL,
   framedipaddress varchar(15) NOT NULL default '',
+  framedipv6address varchar(45) NOT NULL default '',
+  framedipv6prefix varchar(45) NOT NULL default '',
+  framedinterfaceid varchar(44) NOT NULL default '',
+  delegatedipv6prefix varchar(45) NOT NULL default '',
+  class varchar(64) default NULL,
   PRIMARY KEY (radacctid),
   UNIQUE KEY acctuniqueid (acctuniqueid),
   KEY username (username),
   KEY framedipaddress (framedipaddress),
+  KEY framedipv6address (framedipv6address),
+  KEY framedipv6prefix (framedipv6prefix),
+  KEY framedinterfaceid (framedinterfaceid),
+  KEY delegatedipv6prefix (delegatedipv6prefix),
   KEY acctsessionid (acctsessionid),
   KEY acctsessiontime (acctsessiontime),
   KEY acctstarttime (acctstarttime),
@@ -126,12 +135,19 @@ CREATE TABLE radusergroup (
 #
 # Table structure for table 'radpostauth'
 #
+# Note: MySQL versions since 5.6.4 support fractional precision timestamps
+#        which we use here. Replace the authdate definition with the following
+#        if your software is too old:
+#
+#   authdate timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+#
 CREATE TABLE radpostauth (
   id int(11) NOT NULL auto_increment,
   username varchar(64) NOT NULL default '',
   pass varchar(64) NOT NULL default '',
   reply varchar(32) NOT NULL default '',
-  authdate timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  authdate timestamp(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+  class varchar(64) NOT NULL default '',
   PRIMARY KEY  (id)
 ) ENGINE = INNODB;
 
@@ -150,4 +166,13 @@ CREATE TABLE nas (
   description varchar(200) DEFAULT 'RADIUS Client',
   PRIMARY KEY (id),
   KEY nasname (nasname)
-);
+) ENGINE = INNODB;
+
+#
+# Table structure for table 'nasreload'
+#
+CREATE TABLE IF NOT EXISTS nasreload (
+  nasipaddress varchar(15) NOT NULL,
+  reloadtime datetime NOT NULL,
+  PRIMARY KEY (nasipaddress)
+) ENGINE = INNODB;

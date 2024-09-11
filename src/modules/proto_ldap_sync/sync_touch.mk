@@ -5,9 +5,9 @@ TARGETNAME=
 -include $(top_builddir)/src/lib/ldap/all.mk
 
 ifneq "${TARGETNAME}" ""
-  TARGETNAME	:= proto_ldap_sync
-  TARGET	:= $(TARGETNAME).a
+  TARGETNAME	:= sync_touch
+  TARGET	:= $(TARGETNAME)$(L)
 endif
 
-SOURCES		:= $(TARGETNAME).c sync.c
-TGT_PREREQS	:= libfreeradius-ldap.a
+SOURCES		:= $(TARGETNAME).c
+TGT_PREREQS	:= libfreeradius-ldap$(L)

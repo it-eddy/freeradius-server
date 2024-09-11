@@ -18,19 +18,20 @@
  * @file rlm_lua.c
  * @brief Translates requests between the server an a Lua interpreter.
  *
- * @author Arran Cudbard-Bell <a.cudbardb@freeradius.org>
+ * @author Arran Cudbard-Bell (a.cudbardb@freeradius.org)
  *
- * @copyright 2016 Arran Cudbard-Bell <a.cudbardb@freeradius.org>
+ * @copyright 2016 Arran Cudbard-Bell (a.cudbardb@freeradius.org)
  * @copyright 2016 The FreeRADIUS Server Project.
  */
 RCSID("$Id$")
 
-#include <freeradius-devel/radiusd.h>
-#include <freeradius-devel/rad_assert.h>
-#include <freeradius-devel/modules.h>
+#define LOG_PREFIX mctx->mi->name
+
+#include <freeradius-devel/server/base.h>
+#include <freeradius-devel/util/debug.h>
+#include <freeradius-devel/server/module_rlm.h>
 
 #include "lua.h"
-
 /*
  *	A mapping of configuration file names to internal variables.
  *
@@ -40,159 +41,158 @@ RCSID("$Id$")
  *	to the strdup'd string into 'config.string'.  This gets around
  *	buffer over-flows.
  */
-static const CONF_PARSER module_config[] = {
-	{ FR_CONF_OFFSET("filename", FR_TYPE_FILE_INPUT | FR_TYPE_REQUIRED, rlm_lua_t, module), NULL},
-	{ FR_CONF_OFFSET("threads", FR_TYPE_BOOL, rlm_lua_t, threads), .dflt = "no"},
-	{ FR_CONF_OFFSET("func_instantiate", FR_TYPE_STRING, rlm_lua_t, func_instantiate), NULL},
-	{ FR_CONF_OFFSET("func_detach", FR_TYPE_STRING, rlm_lua_t, func_detach), NULL},
-	{ FR_CONF_OFFSET("func_authorize", FR_TYPE_STRING, rlm_lua_t, func_authorize), NULL},
-	{ FR_CONF_OFFSET("func_authenticate", FR_TYPE_STRING, rlm_lua_t, func_authenticate), NULL},
-#ifdef WITH_ACCOUNTING
-	{ FR_CONF_OFFSET("func_accounting", FR_TYPE_STRING, rlm_lua_t, func_accounting), NULL},
-	{ FR_CONF_OFFSET("func_preacct", FR_TYPE_STRING, rlm_lua_t, func_preacct), NULL},
-#endif
-	{ FR_CONF_OFFSET("func_checksimul", FR_TYPE_STRING, rlm_lua_t, func_checksimul), NULL},
-	{ FR_CONF_OFFSET("func_xlat", FR_TYPE_STRING, rlm_lua_t, func_xlat), NULL},
-#ifdef WITH_PROXY
-	{ FR_CONF_OFFSET("func_pre_proxy", FR_TYPE_STRING, rlm_lua_t, func_pre_proxy), NULL},
-	{ FR_CONF_OFFSET("func_post_proxy", FR_TYPE_STRING, rlm_lua_t, func_post_proxy), NULL},
-#endif
-	{ FR_CONF_OFFSET("func_post_auth", FR_TYPE_STRING, rlm_lua_t, func_post_auth), NULL},
-#ifdef WITH_COA
-	{ FR_CONF_OFFSET("func_recv_coa", FR_TYPE_STRING, rlm_lua_t, func_recv_coa), NULL},
-	{ FR_CONF_OFFSET("func_send_coa", FR_TYPE_STRING, rlm_lua_t, func_send_coa), NULL},
-#endif
+static const conf_parser_t module_config[] = {
+	{ FR_CONF_OFFSET_FLAGS("filename", CONF_FLAG_FILE_INPUT | CONF_FLAG_REQUIRED, rlm_lua_t, module), NULL},
+	{ FR_CONF_OFFSET("func_instantiate", rlm_lua_t, func_instantiate), NULL},
+	{ FR_CONF_OFFSET("func_detach", rlm_lua_t, func_detach), NULL},
+	{ FR_CONF_OFFSET("func_authorize", rlm_lua_t, func_authorize), NULL},
+	{ FR_CONF_OFFSET("func_authenticate", rlm_lua_t, func_authenticate), NULL},
+	{ FR_CONF_OFFSET("func_accounting", rlm_lua_t, func_accounting), NULL},
+	{ FR_CONF_OFFSET("func_preacct", rlm_lua_t, func_preacct), NULL},
+	{ FR_CONF_OFFSET("func_xlat", rlm_lua_t, func_xlat), NULL},
+	{ FR_CONF_OFFSET("func_post_auth", rlm_lua_t, func_post_auth), NULL},
 
 	CONF_PARSER_TERMINATOR
 };
 
-/** Destroy the interpreter when it's associated worker exits
- *
- * @param ctx The interpreter to destroy.
- */
-static void _tls_interp_destroy(void *ctx)
-{
-	lua_State **marker = talloc_get_type_abort(ctx, lua_State *);
-	rlm_lua_t *inst;
-
-	/*
-	 *	ctx is a pointer to a Lua interpreter.
-	 *	So that we don't have to have a special struct to pass around the instance this
-	 *	interpreter belongs to, we use some talloc magic to find it's parent context
-	 *	which is hopefully an rlm_lua_t.
-	 *
-	 *	We then re-use the mutex in the rlm_lua_t to protect the parent context whilst
-	 *	we free this context, which should in turn call a destructor which will
-	 *	call lua_close and free the actual interpreter.
-	 */
-	inst = talloc_find_parent_bytype(marker, rlm_lua_t);
-	rad_assert(inst != NULL);
-	pthread_mutex_lock(inst->mutex);
-	talloc_free(marker);
-	pthread_mutex_unlock(inst->mutex);
-}
-
-static int mod_instantiate(void *instance, CONF_SECTION *conf)
-{
-	rlm_lua_t *inst = instance;
-
-	inst->xlat_name = cf_section_name2(conf);
-	if (!inst->xlat_name) {
-		inst->xlat_name = cf_section_name1(conf);
-	}
-
-#ifdef HAVE_PTHREAD_H
-	inst->mutex = talloc(inst, pthread_mutex_t);
-	pthread_mutex_init(inst->mutex, NULL);	/* Used in both threaded and non-threaded modes */
-
-	if (inst->threads) {
-		int rcode;
-
-		rcode = pthread_key_create(&inst->key, _tls_interp_destroy);
-		if (rcode != 0) {
-			ERROR("Error creating pthread key for lua interpreter: %s", fr_syserror(rcode));
-			return -1;
-		}
-	}
-#endif
-	if (rlm_lua_init(&inst->interpreter, inst) < 0) {
-		return -1;
-	}
-
-	inst->jit = rlm_lua_isjit(inst->interpreter);
-	if (!inst->jit) {
-		WARN("Using standard Lua interpreter, performance will be suboptimal");
-	}
-
-	DEBUG("rlm_lua (%s): Using %s interpreter", inst->xlat_name, rlm_lua_version(inst->interpreter));
-
-	return 0;
-}
-
-static int mod_detach(void *instance)
-{
-	rlm_lua_t *inst = instance;
-
-	if (inst->key) {
-		pthread_key_delete(inst->key);
-	}
-
-	return 0;
-}
-
 #define DO_LUA(_s)\
-static rlm_rcode_t mod_##_s(void *instance, UNUSED void *thread, REQUEST *request) {\
-	rlm_lua_t const *inst = instance;\
-	if (!inst->func_##_s) {\
-		return RLM_MODULE_NOOP;\
-	}\
-	if (do_lua(inst, request, inst->func_##_s) < 0) {\
-		return RLM_MODULE_FAIL;\
-	}\
-	return RLM_MODULE_OK;\
+static unlang_action_t mod_##_s(rlm_rcode_t *p_result, module_ctx_t const *mctx, request_t *request) \
+{\
+	rlm_lua_t const *inst = talloc_get_type_abort_const(mctx->mi->data, rlm_lua_t);\
+	if (!inst->func_##_s) RETURN_MODULE_NOOP;\
+	return fr_lua_run(p_result, mctx, request, inst->func_##_s);\
 }
 
 DO_LUA(authorize)
 DO_LUA(authenticate)
 DO_LUA(preacct)
 DO_LUA(accounting)
-DO_LUA(pre_proxy)
-DO_LUA(post_proxy)
 DO_LUA(post_auth)
-DO_LUA(recv_coa)
-DO_LUA(send_coa)
+
+
+/** Free any thread specific interpreters
+ *
+ */
+static int mod_thread_detach(module_thread_inst_ctx_t const *mctx)
+{
+	rlm_lua_thread_t *t = talloc_get_type_abort(mctx->thread, rlm_lua_thread_t);
+
+	/*
+	 *	May be NULL if fr_lua_init failed
+	 */
+	if (t->interpreter) lua_close(t->interpreter);
+
+	return 0;
+}
+
+/** Create thread-specific connections and buffers
+ *
+ * @param[in] mctx	specific data (where we write the interpreter).
+ * @return
+ *	- 0 on success.
+ *	- -1 on failure.
+ */
+static int mod_thread_instantiate(module_thread_inst_ctx_t const *mctx)
+{
+	rlm_lua_thread_t *t = talloc_get_type_abort(mctx->thread, rlm_lua_thread_t);
+
+	if (fr_lua_init(&t->interpreter, (module_inst_ctx_t const *)mctx) < 0) return -1;
+
+	return 0;
+}
+
+/** Close the global interpreter
+ *
+ */
+static int mod_detach(module_detach_ctx_t const *mctx)
+{
+	rlm_lua_t *inst = talloc_get_type_abort(mctx->mi->data, rlm_lua_t);
+	rlm_rcode_t ret = 0;
+
+	/*
+	 *	May be NULL if fr_lua_init failed
+	 */
+	if (inst->interpreter) {
+		if (inst->func_detach) {
+			fr_lua_run(&ret,
+				   MODULE_CTX(mctx->mi,
+					      &(rlm_lua_thread_t){
+							.interpreter = inst->interpreter
+					      },
+					      NULL, NULL),
+				   NULL, inst->func_detach);
+		}
+		lua_close(inst->interpreter);
+	}
+
+	return ret;
+}
+
+static int mod_instantiate(module_inst_ctx_t const *mctx)
+{
+	rlm_lua_t *inst = talloc_get_type_abort(mctx->mi->data, rlm_lua_t);
+	rlm_rcode_t rcode;
+
+	/*
+	 *	Get an instance global interpreter to use with various things...
+	 */
+	if (fr_lua_init(&inst->interpreter, mctx) < 0) return -1;
+	inst->jit = fr_lua_isjit(inst->interpreter);
+	if (!inst->jit) WARN("Using standard Lua interpreter, performance will be suboptimal");
+
+	DEBUG("Using %s interpreter", fr_lua_version(inst->interpreter));
+
+	if (inst->func_instantiate) {
+		fr_lua_run(&rcode,
+			   MODULE_CTX(mctx->mi,
+			   	      &(rlm_lua_thread_t){
+						.interpreter = inst->interpreter
+				      },
+				      NULL, NULL),
+			   NULL, inst->func_instantiate);
+	}
+
+	return 0;
+}
 
 /*
  *	The module name should be the only globally exported symbol.
  *	That is, everything else should be 'static'.
  *
  *	If the module needs to temporarily modify it's instantiation
- *	data, the type should be changed to RLM_TYPE_THREAD_UNSAFE.
+ *	data, the type should be changed to MODULE_TYPE_THREAD_UNSAFE.
  *	The server will then take care of ensuring that the module
  *	is single-threaded.
  */
-extern rad_module_t rlm_lua;
-rad_module_t rlm_lua = {
-	.magic		= RLM_MODULE_INIT,
-	.name		= "lua",
-	.type		= RLM_TYPE_THREAD_SAFE,
-	.inst_size	= sizeof(rlm_lua_t),
-	.config		= module_config,
-	.instantiate	= mod_instantiate,
-	.detach		= mod_detach,
+extern module_rlm_t rlm_lua;
+module_rlm_t rlm_lua = {
+	.common = {
+		.magic			= MODULE_MAGIC_INIT,
+		.name			= "lua",
+		.inst_size		= sizeof(rlm_lua_t),
 
-	.methods = {
-		[MOD_AUTHENTICATE]	= mod_authenticate,
-		[MOD_AUTHORIZE]		= mod_authorize,
-		[MOD_PREACCT]		= mod_preacct,
-		[MOD_ACCOUNTING]	= mod_accounting,
-		[MOD_PRE_PROXY]		= mod_pre_proxy,
-		[MOD_POST_PROXY]	= mod_post_proxy,
-		[MOD_POST_AUTH]		= mod_post_auth
-#ifdef WITH_COA
-		,
-		[MOD_RECV_COA]		= mod_recv_coa,
-		[MOD_SEND_COA]		= mod_send_coa
-#endif
+		.thread_inst_size	= sizeof(rlm_lua_thread_t),
+
+		.config			= module_config,
+		.instantiate		= mod_instantiate,
+		.thread_instantiate	= mod_thread_instantiate,
+
+		.detach			= mod_detach,
+		.thread_detach		= mod_thread_detach
+	},
+	.method_group = {
+		.bindings = (module_method_binding_t[]){
+			/*
+			 *	Hack to support old configurations
+			 */
+			{ .section = SECTION_NAME("accounting", CF_IDENT_ANY), .method = mod_accounting	},
+			{ .section = SECTION_NAME("authenticate", CF_IDENT_ANY), .method = mod_authenticate },
+			{ .section = SECTION_NAME("authorize", CF_IDENT_ANY), .method = mod_authorize },
+
+			{ .section = SECTION_NAME("recv", "accounting-request"), .method = mod_preacct },
+			{ .section = SECTION_NAME("recv", CF_IDENT_ANY), .method = mod_authorize },
+			{ .section = SECTION_NAME("send", CF_IDENT_ANY), .method = mod_post_auth },
+			MODULE_BINDING_TERMINATOR
+		}
 	}
 };

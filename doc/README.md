@@ -1,100 +1,63 @@
-# Installation
+# Documentation
 
-See the `INSTALL.md` file, in the parent directory.
+All of the documentation is now in Asciidoc format.  Please see the
+[introduction](introduction/index.adoc) file for full details.
 
-# Configuration Files
+We also suggest reading the [directory](introduction/directory.adoc)
+file, which describes the layout of this directory.
 
-For every file there is a fully commented example file included, that
-explains what is does, and how to use it. Read those sample files too!
+Please run the top-level `configure` script in order to create HTML
+versions of the documentation.
 
-Again, many of the configuration files are ONLY documented in the
-comments included in the files.  Reading the configuration files is
-*required* to fully understand how to create complex configurations of
-the server.
+## Antora
 
-See the `raddb/radiusd.conf` file for the base configuration file.
+If the local system has [Antora
+installed](https://docs.antora.org/antora/latest/install/install-antora/),
+then you can run:
 
-# Additional information
+    make docsite
 
-The latest version of FreeRADIUS is always available from
-the git repository hosted on GitHub at
+The output HTML is placed in the following location:
 
-https://github.com/FreeRADIUS/freeradius-server
+    ./build/docsite/freeradius-server/latest/index.html
 
-There are two mailing lists for users and developers. General
-user, administrator and configuration issues should be discussed
-on the users list at:
+If Antora is not installed locally, it can usually be installed from
+`npm` (a command available once you install [Node.js](https://nodejs.org/)):
 
-http://lists.freeradius.org/mailman/listinfo/freeradius-users
+    npm i -g @antora/cli@2.0 @antora/site-generator-default@2.0
 
-When asking for help on the users list, be sure the include a
-detailed and clear description of the problem, together with
-full debug output from FreeRADIUS, obtained by running
+## Basic HTML
 
-    $ radiusd -X
+If the local system has Asciidoctor and Pandoc installed, then it is
+possible to create simple HTML output via the following command:
 
-Developers only discussion is to be had on the developers list:
+    make html
 
-http://lists.freeradius.org/mailman/listinfo/freeradius-devel
+The build process will create one `html` file for every `adoc` file in
+this directory.  Note that Antora uses a different syntax for
+cross-links than plain Asciidoc.  As a result, the output will look
+OK, but links may be broken.
 
-Please do not raise general configuration issues there.
+The main reason to use `make html` is that it can be faster than
+Antora.  You can use this process to get a "quick look" at a rendered
+page, to see if it looks reasonable.
 
-# Directories
-## Documentation
+The output HTML files are placed in the same directory as the input
+Asciidoc files, with the extension changed to `.html`.
 
-| Directory			| Description
-|---				|---
-| ``debian/`` 			| Files to build a "freeradius" Debian Linux package.
-| ``doc/``  			| Various snippets of documentation
-| ``doc/rfc/``			| Copies of the RFC's.  If you have Perl, do a 'make' in that directory, and look at the HTML output.
-| ``man/``			| Unix Manual pages for the server, configuration files, and associated utilities.
+Note that the CSS for these HTML files is not in the `antora`
+directories.  If you look at the files there, they will be missing the
+CSS.  Instead, the `mods-available/always.adoc` file ends up being
+accessible _only_ via `doc/raddb/mods-available/always.html`
 
-## Utility
+## Raddb and Module Documentation
 
-| Directory			| Description
-|---				|---
-| ``mibs/``			| SNMP Mibs for the server.
-| ``scripts/``			| Sample scripts for startup and maintenance.
+The documentation for each module syntax, configuration, etc. is
+auto-generated from the files in the `raddb` directory.  Each
+configuration file has some Asciidoc markup in the comments.  The file
+`scripts/asciidoc/conf2adoc` takes care of converting configuration
+files to Asciidoc.  See `all.mk` for specific commands.
 
-## Configuration
-
-| Directory			| Description
-|---				|---
-| ``raddb/``			| Sample configuration files for the server.
-| ``raddb/mods-available``	| Module configuration files.
-| ``raddb/mods-enabled``	| Directory containing symlinks to raddb/mods-available. Controls which modules are enabled.
-| ``raddb/sites-available``	| Virtual servers.
-| ``raddb/sites-enabled``	| Directory containing symlinks to raddb/sites-available. Control which virtual servers are enabled.
-
-## Packaging
-| Directory			| Description
-|---				|---
-| ``redhat/``			| Additional files for a RedHat Linux system.
-| ``suse/``			| Additional files for a SuSE (UnitedLinux) system.
-
-## Source
-| Directory			| Description
-|---				|---
-| ``src/``			| Source code
-| ``src/main/``			| Source code for the daemon and associated utilities.
-| ``src/lib/``			| Source code for the RADIUS library.
-| ``src/include/``		| Header files.
-| ``src/modules/``		| Dynamic plug-in modules.
-
-# Debugging
-
-If you have ANY problems, concerns, or surprises when running
-the server, then run it in debugging mode, as root, from the
-command line:
-
-    $ radiusd -X
-
-It will produce a large number of messages.  The answers to many
-questions, and the solution to many problems, can usually be found in
-these messages.
-
-For further details, see:
-
-https://www.freeradius.org/faq/
-
-and the `bugs.md`  file, in this directory.
+When any documentation is built, the files in `raddb` are checked to
+see if they are "out of date" with respect to the output `.adoc`
+files.  If so, the `conf2adoc` script is run to refresh the Asciidoc files.

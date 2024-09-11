@@ -18,7 +18,7 @@ CREATE TABLE radacct (
 	groupname varchar(64) NOT NULL default '',
 	realm varchar(64) default '',
 	nasipaddress varchar(15) NOT NULL default '',
-	nasportid varchar(15) default NULL,
+	nasportid varchar(32) default NULL,
 	nasporttype varchar(32) default NULL,
 	acctstarttime datetime NULL default NULL,
 	acctupdatetime datetime NULL default NULL,
@@ -35,12 +35,21 @@ CREATE TABLE radacct (
 	acctterminatecause varchar(32) NOT NULL default '',
 	servicetype varchar(32) default NULL,
 	framedprotocol varchar(32) default NULL,
-	framedipaddress varchar(15) NOT NULL default ''
+	framedipaddress varchar(15) NOT NULL default '',
+	framedipv6address varchar(45) NOT NULL default '',
+	framedipv6prefix varchar(45) NOT NULL default '',
+	framedinterfaceid varchar(44) NOT NULL default '',
+	delegatedipv6prefix varchar(45) NOT NULL default '',
+	class varchar(64) default NULL
 );
 
 CREATE UNIQUE INDEX acctuniqueid ON radacct(acctuniqueid);
 CREATE INDEX username ON radacct(username);
 CREATE INDEX framedipaddress ON radacct (framedipaddress);
+CREATE INDEX framedipv6address ON radacct (framedipv6address);
+CREATE INDEX framedipv6prefix ON radacct (framedipv6prefix);
+CREATE INDEX framedinterfaceid ON radacct (framedinterfaceid);
+CREATE INDEX delegatedipv6prefix ON radacct (delegatedipv6prefix);
 CREATE INDEX acctsessionid ON radacct(acctsessionid);
 CREATE INDEX acctsessiontime ON radacct(acctsessiontime);
 CREATE INDEX acctstarttime ON radacct(acctstarttime);
@@ -118,7 +127,8 @@ CREATE TABLE radpostauth (
 	username varchar(64) NOT NULL default '',
 	pass varchar(64) NOT NULL default '',
 	reply varchar(32) NOT NULL default '',
-	authdate timestamp NOT NULL
+	authdate timestamp NOT NULL,
+	class varchar(64) NOT NULL default ''
 );
 
 --
@@ -136,3 +146,11 @@ CREATE TABLE nas (
 	description varchar(200) DEFAULT 'RADIUS Client'
 );
 CREATE INDEX nasname ON nas(nasname);
+
+--
+-- Table structure for table 'nasreload'
+--
+CREATE TABLE IF NOT EXISTS nasreload (
+	nasipaddress varchar(15) PRIMARY KEY,
+	reloadtime datetime NOT NULL
+);

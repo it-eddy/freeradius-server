@@ -1,5 +1,6 @@
+#pragma once
 /*
- *   This program is is free software; you can redistribute it and/or modify
+ *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
  *   the Free Software Foundation; either version 2 of the License, or (at
  *   your option) any later version.
@@ -21,13 +22,9 @@
  *
  * @author Arran Cudbard-Bell
  *
- * @copyright 2015 Arran Cudbard-Bell <a.cudbardb@freeradius.org>
+ * @copyright 2015 Arran Cudbard-Bell (a.cudbardb@freeradius.org)
  * @copyright 2015 The FreeRADIUS server project
  */
-
-#ifndef _REDIS_IPPOOL_H
-#define	_REDIS_IPPOOL_H
-
 RCSIDH(redis_ippool_h, "$Id$")
 
 /*
@@ -59,7 +56,8 @@ typedef enum {
 #define IPPOOL_MAX_KEY_PREFIX_SIZE	128
 #define IPPOOL_POOL_KEY			"pool"
 #define IPPOOL_ADDRESS_KEY		"ip"
-#define IPPOOL_DEVICE_KEY		"device"
+#define IPPOOL_OWNER_KEY		"device"
+#define IPPOOL_STATIC_BIT		0x10000000000000   /* A high bit which Redis ZSCORE will represent accurately*/
 
 /** {prefix}:pool
  */
@@ -68,6 +66,10 @@ typedef enum {
 /** {prefix}:ipaddr/prefix
  */
 #define IPPOOL_MAX_IP_KEY_SIZE		IPPOOL_MAX_KEY_PREFIX_SIZE + (sizeof("{}:" IPPOOL_ADDRESS_KEY ":") - 1) + INET6_ADDRSTRLEN + 4
+
+/** {prefix}:device
+ */
+#define IPPOOL_MAX_OWNER_KEY_SIZE	IPPOOL_MAX_KEY_PREFIX_SIZE + (sizeof("{}:" IPPOOL_OWNER_KEY ":") - 1) + 128
 
 
 #define IPADDR_LEN(_af) ((_af == AF_UNSPEC) ? 0 : ((_af == AF_INET6) ? 128 : 32))
@@ -102,8 +104,8 @@ do { \
 		goto finish; \
 	} \
 	_p += (size_t)_slen;\
-	_slen = fr_pair_value_snprint((char *)_p, sizeof(_buff) - (_p - _buff), _ip, '\0'); \
-	if (is_truncated((size_t)_slen, sizeof(_buff) - (_p - _buff))) { \
+	_slen = fr_pair_print_value_quoted(&FR_SBUFF_OUT((char *)_p, sizeof(_buff) - (_p - _buff)), _ip, T_BARE_WORD); \
+	if (_slen < 0) { \
 		REDEBUG("IP key too long"); \
 		ret = IPPOOL_RCODE_FAIL; \
 		goto finish; \
@@ -125,5 +127,3 @@ do { \
 		(_ip)->prefix = _net; \
 	} \
 } while (0)
-
-#endif /* _REDIS_IPPOOL_H */
